@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024 Raster Lab. All rights reserved.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  # Verify the release builds and tests pass
+  validate:
+    name: Validate Release
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.0.app
+
+      - name: Build Release
+        run: swift build -c release
+
+      - name: Run Tests
+        run: swift test --parallel
+
+  # Create GitHub Release with auto-generated notes
+  release:
+    name: Create Release
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get commits since last tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            COMMITS=$(git log $PREV_TAG..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          else
+            COMMITS=$(git log --pretty=format:"- %s (%h)" --no-merges -20)
+          fi
+          
+          # Write changelog to file (handles multiline)
+          echo "$COMMITS" > changelog.txt
+          
+          # Categorize commits
+          echo "## What's Changed" > release_notes.md
+          echo "" >> release_notes.md
+          
+          # Features
+          FEATURES=$(echo "$COMMITS" | grep -E "^- feat" || true)
+          if [ -n "$FEATURES" ]; then
+            echo "### ✨ Features" >> release_notes.md
+            echo "$FEATURES" | sed 's/^- feat[:(]/- /' >> release_notes.md
+            echo "" >> release_notes.md
+          fi
+          
+          # Fixes
+          FIXES=$(echo "$COMMITS" | grep -E "^- fix" || true)
+          if [ -n "$FIXES" ]; then
+            echo "### 🐛 Bug Fixes" >> release_notes.md
+            echo "$FIXES" | sed 's/^- fix[:(]/- /' >> release_notes.md
+            echo "" >> release_notes.md
+          fi
+          
+          # Performance
+          PERF=$(echo "$COMMITS" | grep -E "^- perf" || true)
+          if [ -n "$PERF" ]; then
+            echo "### ⚡ Performance" >> release_notes.md
+            echo "$PERF" | sed 's/^- perf[:(]/- /' >> release_notes.md
+            echo "" >> release_notes.md
+          fi
+          
+          # Docs
+          DOCS=$(echo "$COMMITS" | grep -E "^- docs" || true)
+          if [ -n "$DOCS" ]; then
+            echo "### 📚 Documentation" >> release_notes.md
+            echo "$DOCS" | sed 's/^- docs[:(]/- /' >> release_notes.md
+            echo "" >> release_notes.md
+          fi
+          
+          # Other changes
+          OTHER=$(echo "$COMMITS" | grep -vE "^- (feat|fix|perf|docs)" || true)
+          if [ -n "$OTHER" ]; then
+            echo "### 🔧 Other Changes" >> release_notes.md
+            echo "$OTHER" >> release_notes.md
+            echo "" >> release_notes.md
+          fi
+          
+          # Installation instructions
+          echo "## Installation" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "Add JLISwift to your \`Package.swift\`:" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "\`\`\`swift" >> release_notes.md
+          echo "dependencies: [" >> release_notes.md
+          echo "    .package(url: \"https://github.com/Raster-Lab/JLISwift.git\", from: \"${{ steps.version.outputs.VERSION }}\")" >> release_notes.md
+          echo "]" >> release_notes.md
+          echo "\`\`\`" >> release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: JLISwift v${{ steps.version.outputs.VERSION }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Notify Swift Package Index to update
+  swift-package-index:
+    name: Update Swift Package Index
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Swift Package Index update
+        run: |
+          curl -X POST \
+            -H "Accept: application/json" \
+            "https://swiftpackageindex.com/api/packages/Raster-Lab/JLISwift/trigger-build" \
+            || echo "Swift Package Index notification sent (may require registration)"

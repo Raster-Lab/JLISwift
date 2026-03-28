@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024 Raster Lab. All rights reserved.
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Build and test on macOS (primary platform with full features)
+  macos:
+    name: macOS ${{ matrix.xcode }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        xcode: ['16.0']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode ${{ matrix.xcode }}
+        run: sudo xcode-select -s /Applications/Xcode_${{ matrix.xcode }}.app
+
+      - name: Swift Version
+        run: swift --version
+
+      - name: Build
+        run: swift build -c release
+
+      - name: Test
+        run: swift test --parallel
+
+      - name: Test with coverage
+        run: swift test --enable-code-coverage
+
+      - name: Generate coverage report
+        run: |
+          xcrun llvm-cov export \
+            .build/debug/JLISwiftPackageTests.xctest/Contents/MacOS/JLISwiftPackageTests \
+            -instr-profile=.build/debug/codecov/default.profdata \
+            -format=lcov > coverage.lcov || true
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.lcov
+          fail_ci_if_error: false
+        continue-on-error: true
+
+  # Build and test on Linux
+  linux:
+    name: Linux (Swift ${{ matrix.swift }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        swift: ['6.0']
+    container:
+      image: swift:${{ matrix.swift }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Swift Version
+        run: swift --version
+
+      - name: Build
+        run: swift build -c release
+
+      - name: Test
+        run: swift test --parallel
+
+  # iOS/tvOS/watchOS/visionOS build check (no tests, just compilation)
+  platforms:
+    name: ${{ matrix.platform }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [iOS, tvOS, watchOS, visionOS]
+        include:
+          - platform: iOS
+            destination: 'platform=iOS Simulator,name=iPhone 15'
+          - platform: tvOS
+            destination: 'platform=tvOS Simulator,name=Apple TV'
+          - platform: watchOS
+            destination: 'platform=watchOS Simulator,name=Apple Watch Series 9 (45mm)'
+          - platform: visionOS
+            destination: 'platform=visionOS Simulator,name=Apple Vision Pro'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.0.app
+
+      - name: Build for ${{ matrix.platform }}
+        run: |
+          xcodebuild build \
+            -scheme JLISwift \
+            -destination '${{ matrix.destination }}' \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO
