@@ -131,17 +131,20 @@ struct CoreTypeTests {
         }
     }
 
-    @Test("Encoder returns not-implemented for valid input")
-    func encoderNotImplemented() throws {
+    @Test("Encoder produces valid JPEG for valid input")
+    func encoderProducesValidOutput() throws {
         let encoder = JLIEncoder()
         let image = try JLIImage(
             width: 1, height: 1,
             pixelFormat: .uint8, colorModel: .rgb,
             data: [UInt8](repeating: 0, count: 3)
         )
-        #expect(throws: JLIError.self) {
-            try encoder.encode(image)
-        }
+        var config = JLIEncoderConfiguration.default
+        config.chromaSubsampling = .yuv444
+        let result = try encoder.encode(image, configuration: config)
+        // Valid JPEG starts with SOI (0xFF 0xD8)
+        #expect(result[0] == 0xFF)
+        #expect(result[1] == 0xD8)
     }
 
     // MARK: - JLIDecoder
@@ -162,10 +165,10 @@ struct CoreTypeTests {
         }
     }
 
-    @Test("Decoder returns not-implemented for valid JPEG header")
-    func decoderNotImplemented() {
+    @Test("Decoder rejects minimal JPEG without frame data")
+    func decoderRejectsMinimalJPEG() {
         let decoder = JLIDecoder()
-        // Minimal valid JPEG SOI marker
+        // SOI + EOI only — no frame info, should fail
         #expect(throws: JLIError.self) {
             try decoder.decode(from: [0xFF, 0xD8, 0xFF, 0xD9])
         }
