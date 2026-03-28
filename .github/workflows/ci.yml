@@ -17,11 +17,11 @@ jobs:
   # Build and test on macOS (primary platform with full features)
   macos:
     name: macOS ${{ matrix.xcode }}
-    runs-on: macos-14
+    runs-on: macos-26
     strategy:
       fail-fast: false
       matrix:
-        xcode: ['16.0']
+        xcode: ['26.2']
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,7 +62,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        swift: ['6.0']
+        swift: ['6.2']
     container:
       image: swift:${{ matrix.swift }}
     steps:
@@ -81,18 +81,18 @@ jobs:
   # iOS/tvOS/watchOS/visionOS build check (no tests, just compilation)
   platforms:
     name: ${{ matrix.platform }}
-    runs-on: macos-14
+    runs-on: macos-26
     strategy:
       fail-fast: false
       matrix:
         platform: [iOS, tvOS, watchOS, visionOS]
         include:
           - platform: iOS
-            destination: 'platform=iOS Simulator,name=iPhone 15'
+            destination: 'platform=iOS Simulator,name=iPhone 17'
           - platform: tvOS
             destination: 'platform=tvOS Simulator,name=Apple TV'
           - platform: watchOS
-            destination: 'platform=watchOS Simulator,name=Apple Watch Series 9 (45mm)'
+            destination: 'platform=watchOS Simulator,name=Apple Watch Series 11 (46mm)'
           - platform: visionOS
             destination: 'platform=visionOS Simulator,name=Apple Vision Pro'
     steps:
@@ -100,7 +100,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.0.app
+        run: sudo xcode-select -s /Applications/Xcode_26.2.app
 
       - name: Build for ${{ matrix.platform }}
         run: |
