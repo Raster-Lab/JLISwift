@@ -17,10 +17,18 @@ let package = Package(
             name: "JLISwift",
             targets: ["JLISwift"]
         ),
+        .executable(
+            name: "JLIBench",
+            targets: ["JLIBench"]
+        ),
     ],
     targets: [
         .target(
             name: "JLISwift"
+        ),
+        .executableTarget(
+            name: "JLIBench",
+            dependencies: ["JLISwift"]
         ),
         .testTarget(
             name: "JLISwiftTests",
