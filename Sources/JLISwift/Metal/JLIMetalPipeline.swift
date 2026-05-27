@@ -3,16 +3,14 @@
 
 /// Metal GPU acceleration pipeline for JPEG processing.
 ///
-/// Provides GPU-accelerated DCT, quantization, and color conversion
-/// using Metal compute shaders on supported Apple platforms.
+/// Provides GPU-accelerated DCT, quantization, and color conversion using Metal
+/// compute shaders. JLISwift only ships on Apple platforms, so Metal is always
+/// importable; `JLIMetalPipeline.isAvailable` still reports `false` on hosts
+/// without a Metal device (watchOS, headless servers, some VMs).
 ///
-/// ## Architecture
-///
-/// The pipeline compiles Metal Shading Language kernels at runtime from
-/// embedded source strings, avoiding the need to bundle `.metallib` files.
-/// All operations fall back to CPU when Metal is unavailable.
+/// Kernels are compiled at runtime from embedded MSL source so no `.metallib`
+/// needs to be bundled.
 
-#if canImport(Metal)
 import Metal
 
 /// GPU-accelerated JPEG processing pipeline using Metal compute shaders.
@@ -198,4 +196,3 @@ public final class JLIMetalPipeline: @unchecked Sendable {
     }
     """
 }
-#endif

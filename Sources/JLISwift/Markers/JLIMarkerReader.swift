@@ -47,6 +47,10 @@ struct ParsedJPEG: Sendable {
     let huffmanDCTables: [Int: HuffmanTable]
     let huffmanACTables: [Int: HuffmanTable]
     let scans: [JPEGScanData]
+    /// Number of MCUs between restart markers. 0 means no restart markers in the
+    /// stream. Apple ImageIO and many other encoders emit DRI + RST0–RST7 for
+    /// error resilience even on baseline JPEGs.
+    let restartInterval: Int
 }
 
 // MARK: - Marker Reader
@@ -116,6 +120,7 @@ struct MarkerReader {
         var huffDC = [Int: HuffmanTable]()
         var huffAC = [Int: HuffmanTable]()
         var scans: [JPEGScanData] = []
+        var restartInterval: Int = 0
 
         while offset < data.count - 1 {
             guard let marker = try nextMarker() else { break }
@@ -140,6 +145,11 @@ struct MarkerReader {
                     }
                 }
 
+            case JPEGMarker.dri:
+                // Length=4, then 2-byte restart interval.
+                _ = try readUInt16()
+                restartInterval = Int(try readUInt16())
+
             case JPEGMarker.sos:
                 let scanHeader = try readSOS()
                 let entropyData = try readEntropyData()
@@ -147,6 +157,13 @@ struct MarkerReader {
 
             case JPEGMarker.eoi:
                 break
+
+            case 0xD0...0xD7:
+                // RST0–RST7 — restart markers have no length field and should
+                // normally be consumed by `readEntropyData`. A bare one at the
+                // top level (after a scan that already exited cleanly) is
+                // harmless; just skip it.
+                continue
 
             default:
                 try skipSegment()
@@ -162,7 +179,8 @@ struct MarkerReader {
             quantTables: quantTables,
             huffmanDCTables: huffDC,
             huffmanACTables: huffAC,
-            scans: scans
+            scans: scans,
+            restartInterval: restartInterval
         )
     }
 
@@ -324,33 +342,42 @@ struct MarkerReader {
         )
     }
 
-    /// Reads entropy-coded data until the next marker (handling byte stuffing).
+    /// Slices the entropy-coded segment between SOS and the next non-RST marker.
+    ///
+    /// The returned buffer is byte-for-byte identical to what the encoder wrote, including
+    /// stuffed `0xFF 0x00` pairs **and** restart markers (`0xFF 0xD0`–`0xFF 0xD7`).
+    /// `BitReader` is the single point that performs unstuffing, and the decoder consumes
+    /// restart markers explicitly at known MCU boundaries via `skipRestartMarker`.
     private mutating func readEntropyData() throws -> [UInt8] {
         var entropyData = [UInt8]()
 
         while offset < data.count {
             let byte = data[offset]
-            offset += 1
 
             if byte == 0xFF {
-                guard offset < data.count else { break }
-                let next = data[offset]
+                // Need at least one more byte to disambiguate stuffing vs marker.
+                guard offset + 1 < data.count else { break }
+                let next = data[offset + 1]
                 if next == 0x00 {
-                    // Byte stuffing — 0xFF is data
+                    // Stuffed data byte — keep both bytes; BitReader will unstuff.
                     entropyData.append(0xFF)
-                    offset += 1
+                    entropyData.append(0x00)
+                    offset += 2
                 } else if next >= 0xD0 && next <= 0xD7 {
-                    // Restart marker — skip it
+                    // RST0–RST7 — restart marker. Include in the entropy buffer;
+                    // the decoder will call `BitReader.skipRestartMarker` at the
+                    // matching MCU boundary to consume it and reset DC predictors.
                     entropyData.append(0xFF)
                     entropyData.append(next)
-                    offset += 1
+                    offset += 2
                 } else {
-                    // Real marker found — back up so nextMarker() can find it
-                    offset -= 1  // Back to the 0xFF
+                    // Other real marker (EOI, DHT, etc.) — stop and leave offset
+                    // on the 0xFF so nextMarker() can pick it up.
                     break
                 }
             } else {
                 entropyData.append(byte)
+                offset += 1
             }
         }
 

@@ -39,40 +39,21 @@ enum ColorConversion {
     }
 
     /// Converts an entire image from RGB to YCbCr component planes.
-    ///
-    /// Returns three separate planes (Y, Cb, Cr), each of size `width × height`.
+    /// Delegates to ``AccelerateDSP/imageRGBToYCbCr(data:pixelCount:componentCount:)``.
     static func imageRGBToYCbCr(data: [UInt8], width: Int, height: Int,
                                  componentCount: Int) -> (y: [Float], cb: [Float], cr: [Float]) {
-        let pixelCount = width * height
-        var yPlane = [Float](repeating: 0, count: pixelCount)
-        var cbPlane = [Float](repeating: 0, count: pixelCount)
-        var crPlane = [Float](repeating: 0, count: pixelCount)
-
-        for i in 0..<pixelCount {
-            let r = Float(data[i * componentCount])
-            let g = Float(data[i * componentCount + 1])
-            let b = Float(data[i * componentCount + 2])
-            let (y, cb, cr) = rgbToYCbCr(r: r, g: g, b: b)
-            yPlane[i] = y
-            cbPlane[i] = cb
-            crPlane[i] = cr
-        }
-        return (yPlane, cbPlane, crPlane)
+        return AccelerateDSP.imageRGBToYCbCr(
+            data: data, pixelCount: width * height, componentCount: componentCount
+        )
     }
 
     /// Converts YCbCr component planes back to interleaved RGB bytes.
+    /// Delegates to ``AccelerateDSP/imageYCbCrToRGB(y:cb:cr:pixelCount:)``.
     static func imageYCbCrToRGB(y: [Float], cb: [Float], cr: [Float],
                                  width: Int, height: Int) -> [UInt8] {
-        let pixelCount = width * height
-        var result = [UInt8](repeating: 0, count: pixelCount * 3)
-
-        for i in 0..<pixelCount {
-            let (r, g, b) = ycbcrToRGB(y: y[i], cb: cb[i], cr: cr[i])
-            result[i * 3]     = UInt8(clamping: Int(r.rounded()))
-            result[i * 3 + 1] = UInt8(clamping: Int(g.rounded()))
-            result[i * 3 + 2] = UInt8(clamping: Int(b.rounded()))
-        }
-        return result
+        return AccelerateDSP.imageYCbCrToRGB(
+            y: y, cb: cb, cr: cr, pixelCount: width * height
+        )
     }
 
     /// Converts a grayscale image buffer to a luminance plane.

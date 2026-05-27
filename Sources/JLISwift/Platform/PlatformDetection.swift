@@ -1,73 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024 Raster Lab. All rights reserved.
 
-/// Detected hardware acceleration capabilities for the current platform.
+/// Reports the compile-time CPU architecture for the build, plus whether Metal is
+/// likely to be usable at runtime.
 ///
-/// Used internally to select the optimal code path for DSP-heavy operations
-/// (DCT, color space conversion, quantization).
+/// JLISwift only targets Apple platforms, so Accelerate (vDSP/vImage) is always
+/// available and there is no field for it. Metal availability is a runtime check
+/// because some Apple devices (watchOS, headless servers, certain VMs) lack a GPU
+/// device even though the framework imports.
 public struct JLIPlatformCapabilities: Sendable {
-    /// The CPU architecture family.
     public let architecture: Architecture
-
-    /// Whether the Accelerate framework (vDSP/vImage) is available.
-    public let hasAccelerate: Bool
-
-    /// Whether ARM NEON SIMD is available.
+    /// Whether ARM NEON SIMD is available (true on all Apple Silicon builds).
     public let hasNEON: Bool
-
-    /// Whether Intel SSE2+ SIMD is available.
+    /// Whether Intel SSE2+ SIMD is available (true on Intel macOS builds).
     public let hasSSE: Bool
 
-    /// Whether Metal GPU compute is available.
-    public let hasMetal: Bool
-
-    /// CPU architecture family.
     public enum Architecture: String, Sendable {
         case arm64
         case x86_64
         case unknown
     }
 
-    /// Detects the capabilities of the current platform at compile time.
     public static let current: JLIPlatformCapabilities = {
         #if arch(arm64)
-        let arch = Architecture.arm64
+        return JLIPlatformCapabilities(architecture: .arm64, hasNEON: true, hasSSE: false)
         #elseif arch(x86_64)
-        let arch = Architecture.x86_64
+        return JLIPlatformCapabilities(architecture: .x86_64, hasNEON: false, hasSSE: true)
         #else
-        let arch = Architecture.unknown
+        return JLIPlatformCapabilities(architecture: .unknown, hasNEON: false, hasSSE: false)
         #endif
-
-        #if canImport(Accelerate)
-        let accelerate = true
-        #else
-        let accelerate = false
-        #endif
-
-        #if arch(arm64)
-        let neon = true
-        #else
-        let neon = false
-        #endif
-
-        #if arch(x86_64)
-        let sse = true
-        #else
-        let sse = false
-        #endif
-
-        #if canImport(Metal)
-        let metal = true
-        #else
-        let metal = false
-        #endif
-
-        return JLIPlatformCapabilities(
-            architecture: arch,
-            hasAccelerate: accelerate,
-            hasNEON: neon,
-            hasSSE: sse,
-            hasMetal: metal
-        )
     }()
 }

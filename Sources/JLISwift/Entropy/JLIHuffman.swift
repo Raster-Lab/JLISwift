@@ -254,32 +254,38 @@ enum HuffmanDecoder {
     /// Returns 64 coefficients in zigzag order (index 0 is left empty for DC).
     static func decodeAC(from reader: inout BitReader, table: HuffmanTable) throws -> [Int32] {
         var coefficients = [Int32](repeating: 0, count: 64)
-        var index = 1
+        try decodeAC(from: &reader, table: table, into: &coefficients)
+        return coefficients
+    }
 
+    /// In-place variant: decodes 64 zigzag-order AC coefficients into `out`.
+    /// Caller's buffer is zeroed before decoding. Saves an `[Int32](repeating:)`
+    /// allocation per block in the decoder hot loop.
+    static func decodeAC(
+        from reader: inout BitReader, table: HuffmanTable, into out: inout [Int32]
+    ) throws {
+        precondition(out.count == 64)
+        for i in 0..<64 { out[i] = 0 }
+
+        var index = 1
         while index < 64 {
             let symbol = try decodeSymbol(from: &reader, table: table)
 
             if symbol == 0x00 {
-                // EOB — remaining coefficients are zero
-                break
+                break  // EOB — remaining coefficients are zero
             }
-
             if symbol == 0xF0 {
-                // ZRL — skip 16 zeros
-                index += 16
+                index += 16  // ZRL — skip 16 zeros
                 continue
             }
 
             let zeroRun = Int(symbol >> 4)
             let cat = Int(symbol & 0x0F)
             index += zeroRun
-
             guard index < 64 else { break }
 
-            coefficients[index] = try decodeValue(from: &reader, category: cat)
+            out[index] = try decodeValue(from: &reader, category: cat)
             index += 1
         }
-
-        return coefficients
     }
 }

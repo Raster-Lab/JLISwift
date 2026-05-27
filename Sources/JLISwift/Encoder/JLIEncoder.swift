@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024 Raster Lab. All rights reserved.
 
+import Accelerate
+
 /// The jpegli-compatible JPEG encoder.
 ///
 /// `JLIEncoder` compresses image data into JPEG format using the jpegli algorithm,
@@ -120,13 +122,15 @@ public struct JLIEncoder: Sendable {
             crPlane = crDS.data; crWidth = crDS.width; crHeight = crDS.height
         }
 
-        // Step 3: Quantization tables
+        // Step 3: Quantization tables (and reciprocals for vectorized quantization).
         let lumQT = Quantization.scaleTable(
             Quantization.standardLuminanceTable, quality: quality
         )
         let chromQT = Quantization.scaleTable(
             Quantization.standardChrominanceTable, quality: quality
         )
+        let lumInv = lumQT.map { 1.0 / Float($0) }
+        let chromInv = chromQT.map { 1.0 / Float($0) }
 
         // Step 4: MCU structure
         let hMax = isGrayscale ? 1 : hFactor
@@ -136,43 +140,75 @@ public struct JLIEncoder: Sendable {
         let mcuCountH = (width + mcuW - 1) / mcuW
         let mcuCountV = (height + mcuH - 1) / mcuH
 
-        // Step 5: Encode entropy data
-        var bitWriter = BitWriter()
+        // Step 5: Extract → batch-DCT → batch-quantize for each component, then
+        // walk MCUs sequentially to emit Huffman bits (DC DPCM forces sequential).
         let numComponents = isGrayscale ? 1 : 3
+        let yBlocksPerRow = mcuCountH * hMax
+        let yBlocksPerCol = mcuCountV * vMax
+        let yBlockCount = yBlocksPerRow * yBlocksPerCol
+        let cBlockCount = isGrayscale ? 0 : mcuCountH * mcuCountV
+
+        // Scratch sized for the largest component batch — reused across Y/Cb/Cr.
+        let maxBlockCount = max(yBlockCount, cBlockCount)
+        var dctScratch = [Float](repeating: 0, count: maxBlockCount * 64)
+
+        let yQuant = quantizePlane(
+            yPlane, planeWidth: width, planeHeight: height,
+            blocksH: yBlocksPerRow, blocksV: yBlocksPerCol,
+            invQuant: lumInv, scratch: &dctScratch
+        )
+        let cbQuant: [Int32]
+        let crQuant: [Int32]
+        if isGrayscale {
+            cbQuant = []; crQuant = []
+        } else {
+            cbQuant = quantizePlane(
+                cbPlane, planeWidth: cbWidth, planeHeight: cbHeight,
+                blocksH: mcuCountH, blocksV: mcuCountV,
+                invQuant: chromInv, scratch: &dctScratch
+            )
+            crQuant = quantizePlane(
+                crPlane, planeWidth: crWidth, planeHeight: crHeight,
+                blocksH: mcuCountH, blocksV: mcuCountV,
+                invQuant: chromInv, scratch: &dctScratch
+            )
+        }
+
+        // MCU walk → Huffman bitstream. Sequential because DC coefficients are
+        // DPCM-coded against the previous block of the same component. Preallocate
+        // the BitWriter buffer to the worst-case raw-RGB size so the inner loop
+        // never reallocates.
+        var bitWriter = BitWriter(estimatedMaxSize: width * height * 3 + 4096)
         var prevDC = [Int32](repeating: 0, count: numComponents)
+        var zigzagBuf = [Int32](repeating: 0, count: 64)
 
         for mcuY in 0..<mcuCountV {
             for mcuX in 0..<mcuCountH {
-                // Y blocks (hMax × vMax blocks per MCU)
                 for by in 0..<vMax {
                     for bx in 0..<hMax {
-                        let blockX = mcuX * hMax + bx
-                        let blockY = mcuY * vMax + by
-                        prevDC[0] = encodeBlock(
-                            extractBlock(yPlane, width, height, blockX, blockY),
-                            lumQT, prevDC[0],
-                            StandardHuffmanTables.dcLuminance,
-                            StandardHuffmanTables.acLuminance,
-                            &bitWriter
+                        let yIdx = (mcuY * vMax + by) * yBlocksPerRow + (mcuX * hMax + bx)
+                        prevDC[0] = emitBlock(
+                            quantized: yQuant, blockIndex: yIdx, prevDC: prevDC[0],
+                            dcTable: StandardHuffmanTables.dcLuminance,
+                            acTable: StandardHuffmanTables.acLuminance,
+                            zigzagBuf: &zigzagBuf, writer: &bitWriter
                         )
                     }
                 }
 
-                // Cb and Cr blocks (1 each per MCU)
                 if !isGrayscale {
-                    prevDC[1] = encodeBlock(
-                        extractBlock(cbPlane, cbWidth, cbHeight, mcuX, mcuY),
-                        chromQT, prevDC[1],
-                        StandardHuffmanTables.dcChrominance,
-                        StandardHuffmanTables.acChrominance,
-                        &bitWriter
+                    let cIdx = mcuY * mcuCountH + mcuX
+                    prevDC[1] = emitBlock(
+                        quantized: cbQuant, blockIndex: cIdx, prevDC: prevDC[1],
+                        dcTable: StandardHuffmanTables.dcChrominance,
+                        acTable: StandardHuffmanTables.acChrominance,
+                        zigzagBuf: &zigzagBuf, writer: &bitWriter
                     )
-                    prevDC[2] = encodeBlock(
-                        extractBlock(crPlane, crWidth, crHeight, mcuX, mcuY),
-                        chromQT, prevDC[2],
-                        StandardHuffmanTables.dcChrominance,
-                        StandardHuffmanTables.acChrominance,
-                        &bitWriter
+                    prevDC[2] = emitBlock(
+                        quantized: crQuant, blockIndex: cIdx, prevDC: prevDC[2],
+                        dcTable: StandardHuffmanTables.dcChrominance,
+                        acTable: StandardHuffmanTables.acChrominance,
+                        zigzagBuf: &zigzagBuf, writer: &bitWriter
                     )
                 }
             }
@@ -251,52 +287,84 @@ public struct JLIEncoder: Sendable {
         }
     }
 
-    /// Extracts an 8×8 block from a component plane, replicating edge pixels for padding.
-    private func extractBlock(
-        _ plane: [Float], _ planeWidth: Int, _ planeHeight: Int,
-        _ blockX: Int, _ blockY: Int
-    ) -> [Float] {
-        var block = [Float](repeating: 0, count: 64)
-        let startX = blockX * 8
-        let startY = blockY * 8
-        for y in 0..<8 {
-            let sy = min(startY + y, planeHeight - 1)
-            for x in 0..<8 {
-                let sx = min(startX + x, planeWidth - 1)
-                block[y * 8 + x] = plane[sy * planeWidth + sx]
-            }
-        }
-        return block
+    /// Extract every 8×8 block from a component plane → batched forward DCT +
+    /// quantize. Returns an Int32 buffer of size `blocksH*blocksV*64` holding
+    /// quantized coefficients in natural (non-zigzag) order, per-block-contiguous.
+    ///
+    /// Level-shift (-128) is folded into the extract pass so we don't pay a
+    /// separate read+write sweep over the whole batched buffer. Edge pixels are
+    /// replicated when the plane dimensions aren't a multiple of 8.
+    private func quantizePlane(
+        _ plane: [Float], planeWidth: Int, planeHeight: Int,
+        blocksH: Int, blocksV: Int,
+        invQuant: [Float], scratch: inout [Float]
+    ) -> [Int32] {
+        let n = blocksH * blocksV
+        var blockBuf = [Float](repeating: 0, count: n * 64)
+        extractAllBlocksLevelShifted(
+            plane, planeWidth: planeWidth, planeHeight: planeHeight,
+            blocksH: blocksH, blocksV: blocksV, into: &blockBuf
+        )
+
+        var dctBuf = [Float](repeating: 0, count: n * 64)
+        AccelerateDSP.forwardDCTBatch(
+            blockBuf, into: &dctBuf, scratch: &scratch, blockCount: n
+        )
+
+        var quant = [Int32](repeating: 0, count: n * 64)
+        AccelerateDSP.quantizeBatch(
+            dctBuf, invTable: invQuant, into: &quant, blockCount: n
+        )
+        return quant
     }
 
-    /// Processes one 8×8 block: level-shift → DCT → quantize → zigzag → Huffman encode.
-    /// Returns the current DC value for the next block's DPCM.
-    @discardableResult
-    private func encodeBlock(
-        _ block: [Float], _ quantTable: [Int], _ prevDC: Int32,
-        _ dcTable: HuffmanTable, _ acTable: HuffmanTable,
-        _ writer: inout BitWriter
+    /// Extracts `blocksH × blocksV` 8×8 blocks from a plane into a per-block-contig
+    /// Float buffer with level shift (-128) folded in. Block `i` at offset `64*i`,
+    /// row-major within. Edge pixels are replicated past plane bounds.
+    private func extractAllBlocksLevelShifted(
+        _ plane: [Float], planeWidth: Int, planeHeight: Int,
+        blocksH: Int, blocksV: Int, into out: inout [Float]
+    ) {
+        plane.withUnsafeBufferPointer { srcBuf in
+            out.withUnsafeMutableBufferPointer { dstBuf in
+                let src = srcBuf.baseAddress!
+                let dst = dstBuf.baseAddress!
+                for by in 0..<blocksV {
+                    let startY = by * 8
+                    for bx in 0..<blocksH {
+                        let startX = bx * 8
+                        let blockBase = (by * blocksH + bx) * 64
+                        for r in 0..<8 {
+                            let sy = min(startY + r, planeHeight - 1)
+                            let srcRow = sy * planeWidth
+                            let dstRow = blockBase + r * 8
+                            for c in 0..<8 {
+                                let sx = min(startX + c, planeWidth - 1)
+                                dst[dstRow + c] = src[srcRow + sx] - 128.0
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read one block's quantized coefficients out of the batched buffer, zigzag
+    /// directly from there, and emit DC (DPCM against `prevDC`) + AC Huffman codes.
+    /// Returns the new DC value for the next block's prediction.
+    @inline(__always)
+    private func emitBlock(
+        quantized: [Int32], blockIndex: Int, prevDC: Int32,
+        dcTable: HuffmanTable, acTable: HuffmanTable,
+        zigzagBuf: inout [Int32],
+        writer: inout BitWriter
     ) -> Int32 {
-        // Level shift
-        let shifted = block.map { $0 - 128.0 }
+        Quantization.zigzagScan(quantized, offset: blockIndex * 64, into: &zigzagBuf)
 
-        // Forward DCT
-        let dctCoeffs = DCT.forward(shifted)
-
-        // Quantize
-        let quantized = Quantization.quantize(dctCoeffs, table: quantTable)
-
-        // Zigzag scan
-        let zigzag = Quantization.zigzagScan(quantized)
-
-        // Huffman encode DC (DPCM)
-        let dcDiff = zigzag[0] - prevDC
+        let dcDiff = zigzagBuf[0] - prevDC
         HuffmanEncoder.encodeDC(dcDiff, table: dcTable, writer: &writer)
-
-        // Huffman encode AC
-        HuffmanEncoder.encodeAC(zigzag, table: acTable, writer: &writer)
-
-        return zigzag[0]
+        HuffmanEncoder.encodeAC(zigzagBuf, table: acTable, writer: &writer)
+        return zigzagBuf[0]
     }
 
     /// Reorders a quantization table to zigzag order for the DQT marker.

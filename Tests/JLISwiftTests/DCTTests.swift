@@ -73,10 +73,71 @@ struct DCTTests {
         #expect(abs(energyBefore - energyAfter) / energyBefore < 0.01)
     }
 
+    @Test("Batched forward DCT matches per-block forward DCT")
+    func batchedForwardDCTMatchesPerBlock() {
+        // Build a handful of distinct synthetic blocks, all with non-trivial AC
+        // content so a normalization or transposition bug would show up.
+        let n = 7
+        var input = [Float](repeating: 0, count: n * 64)
+        for i in 0..<n {
+            for r in 0..<8 {
+                for c in 0..<8 {
+                    input[i * 64 + r * 8 + c] =
+                        Float(i + 1) * (Float(r) * 3.0 + Float(c) * 2.0 - 17.0)
+                }
+            }
+        }
+
+        // Per-block reference.
+        var expected = [Float](repeating: 0, count: n * 64)
+        for i in 0..<n {
+            let blk = Array(input[i * 64..<(i + 1) * 64])
+            let res = DCT.forward(blk)
+            for j in 0..<64 { expected[i * 64 + j] = res[j] }
+        }
+
+        // Batched output.
+        var output = [Float](repeating: 0, count: n * 64)
+        var scratch = [Float](repeating: 0, count: n * 64)
+        AccelerateDSP.forwardDCTBatch(input, into: &output, scratch: &scratch, blockCount: n)
+
+        for i in 0..<(n * 64) {
+            #expect(abs(output[i] - expected[i]) < 1e-3,
+                    "Mismatch at index \(i): batch=\(output[i]) per-block=\(expected[i])")
+        }
+    }
+
+    @Test("Batched inverse DCT matches per-block inverse DCT")
+    func batchedInverseDCTMatchesPerBlock() {
+        let n = 5
+        var input = [Float](repeating: 0, count: n * 64)
+        for i in 0..<n {
+            for j in 0..<64 {
+                input[i * 64 + j] = Float((i + 1) * (j + 1) % 37) - 18.0
+            }
+        }
+
+        var expected = [Float](repeating: 0, count: n * 64)
+        for i in 0..<n {
+            let blk = Array(input[i * 64..<(i + 1) * 64])
+            let res = DCT.inverse(blk)
+            for j in 0..<64 { expected[i * 64 + j] = res[j] }
+        }
+
+        var output = [Float](repeating: 0, count: n * 64)
+        var scratch = [Float](repeating: 0, count: n * 64)
+        AccelerateDSP.inverseDCTBatch(input, into: &output, scratch: &scratch, blockCount: n)
+
+        for i in 0..<(n * 64) {
+            #expect(abs(output[i] - expected[i]) < 1e-3,
+                    "Mismatch at index \(i): batch=\(output[i]) per-block=\(expected[i])")
+        }
+    }
+
     @Test("Cosine matrix is orthonormal")
     func cosineMatrixOrthonormal() {
-        let c = DCT.cosineMatrix
-        let ct = DCT.cosineMatrixTransposed
+        let c = AccelerateDSP.dctMatrix
+        let ct = AccelerateDSP.dctMatrixTransposed
 
         // C * C^T should equal identity
         var product = [Float](repeating: 0, count: 64)

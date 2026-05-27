@@ -30,19 +30,37 @@ enum Quantization {
     /// Reorders a block from natural order to zigzag order.
     static func zigzagScan(_ block: [Int32]) -> [Int32] {
         var result = [Int32](repeating: 0, count: 64)
-        for i in 0..<64 {
-            result[i] = block[zigzagOrder[i]]
-        }
+        zigzagScan(block, into: &result)
         return result
+    }
+
+    /// In-place variant: reorders `block` into `out` in zigzag order.
+    static func zigzagScan(_ block: [Int32], into out: inout [Int32]) {
+        zigzagScan(block, offset: 0, into: &out)
+    }
+
+    /// Variant that reads from a contiguous multi-block buffer at the given offset,
+    /// avoiding a per-block 64-element copy in the encoder's MCU walk.
+    static func zigzagScan(_ source: [Int32], offset: Int, into out: inout [Int32]) {
+        source.withUnsafeBufferPointer { srcBuf in
+            out.withUnsafeMutableBufferPointer { dstBuf in
+                let src = srcBuf.baseAddress! + offset
+                let dst = dstBuf.baseAddress!
+                for i in 0..<64 { dst[i] = src[zigzagOrder[i]] }
+            }
+        }
     }
 
     /// Reorders a block from zigzag order to natural order.
     static func inverseZigzagScan(_ zigzag: [Int32]) -> [Int32] {
         var result = [Int32](repeating: 0, count: 64)
-        for i in 0..<64 {
-            result[zigzagOrder[i]] = zigzag[i]
-        }
+        inverseZigzagScan(zigzag, into: &result)
         return result
+    }
+
+    /// In-place variant: reorders zigzag `zigzag` into natural order in `out`.
+    static func inverseZigzagScan(_ zigzag: [Int32], into out: inout [Int32]) {
+        for i in 0..<64 { out[zigzagOrder[i]] = zigzag[i] }
     }
 
     // MARK: - Standard Quantization Tables (ITU-T T.81 Annex K)
