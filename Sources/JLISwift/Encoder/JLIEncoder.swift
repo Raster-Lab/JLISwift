@@ -174,6 +174,63 @@ public struct JLIEncoder: Sendable {
             )
         }
 
+        // Step 5b: Select Huffman tables. With `optimiseHuffman`, run a counting
+        // pass over the exact MCU walk the emit pass uses (DC DPCM state must
+        // match) to gather per-image symbol frequencies, then build optimal
+        // tables. Otherwise use the fixed Annex K tables.
+        let dcLumTable: HuffmanTable
+        let acLumTable: HuffmanTable
+        let dcChrTable: HuffmanTable
+        let acChrTable: HuffmanTable
+
+        if configuration.optimiseHuffman {
+            var dcLumFreq = [Int](repeating: 0, count: 256)
+            var acLumFreq = [Int](repeating: 0, count: 256)
+            var dcChrFreq = [Int](repeating: 0, count: 256)
+            var acChrFreq = [Int](repeating: 0, count: 256)
+            var prevDC = [Int32](repeating: 0, count: numComponents)
+            var zigzagBuf = [Int32](repeating: 0, count: 64)
+
+            for mcuY in 0..<mcuCountV {
+                for mcuX in 0..<mcuCountH {
+                    for by in 0..<vMax {
+                        for bx in 0..<hMax {
+                            let yIdx = (mcuY * vMax + by) * yBlocksPerRow + (mcuX * hMax + bx)
+                            prevDC[0] = countBlock(
+                                quantized: yQuant, blockIndex: yIdx, prevDC: prevDC[0],
+                                zigzagBuf: &zigzagBuf, dcFreq: &dcLumFreq, acFreq: &acLumFreq
+                            )
+                        }
+                    }
+                    if !isGrayscale {
+                        let cIdx = mcuY * mcuCountH + mcuX
+                        prevDC[1] = countBlock(
+                            quantized: cbQuant, blockIndex: cIdx, prevDC: prevDC[1],
+                            zigzagBuf: &zigzagBuf, dcFreq: &dcChrFreq, acFreq: &acChrFreq
+                        )
+                        prevDC[2] = countBlock(
+                            quantized: crQuant, blockIndex: cIdx, prevDC: prevDC[2],
+                            zigzagBuf: &zigzagBuf, dcFreq: &dcChrFreq, acFreq: &acChrFreq
+                        )
+                    }
+                }
+            }
+
+            dcLumTable = HuffmanTableBuilder.build(
+                frequencies: dcLumFreq, fallback: StandardHuffmanTables.dcLuminance)
+            acLumTable = HuffmanTableBuilder.build(
+                frequencies: acLumFreq, fallback: StandardHuffmanTables.acLuminance)
+            dcChrTable = HuffmanTableBuilder.build(
+                frequencies: dcChrFreq, fallback: StandardHuffmanTables.dcChrominance)
+            acChrTable = HuffmanTableBuilder.build(
+                frequencies: acChrFreq, fallback: StandardHuffmanTables.acChrominance)
+        } else {
+            dcLumTable = StandardHuffmanTables.dcLuminance
+            acLumTable = StandardHuffmanTables.acLuminance
+            dcChrTable = StandardHuffmanTables.dcChrominance
+            acChrTable = StandardHuffmanTables.acChrominance
+        }
+
         // MCU walk → Huffman bitstream. Sequential because DC coefficients are
         // DPCM-coded against the previous block of the same component. Preallocate
         // the BitWriter buffer to the worst-case raw-RGB size so the inner loop
@@ -189,8 +246,7 @@ public struct JLIEncoder: Sendable {
                         let yIdx = (mcuY * vMax + by) * yBlocksPerRow + (mcuX * hMax + bx)
                         prevDC[0] = emitBlock(
                             quantized: yQuant, blockIndex: yIdx, prevDC: prevDC[0],
-                            dcTable: StandardHuffmanTables.dcLuminance,
-                            acTable: StandardHuffmanTables.acLuminance,
+                            dcTable: dcLumTable, acTable: acLumTable,
                             zigzagBuf: &zigzagBuf, writer: &bitWriter
                         )
                     }
@@ -200,14 +256,12 @@ public struct JLIEncoder: Sendable {
                     let cIdx = mcuY * mcuCountH + mcuX
                     prevDC[1] = emitBlock(
                         quantized: cbQuant, blockIndex: cIdx, prevDC: prevDC[1],
-                        dcTable: StandardHuffmanTables.dcChrominance,
-                        acTable: StandardHuffmanTables.acChrominance,
+                        dcTable: dcChrTable, acTable: acChrTable,
                         zigzagBuf: &zigzagBuf, writer: &bitWriter
                     )
                     prevDC[2] = emitBlock(
                         quantized: crQuant, blockIndex: cIdx, prevDC: prevDC[2],
-                        dcTable: StandardHuffmanTables.dcChrominance,
-                        acTable: StandardHuffmanTables.acChrominance,
+                        dcTable: dcChrTable, acTable: acChrTable,
                         zigzagBuf: &zigzagBuf, writer: &bitWriter
                     )
                 }
@@ -242,18 +296,15 @@ public struct JLIEncoder: Sendable {
                         ])
         }
 
-        // DHT — DC and AC tables for luminance (+ chrominance if color)
-        let dcLum = StandardHuffmanTables.dcLuminance
-        let acLum = StandardHuffmanTables.acLuminance
+        // DHT — embed whichever tables we actually encoded with (standard or
+        // per-image optimal). The decoder reads these back from the DHT markers.
         var dhtTables: [(tableClass: Int, tableId: Int, bits: [UInt8], values: [UInt8])] = [
-            (0, 0, dcLum.bits, dcLum.values),
-            (1, 0, acLum.bits, acLum.values)
+            (0, 0, dcLumTable.bits, dcLumTable.values),
+            (1, 0, acLumTable.bits, acLumTable.values)
         ]
         if !isGrayscale {
-            let dcChr = StandardHuffmanTables.dcChrominance
-            let acChr = StandardHuffmanTables.acChrominance
-            dhtTables.append((0, 1, dcChr.bits, dcChr.values))
-            dhtTables.append((1, 1, acChr.bits, acChr.values))
+            dhtTables.append((0, 1, dcChrTable.bits, dcChrTable.values))
+            dhtTables.append((1, 1, acChrTable.bits, acChrTable.values))
         }
         mw.writeDHT(tables: dhtTables)
 
@@ -364,6 +415,20 @@ public struct JLIEncoder: Sendable {
         let dcDiff = zigzagBuf[0] - prevDC
         HuffmanEncoder.encodeDC(dcDiff, table: dcTable, writer: &writer)
         HuffmanEncoder.encodeAC(zigzagBuf, table: acTable, writer: &writer)
+        return zigzagBuf[0]
+    }
+
+    /// Counting analogue of ``emitBlock`` — gathers DC/AC symbol frequencies for
+    /// optimal-table generation. Must walk identically to the emit pass so the
+    /// DC DPCM predictor stays in lockstep. Returns the block's DC value.
+    @inline(__always)
+    private func countBlock(
+        quantized: [Int32], blockIndex: Int, prevDC: Int32,
+        zigzagBuf: inout [Int32], dcFreq: inout [Int], acFreq: inout [Int]
+    ) -> Int32 {
+        Quantization.zigzagScan(quantized, offset: blockIndex * 64, into: &zigzagBuf)
+        HuffmanEncoder.countDC(zigzagBuf[0] - prevDC, freq: &dcFreq)
+        HuffmanEncoder.countAC(zigzagBuf, freq: &acFreq)
         return zigzagBuf[0]
     }
 

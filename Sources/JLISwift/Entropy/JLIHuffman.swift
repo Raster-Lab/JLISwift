@@ -135,6 +135,88 @@ enum StandardHuffmanTables {
     )
 }
 
+// MARK: - Optimal Huffman Table Generation
+
+/// Builds image-optimal Huffman tables from symbol frequencies, per the
+/// procedure in ITU-T T.81 Annex K.2 (the same algorithm libjpeg uses for
+/// `-optimize`). Replacing the fixed Annex K tables with per-image tables
+/// typically shrinks entropy-coded output 10–50% at identical quality, since
+/// the fixed tables are tuned for a generic photo and waste bits on symbol
+/// distributions that don't match the actual image.
+enum HuffmanTableBuilder {
+
+    /// Generates an optimal Huffman table from `frequencies` (indexed by symbol,
+    /// at least 256 entries). Returns `fallback` unchanged when no symbols were
+    /// counted — an empty table can't encode anything and some decoders reject
+    /// empty DHT segments, so the standard table is a safe no-op there.
+    static func build(frequencies: [Int], fallback: HuffmanTable) -> HuffmanTable {
+        if frequencies.reduce(0, +) == 0 { return fallback }
+
+        // freq[256] is a reserved code point that guarantees no real symbol gets
+        // the all-ones code (forbidden by JPEG). Work on a 257-entry copy.
+        var freq = [Int](repeating: 0, count: 257)
+        for i in 0..<min(256, frequencies.count) { freq[i] = frequencies[i] }
+        freq[256] = 1
+
+        var codesize = [Int](repeating: 0, count: 257)
+        var others = [Int](repeating: -1, count: 257)
+
+        // Repeatedly merge the two least-frequent live nodes (Huffman tree build),
+        // tracking each merged chain's growing code length in `codesize`.
+        while true {
+            var c1 = -1, v = Int.max
+            for i in 0...256 where freq[i] > 0 && freq[i] <= v { v = freq[i]; c1 = i }
+            var c2 = -1; v = Int.max
+            for i in 0...256 where freq[i] > 0 && freq[i] <= v && i != c1 { v = freq[i]; c2 = i }
+            if c2 < 0 { break }
+
+            freq[c1] += freq[c2]
+            freq[c2] = 0
+            codesize[c1] += 1
+            while others[c1] >= 0 { c1 = others[c1]; codesize[c1] += 1 }
+            others[c1] = c2
+            codesize[c2] += 1
+            while others[c2] >= 0 { c2 = others[c2]; codesize[c2] += 1 }
+        }
+
+        // Count codes of each length (1–32 before limiting).
+        var bits = [Int](repeating: 0, count: 33)
+        for i in 0...256 where codesize[i] > 0 { bits[codesize[i]] += 1 }
+
+        // Limit code lengths to 16 bits (Annex K.2, figure K.3). Each over-long
+        // code is shortened by reshaping the prefix tree, keeping it a valid
+        // prefix code.
+        var i = 32
+        while i > 16 {
+            while bits[i] > 0 {
+                var j = i - 2
+                while bits[j] == 0 { j -= 1 }
+                bits[i] -= 2
+                bits[i - 1] += 1
+                bits[j + 1] += 2
+                bits[j] -= 1
+            }
+            i -= 1
+        }
+        // Drop the reserved code point: decrement the longest non-empty length.
+        i = 16
+        while i > 0 && bits[i] == 0 { i -= 1 }
+        if i > 0 { bits[i] -= 1 }
+
+        var bits16 = [UInt8](repeating: 0, count: 16)
+        for len in 1...16 { bits16[len - 1] = UInt8(bits[len]) }
+
+        // HUFFVAL: real symbols (0–255) ordered by increasing original code length.
+        // Symbol 256 (reserved) is naturally excluded by the 0...255 range.
+        var values = [UInt8]()
+        for len in 1...32 {
+            for sym in 0...255 where codesize[sym] == len { values.append(UInt8(sym)) }
+        }
+
+        return HuffmanTable(bits: bits16, values: values)
+    }
+}
+
 // MARK: - Huffman Encoding
 
 /// Huffman entropy encoder for JPEG data.
@@ -164,6 +246,33 @@ enum HuffmanEncoder {
         } else {
             return UInt32(Int(value) + (1 << cat) - 1)
         }
+    }
+
+    /// Counts the Huffman symbol a DC difference would emit, without writing bits.
+    /// Mirrors ``encodeDC(_:table:writer:)`` exactly so a counting pass and an
+    /// emit pass agree on which symbols appear. `freq` is indexed by symbol (0–255).
+    static func countDC(_ diff: Int32, freq: inout [Int]) {
+        freq[category(for: diff)] += 1
+    }
+
+    /// Counts the Huffman symbols the 63 AC coefficients would emit. Mirrors
+    /// ``encodeAC(_:table:writer:)``.
+    static func countAC(_ zigzag: [Int32], freq: inout [Int]) {
+        var zeroRun = 0
+        for i in 1..<64 {
+            let value = zigzag[i]
+            if value == 0 {
+                zeroRun += 1
+            } else {
+                while zeroRun > 15 {
+                    freq[0xF0] += 1  // ZRL
+                    zeroRun -= 16
+                }
+                freq[(zeroRun << 4) | category(for: value)] += 1
+                zeroRun = 0
+            }
+        }
+        if zeroRun > 0 { freq[0x00] += 1 }  // EOB
     }
 
     /// Encodes a DC coefficient difference using the given Huffman table.

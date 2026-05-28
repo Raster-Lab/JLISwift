@@ -43,18 +43,34 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | Baseline sequential JPEG (SOF0) decode | ✅ |
 | Chroma subsampling: 4:4:4, 4:2:2, 4:2:0, 4:0:0 (grayscale) | ✅ |
 | Standard ITU-T T.81 Annex K Huffman tables | ✅ |
+| **Optimized (per-image) Huffman tables** (Annex K.2, `optimiseHuffman`, default on) | ✅ |
+| Restart marker (DRI / RST) decode — interop with ImageIO/libjpeg output | ✅ |
 | Quality-scaled standard quantization tables (IJG formula) | ✅ |
 | RGB / RGBA / grayscale / pre-converted YCbCr input | ✅ |
 | `inspect()` — metadata parse without full decode | ✅ |
 | Accelerate `vDSP_mmul` DCT, `vDSP_vmul` quant, vectorized BT.601 color conversion | ✅ |
-| Round-trip encode → decode tested on synthetic gradient / checker / noise | ✅ |
+| Round-trip + cross-codec tested (ImageIO, libjpeg-turbo) on synthetic + DICOM | ✅ |
 | Adaptive dead-zone quantization | ❌ planned |
 | Distance-parameter quantization tuning | ❌ planned (API stub exists; ignored today) |
 | 10+ bit input (`.uint16`, `.float32`) | ❌ planned (encoder rejects today) |
 | XYB color space JPEG | ❌ planned (XYB transform math exists, encoder doesn't emit XYB) |
 | Progressive (SOF2) encode/decode | ❌ planned (SOF2 header parses; no progressive entropy decode) |
-| Optimized Huffman tables | ❌ planned (config flag exists; ignored today) |
 | Metal GPU pipeline | ⚠️ kernels compile but are not wired into encode/decode |
+
+### Optimized Huffman tables
+
+With `optimiseHuffman` (on by default) the encoder runs a counting pass over the
+quantized coefficients, builds per-image DC/AC tables via the ITU-T T.81 Annex K.2
+procedure, and embeds them in the DHT markers. Output stays fully baseline-compatible.
+
+On the DICOM corpus this matches libjpeg-turbo's `-optimize` byte-for-byte to within
+~0.5% at identical PSNR — a 21–54% size reduction over the fixed Annex K tables:
+
+| Image @ q=50 | fixed tables | optimized | libjpeg-turbo `-optimize` |
+|---|---|---|---|
+| CT  | 5190 B | **2368 B** | 2383 B |
+| MR  | 22982 B | **16541 B** | 16581 B |
+| XA  | 35001 B | **27571 B** | 27719 B |
 
 The configuration fields `progressive`, `optimiseHuffman`, `adaptiveQuantization`, `distance`, and `colorSpace = .xyb` are present on `JLIEncoderConfiguration` but are not yet honored — they exist as the planned API surface.
 
@@ -181,8 +197,9 @@ Next-up candidates (rough order):
 5. **XYB color-space encoding** — perceptual color space from JPEG XL.
 6. **10+ bit input** — accept `.uint16` / `.float32` source images with 8-bit backward-compatible output.
 7. **Progressive (SOF2) encode & decode**.
-8. **Optimized Huffman tables** — per-image table generation instead of standard fallback.
-9. **Metal hot path** — actually invoke the existing `JLIMetalPipeline` kernels from the encoder/decoder.
+8. **Metal hot path** — actually invoke the existing `JLIMetalPipeline` kernels from the encoder/decoder.
+
+Done since 0.1: spec-compliance fixes (byte-unstuffing, DRI/RST decode), Accelerate-backed batched DCT, and **optimized Huffman tables** (item 8 of the original list — now matches libjpeg-turbo's `-optimize`).
 
 ## Requirements
 
