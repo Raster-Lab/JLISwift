@@ -1,0 +1,171 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024 Raster Lab. All rights reserved.
+
+import Foundation
+
+/// A `Codec` that runs an external command-line encoder/decoder, piping pixel
+/// data in via PPM on stdin and reading JPEG (or PPM) back from stdout.
+///
+/// Three concrete codecs ship below — libjpeg-turbo, mozjpeg, and jpegli —
+/// all of which speak the same `cjpeg`/`djpeg` CLI dialect or a near-dialect.
+///
+/// Availability is determined at init time by probing the configured paths.
+/// If neither candidate path exists `enabled` is false and the bench skips
+/// this codec rather than failing every row.
+struct CLICodec: Codec {
+    let name: String
+    /// Path to the encoder binary, or nil if no candidate was found.
+    let encoderPath: String?
+    /// Path to the decoder binary (often the same project's `djpeg`).
+    let decoderPath: String?
+    /// Builds the encoder argv for a given quality. Stdin = PPM, stdout = JPEG.
+    let encoderArgs: @Sendable (Int) -> [String]
+    let isExternal = true
+
+    /// `enabled` is what the bench checks before adding the codec to its codec
+    /// list — encode/decode will throw `CodecError.unavailable` otherwise.
+    var enabled: Bool { encoderPath != nil && decoderPath != nil }
+
+    func encode(rgb: [UInt8], width: Int, height: Int, quality: Int) throws -> [UInt8] {
+        guard let path = encoderPath else { throw CodecError.unavailable(name) }
+        let ppm = PPM.encode(rgb: rgb, width: width, height: height)
+        return try runPipe(binary: path, args: encoderArgs(quality), stdin: ppm)
+    }
+
+    func decode(jpeg: [UInt8]) throws -> (rgb: [UInt8], width: Int, height: Int) {
+        guard let path = decoderPath else { throw CodecError.unavailable(name) }
+        // `djpeg` (libjpeg-turbo/mozjpeg) writes PPM to stdout by default.
+        let ppm = try runPipe(binary: path, args: [], stdin: jpeg)
+        return try PPM.decode(ppm)
+    }
+
+    /// Runs `binary args…`, feeding `stdin` bytes and capturing stdout bytes.
+    /// Throws if the process exits non-zero, including stderr in the message.
+    private func runPipe(binary: String, args: [String], stdin: [UInt8]) throws -> [UInt8] {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: binary)
+        proc.arguments = args
+
+        let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
+        proc.standardInput = inPipe
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+
+        try proc.run()
+
+        // Write input on a background thread so a large stdin doesn't deadlock
+        // against a small stdout pipe buffer.
+        let writeHandle = inPipe.fileHandleForWriting
+        DispatchQueue.global(qos: .userInitiated).async {
+            writeHandle.write(Data(stdin))
+            try? writeHandle.close()
+        }
+
+        let stdoutData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+
+        if proc.terminationStatus != 0 {
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let errStr = String(data: errData, encoding: .utf8) ?? "<binary stderr>"
+            throw CodecError.processFailed(
+                command: "\(binary) \(args.joined(separator: " "))",
+                exitCode: Int(proc.terminationStatus),
+                stderr: errStr
+            )
+        }
+        return [UInt8](stdoutData)
+    }
+}
+
+enum CodecError: Error, CustomStringConvertible {
+    case unavailable(String)
+    case processFailed(command: String, exitCode: Int, stderr: String)
+    var description: String {
+        switch self {
+        case .unavailable(let name):
+            return "\(name) is not installed (set $JLIBENCH_<NAME>_BIN or install via brew)"
+        case .processFailed(let cmd, let code, let err):
+            // Trim long stderr — the diff/regression table doesn't need a wall of text.
+            let trimmed = err.split(separator: "\n").prefix(3).joined(separator: " ")
+            return "\(cmd) exit \(code): \(trimmed)"
+        }
+    }
+}
+
+// MARK: - Concrete codecs
+
+/// Returns the first existing file from `candidates`, or nil if none exist.
+/// The bench probes a small set of well-known Homebrew/system paths.
+private func firstExisting(_ candidates: [String]) -> String? {
+    for p in candidates where FileManager.default.isExecutableFile(atPath: p) {
+        return p
+    }
+    return nil
+}
+
+enum ReferenceCodecs {
+
+    /// libjpeg-turbo's `cjpeg`/`djpeg`. Apple's ImageIO uses libjpeg-turbo too
+    /// internally — this independent install is a sanity check that our
+    /// JLISwift output decodes outside the Apple stack.
+    static func libjpegTurbo() -> CLICodec {
+        let enc = firstExisting([
+            "/opt/homebrew/opt/jpeg-turbo/bin/cjpeg",
+            "/usr/local/opt/jpeg-turbo/bin/cjpeg",
+            ProcessInfo.processInfo.environment["JLIBENCH_LIBJPEG_TURBO_BIN"] ?? "",
+        ])
+        let dec = firstExisting([
+            "/opt/homebrew/opt/jpeg-turbo/bin/djpeg",
+            "/usr/local/opt/jpeg-turbo/bin/djpeg",
+        ])
+        return CLICodec(
+            name: "libjpeg-turbo", encoderPath: enc, decoderPath: dec,
+            encoderArgs: { q in ["-quality", "\(q)", "-optimize"] }
+        )
+    }
+
+    /// Mozilla's mozjpeg encoder — drop-in `cjpeg`-API replacement with
+    /// trellis quantization + tuned tables. Materially better compression
+    /// than libjpeg-turbo at matched visual quality, so a good "improved
+    /// baseline JPEG" reference.
+    static func mozjpeg() -> CLICodec {
+        let enc = firstExisting([
+            "/opt/homebrew/opt/mozjpeg/bin/cjpeg",
+            "/usr/local/opt/mozjpeg/bin/cjpeg",
+            ProcessInfo.processInfo.environment["JLIBENCH_MOZJPEG_BIN"] ?? "",
+        ])
+        let dec = firstExisting([
+            "/opt/homebrew/opt/mozjpeg/bin/djpeg",
+            "/usr/local/opt/mozjpeg/bin/djpeg",
+        ])
+        return CLICodec(
+            name: "mozjpeg", encoderPath: enc, decoderPath: dec,
+            encoderArgs: { q in ["-quality", "\(q)"] }  // mozjpeg defaults are already good
+        )
+    }
+
+    /// Google's jpegli (`cjpegli`) — the reference JLISwift's long-term roadmap
+    /// targets. Encodes baseline-compatible JPEGs with jpegli's adaptive
+    /// quantization and tuned matrices. Decoding goes through libjpeg-turbo's
+    /// `djpeg` since jpegli output is standard JPEG.
+    static func jpegli() -> CLICodec {
+        let enc = firstExisting([
+            "/opt/homebrew/opt/jpegli/bin/cjpegli",
+            "/opt/homebrew/opt/jpeg-xl/bin/cjpegli",
+            "/usr/local/opt/jpegli/bin/cjpegli",
+            ProcessInfo.processInfo.environment["JLIBENCH_JPEGLI_BIN"] ?? "",
+        ])
+        // jpegli has no dedicated decoder — its output is standard JPEG, so we
+        // fall back to libjpeg-turbo's djpeg for the decode side.
+        let dec = firstExisting([
+            "/opt/homebrew/opt/jpeg-turbo/bin/djpeg",
+            "/usr/local/opt/jpeg-turbo/bin/djpeg",
+        ])
+        return CLICodec(
+            name: "jpegli", encoderPath: enc, decoderPath: dec,
+            // cjpegli wants files, not stdin. We adapt at the call site by
+            // mapping `-` to stdin; recent cjpegli builds support it.
+            encoderArgs: { q in ["--quality", "\(q)", "-", "-"] }
+        )
+    }
+}

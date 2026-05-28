@@ -8,8 +8,16 @@ import JLISwift
 /// Returning `nil` from either function means "this codec is unavailable on this platform."
 protocol Codec: Sendable {
     var name: String { get }
+    /// True for codecs that shell out to an external binary. Their timing is
+    /// dominated by process spawn (~70 ms/call on macOS), so the harness skips
+    /// the median-of-5 sampler and runs them once — bytes/PSNR are deterministic.
+    var isExternal: Bool { get }
     func encode(rgb: [UInt8], width: Int, height: Int, quality: Int) throws -> [UInt8]
     func decode(jpeg: [UInt8]) throws -> (rgb: [UInt8], width: Int, height: Int)
+}
+
+extension Codec {
+    var isExternal: Bool { false }
 }
 
 struct JLISwiftCodec: Codec {

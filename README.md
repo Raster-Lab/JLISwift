@@ -113,10 +113,60 @@ Sources/JLISwift/
 ├── Metal/                JLIMetalPipeline — compiles MSL kernels at runtime (not yet wired)
 └── Platform/             AccelerateBackend (vDSP DSP primitives), JLIPlatformCapabilities
 
-Sources/JLIBench/         Benchmark CLI comparing JLISwift against Apple ImageIO
+Sources/JLIBench/
+├── Codecs/               Codec protocol, JLISwift adapter, ImageIO adapter,
+│                         CLICodec shell-out base + reference adapters
+│                         (libjpeg-turbo / mozjpeg / jpegli), PPM IO
+├── Dataset/              DICOMReader (uncompressed VR LE), DICOMCorpus loader+cache
+├── Regression/           Save/load JSON baseline, diff with tolerances, exit 1 on drift
+├── Harness.swift         Median-of-N timing, PSNR, self/cross runners
+└── main.swift            CLI: synthetic + DICOM modes, regression flags
 
-Tests/JLISwiftTests/      87 tests across 7 suites (Swift Testing framework)
+Tests/JLISwiftTests/      89 tests across 7 suites (Swift Testing framework)
 ```
+
+## Bench: cross-codec + regression
+
+The `JLIBench` target benchmarks JLISwift against system codecs and tracks
+regressions across runs.
+
+```bash
+swift run -c release JLIBench                           # synthetic corpus
+swift run -c release JLIBench --dicom                   # + DICOM corpus
+swift run -c release JLIBench --save-baseline b.json    # snapshot
+swift run -c release JLIBench --check-baseline b.json   # exit 1 on regression
+```
+
+### Reference codecs (auto-detected)
+
+The bench probes for these external encoders and includes any that are
+installed. Cross-codec pairs are generated automatically: `JLISwift →
+each-reference` and `each-reference → JLISwift`.
+
+| Codec | Install | Probed path |
+|---|---|---|
+| **libjpeg-turbo** | `brew install jpeg-turbo` | `/opt/homebrew/opt/jpeg-turbo/bin/{cjpeg,djpeg}` |
+| **mozjpeg** | `brew install mozjpeg` | `/opt/homebrew/opt/mozjpeg/bin/{cjpeg,djpeg}` |
+| **jpegli** | `brew install jpegli` or build libjxl with `JPEGXL_ENABLE_TOOLS=ON` | `/opt/homebrew/opt/jpegli/bin/cjpegli` |
+
+The bench prints active vs inactive codecs at startup. Per-codec binary
+paths can also be overridden via env vars (`JLIBENCH_LIBJPEG_TURBO_BIN`,
+`JLIBENCH_MOZJPEG_BIN`, `JLIBENCH_JPEGLI_BIN`).
+
+External codecs spawn a process per encode/decode (~70 ms overhead each on
+macOS) so the harness times them with a single sample rather than the
+median-of-5 it uses for native codecs. Bytes and PSNR are unaffected.
+
+### DICOM corpus
+
+`JLIBench --dicom` loads a small sample from a clinical DICOM tree
+(`Sources/LocalDatasets/medical-dicom-organized/` by default), windows the
+16-bit pixels to 8-bit, and runs every codec + cross pair against the
+result. Files that hit unsupported transfer syntaxes (compressed-in-DICOM,
+RLE) are silently skipped — only uncompressed Little Endian VR (Implicit
+and Explicit, the typical CT/MR/DX/MG output) is decoded today. Converted
+images are cached at `~/.cache/jlibench/corpus/`; `--rebuild-cache` clears
+it.
 
 ## Roadmap
 

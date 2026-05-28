@@ -114,15 +114,18 @@ enum Harness {
     }
 
     static func run(codec: Codec, image: TestImage, quality: Int) throws -> Result {
+        // Shell-out codecs are overhead-dominated; one sample is enough.
+        let iters = codec.isExternal ? 1 : 5
+
         var jpegBytes = [UInt8]()
-        let encMs = try timeMs {
+        let encMs = try timeMs(iterations: iters) {
             jpegBytes = try codec.encode(
                 rgb: image.rgb, width: image.width, height: image.height, quality: quality
             )
         }
 
         var decoded: (rgb: [UInt8], width: Int, height: Int) = ([], 0, 0)
-        let decMs = try timeMs {
+        let decMs = try timeMs(iterations: iters) {
             decoded = try codec.decode(jpeg: jpegBytes)
         }
 

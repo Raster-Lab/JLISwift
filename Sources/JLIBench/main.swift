@@ -78,13 +78,42 @@ if opts.rebuildCache { DICOMCorpus.clearCache() }
 let jli420 = JLISwiftCodec(subsampling: .yuv420)
 let jli444 = JLISwiftCodec(subsampling: .yuv444)
 let imageIO = ImageIOCodec()
-let codecs: [Codec] = [jli420, jli444, imageIO]
 
-let crossPairs: [(encoder: Codec, decoder: Codec)] = [
-    (jli444, imageIO),
-    (jli420, imageIO),
-    (imageIO, jli444),
+// Reference codecs shell out to external binaries; each probes its install
+// paths at construction time and reports `enabled` accordingly. Missing tools
+// are dropped from the bench rather than failing every row.
+let refCodecs: [CLICodec] = [
+    ReferenceCodecs.libjpegTurbo(),
+    ReferenceCodecs.mozjpeg(),
+    ReferenceCodecs.jpegli(),
 ]
+
+var codecs: [Codec] = [jli420, jli444, imageIO]
+for c in refCodecs where c.enabled { codecs.append(c) }
+
+// Cross-codec pairs:
+//   - JLISwift (both subsamplings) → every other codec's decoder
+//   - every other codec's encoder → JLISwift decoder
+// We deliberately skip third-party ↔ third-party pairs — they exercise
+// libraries we don't ship and don't validate JLISwift.
+var crossPairs: [(encoder: Codec, decoder: Codec)] = []
+let jlEncoders: [Codec] = [jli444, jli420]
+let otherCodecs: [Codec] = [imageIO] + refCodecs.filter { $0.enabled }
+for jl in jlEncoders {
+    for other in otherCodecs {
+        crossPairs.append((jl, other))
+    }
+}
+for other in otherCodecs {
+    crossPairs.append((other, jli444))
+}
+
+print("active codecs: \(codecs.map(\.name).joined(separator: ", "))")
+let missing = refCodecs.filter { !$0.enabled }.map(\.name)
+if !missing.isEmpty {
+    print("inactive (install via brew): \(missing.joined(separator: ", "))")
+}
+print("")
 
 // Accumulator that everything (synthetic + DICOM, self + cross) appends to,
 // then fed into baseline save / regression check.
