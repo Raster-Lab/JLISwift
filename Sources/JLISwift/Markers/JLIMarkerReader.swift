@@ -38,6 +38,11 @@ struct JPEGScanHeader: Sendable {
 struct JPEGScanData: Sendable {
     let header: JPEGScanHeader
     let entropyData: [UInt8]
+    /// Huffman tables in effect when this scan's SOS was parsed. Progressive
+    /// JPEGs redefine DHT tables between scans, so each scan must use the
+    /// snapshot active at its point in the stream, not a global merge.
+    let dcTables: [Int: HuffmanTable]
+    let acTables: [Int: HuffmanTable]
 }
 
 /// Fully parsed JPEG data ready for decoding.
@@ -157,7 +162,11 @@ struct MarkerReader {
             case JPEGMarker.sos:
                 let scanHeader = try readSOS()
                 let entropyData = try readEntropyData()
-                scans.append(JPEGScanData(header: scanHeader, entropyData: entropyData))
+                // Snapshot the tables active right now (progressive redefines them).
+                scans.append(JPEGScanData(
+                    header: scanHeader, entropyData: entropyData,
+                    dcTables: huffDC, acTables: huffAC
+                ))
 
             case JPEGMarker.eoi:
                 break

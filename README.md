@@ -50,13 +50,14 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | RGB / RGBA / grayscale / pre-converted YCbCr input (8-bit) | ✅ |
 | **12-bit grayscale** encode + decode (`.uint16` → SOF1 precision-12 JPEG) | ✅ |
 | SOF1 (extended sequential) decode — reads 12-bit JPEGs from libjpeg/ImageIO | ✅ |
+| **Progressive (SOF2) decode** — multi-scan, spectral selection, successive approximation | ✅ |
 | `inspect()` — metadata parse without full decode | ✅ |
 | Accelerate `vDSP_mmul` DCT, `vDSP_vmul` quant, vectorized BT.601 color conversion | ✅ |
 | Round-trip + cross-codec tested (ImageIO, libjpeg-turbo, mozjpeg) on synthetic + DICOM | ✅ |
 | Trellis quantization — keep/drop + HF magnitude reduction (`adaptiveQuantization`, 8-bit, default on) | ✅ |
 | 12-bit *color* / 16-bit / float32 input | ❌ planned (12-bit grayscale works; color path still assumes 8-bit BT.601) |
 | XYB color space JPEG | ❌ planned (XYB transform math exists, encoder doesn't emit XYB) |
-| Progressive (SOF2) encode/decode | ❌ planned (SOF2 header parses; no progressive entropy decode) |
+| Progressive (SOF2) *encode* | ❌ planned (decode works; encoder still emits baseline) |
 | Metal GPU pipeline | ⚠️ kernels compile but are not wired into encode/decode |
 
 ### Optimized Huffman tables
@@ -253,7 +254,7 @@ Next-up candidates (rough order):
 7. **Progressive (SOF2) encode & decode**.
 8. **Metal hot path** — actually invoke the existing `JLIMetalPipeline` kernels from the encoder/decoder.
 
-Done since 0.1: spec-compliance fixes (byte-unstuffing, DRI/RST decode), Accelerate-backed batched DCT, **optimized Huffman tables** (matches libjpeg-turbo's `-optimize`), and **12-bit grayscale** encode/decode (cross-validated against libjpeg-turbo + ImageIO).
+Done since 0.1: spec-compliance fixes (byte-unstuffing, DRI/RST decode), Accelerate-backed batched DCT, **optimized Huffman tables** (matches libjpeg-turbo's `-optimize`), **12-bit grayscale** encode/decode, **distance parameter**, **trellis quantization** (keep/drop + HF magnitude reduction), and **progressive (SOF2) decode** (reads libjpeg-turbo/mozjpeg/ImageIO progressive output) — all cross-validated against libjpeg-turbo, mozjpeg + ImageIO with PSNR and butteraugli.
 
 ## Requirements
 

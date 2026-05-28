@@ -182,13 +182,12 @@ enum ReferenceCodecs {
             "/opt/homebrew/opt/mozjpeg/bin/djpeg",
             "/usr/local/opt/mozjpeg/bin/djpeg",
         ])
-        // `-baseline`: mozjpeg defaults to progressive (SOF2), which JLISwift
-        // can't decode yet — force sequential so the cross-codec matrix works.
-        // Trellis quantization (mozjpeg's real compression win) is independent
-        // of progression and stays active.
+        // mozjpeg's default is progressive (SOF2) — JLISwift now decodes that,
+        // so we let it use its native default, exercising the progressive path
+        // in the cross-codec matrix.
         return CLICodec(
             name: "mozjpeg", encoderPath: enc, decoderPath: dec,
-            encoderArgs: { q in ["-quality", "\(q)", "-baseline"] }
+            encoderArgs: { q in ["-quality", "\(q)"] }
         )
     }
 

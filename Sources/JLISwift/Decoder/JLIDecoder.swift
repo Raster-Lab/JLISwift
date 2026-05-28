@@ -104,57 +104,82 @@ public struct JLIDecoder: Sendable {
         }
 
         // Step 6: Decode entropy data into the flat per-component buffers.
-        let scan = parsed.scans[0]
-        var bitReader = BitReader(data: scan.entropyData)
-        var prevDC = [Int32](repeating: 0, count: numComponents)
-        var acBuf = [Int32](repeating: 0, count: 64)
+        // Progressive (SOF2) uses multiple scans with spectral selection and
+        // successive approximation; baseline/extended-sequential uses one scan.
+        if frame.isProgressive {
+            // Non-interleaved (AC) scans address each component's own data-unit
+            // grid: ceil(compW/8) × ceil(compH/8), where compW/H = the component's
+            // dimensions after subsampling. Smaller than the MCU-padded grid for
+            // images that aren't a whole number of MCUs.
+            let realW = components.map { comp -> Int in
+                let compW = (frame.width * comp.horizontalSampling + hMaxSampling - 1) / hMaxSampling
+                return (compW + 7) / 8
+            }
+            let realH = components.map { comp -> Int in
+                let compH = (frame.height * comp.verticalSampling + vMaxSampling - 1) / vMaxSampling
+                return (compH + 7) / 8
+            }
+            var prog = ProgressiveDecoder(
+                components: components,
+                mcuCountH: mcuCountH, mcuCountV: mcuCountV,
+                blocksPerRow: componentBlocksPerRow,
+                blocksPerCol: componentDimensions.map { $0.blocksV },
+                realBlocksW: realW, realBlocksH: realH,
+                restartInterval: parsed.restartInterval
+            )
+            try prog.decode(scans: parsed.scans)
+            componentZigzag = prog.coeffs
+        } else {
+            let scan = parsed.scans[0]
+            var bitReader = BitReader(data: scan.entropyData)
+            var prevDC = [Int32](repeating: 0, count: numComponents)
+            var acBuf = [Int32](repeating: 0, count: 64)
 
-        let restartInterval = parsed.restartInterval
-        var mcuCount = 0
-        var restartIndex = 0
+            let restartInterval = parsed.restartInterval
+            var mcuCount = 0
+            var restartIndex = 0
 
-        for mcuY in 0..<mcuCountV {
-            for mcuX in 0..<mcuCountH {
-                // Restart marker handling: every `restartInterval` MCUs, JPEG inserts
-                // an RST0–RST7 marker (cycled). Skip it and reset DC predictors so
-                // a corrupted segment can't poison subsequent ones.
-                if restartInterval > 0 && mcuCount > 0
-                    && mcuCount % restartInterval == 0 {
-                    try bitReader.skipRestartMarker(expectedIndex: restartIndex)
-                    restartIndex = (restartIndex + 1) & 7
-                    for i in 0..<numComponents { prevDC[i] = 0 }
-                }
-                mcuCount += 1
+            for mcuY in 0..<mcuCountV {
+                for mcuX in 0..<mcuCountH {
+                    // Every `restartInterval` MCUs, skip the RST0–RST7 marker
+                    // (cycled) and reset DC predictors.
+                    if restartInterval > 0 && mcuCount > 0
+                        && mcuCount % restartInterval == 0 {
+                        try bitReader.skipRestartMarker(expectedIndex: restartIndex)
+                        restartIndex = (restartIndex + 1) & 7
+                        for i in 0..<numComponents { prevDC[i] = 0 }
+                    }
+                    mcuCount += 1
 
-                for compIdx in 0..<numComponents {
-                    let comp = components[compIdx]
-                    let scanComp = scan.header.components.first { $0.componentSelector == comp.id }
-                    let dcTableId = scanComp?.dcTableId ?? 0
-                    let acTableId = scanComp?.acTableId ?? 0
-                    let dcTable = dcTables[dcTableId]
-                    let acTable = acTables[acTableId]
-                    let blocksPerRow = componentBlocksPerRow[compIdx]
+                    for compIdx in 0..<numComponents {
+                        let comp = components[compIdx]
+                        let scanComp = scan.header.components.first { $0.componentSelector == comp.id }
+                        let dcTableId = scanComp?.dcTableId ?? 0
+                        let acTableId = scanComp?.acTableId ?? 0
+                        let dcTable = dcTables[dcTableId]
+                        let acTable = acTables[acTableId]
+                        let blocksPerRow = componentBlocksPerRow[compIdx]
 
-                    for by in 0..<comp.verticalSampling {
-                        for bx in 0..<comp.horizontalSampling {
-                            let blockX = mcuX * comp.horizontalSampling + bx
-                            let blockY = mcuY * comp.verticalSampling + by
-                            let blockIndex = blockY * blocksPerRow + blockX
-                            let dst = blockIndex * 64
+                        for by in 0..<comp.verticalSampling {
+                            for bx in 0..<comp.horizontalSampling {
+                                let blockX = mcuX * comp.horizontalSampling + bx
+                                let blockY = mcuY * comp.verticalSampling + by
+                                let blockIndex = blockY * blocksPerRow + blockX
+                                let dst = blockIndex * 64
 
-                            let dcDiff = try HuffmanDecoder.decodeDC(
-                                from: &bitReader, table: dcTable
-                            )
-                            prevDC[compIdx] += dcDiff
+                                let dcDiff = try HuffmanDecoder.decodeDC(
+                                    from: &bitReader, table: dcTable
+                                )
+                                prevDC[compIdx] += dcDiff
 
-                            try HuffmanDecoder.decodeAC(
-                                from: &bitReader, table: acTable, into: &acBuf
-                            )
-                            acBuf[0] = prevDC[compIdx]
+                                try HuffmanDecoder.decodeAC(
+                                    from: &bitReader, table: acTable, into: &acBuf
+                                )
+                                acBuf[0] = prevDC[compIdx]
 
-                            // Splat the block's zigzag coefficients into the flat buffer.
-                            for i in 0..<64 {
-                                componentZigzag[compIdx][dst + i] = acBuf[i]
+                                for i in 0..<64 {
+                                    componentZigzag[compIdx][dst + i] = acBuf[i]
+                                }
                             }
                         }
                     }
