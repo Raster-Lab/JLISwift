@@ -186,4 +186,60 @@ struct ProgressiveTests {
         }
         #expect(maxDiff == 0, "grayscale progressive vs baseline max pixel diff \(maxDiff)")
     }
+
+    /// Successive-approximation mode (libjpeg's band-split, multi-Al script) must
+    /// also reconstruct the full coefficients exactly — the first + refine passes
+    /// together carry every bit, so decode must match baseline pixel-for-pixel.
+    @Test("Progressive successive-approximation encode round-trips identically (color)")
+    func progressiveSuccessiveApproxColor() throws {
+        let w = 48, h = 40
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 3
+                rgb[i] = UInt8((x * 5) & 0xFF)
+                rgb[i + 1] = UInt8((y * 7) & 0xFF)
+                rgb[i + 2] = UInt8(((x + y) * 3) & 0xFF)
+            }
+        }
+        let image = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
+
+        var baseCfg = JLIEncoderConfiguration.default
+        baseCfg.progressive = false; baseCfg.chromaSubsampling = .yuv420
+        var progCfg = JLIEncoderConfiguration.default
+        progCfg.progressive = true; progCfg.chromaSubsampling = .yuv420
+        progCfg.progressiveMode = .successiveApproximation
+
+        let baseDec = try JLIDecoder().decode(from: try JLIEncoder().encode(image, configuration: baseCfg))
+        let progJPEG = try JLIEncoder().encode(image, configuration: progCfg)
+        #expect(try JLIDecoder().inspect(data: progJPEG).isProgressive)
+        let progDec = try JLIDecoder().decode(from: progJPEG)
+        var maxDiff = 0
+        for i in 0..<min(baseDec.data.count, progDec.data.count) {
+            maxDiff = max(maxDiff, abs(Int(baseDec.data[i]) - Int(progDec.data[i])))
+        }
+        #expect(maxDiff == 0, "SA-progressive encode vs baseline max pixel diff \(maxDiff)")
+    }
+
+    @Test("Progressive successive-approximation encode round-trips identically (grayscale)")
+    func progressiveSuccessiveApproxGrayscale() throws {
+        let w = 40, h = 24
+        var gray = [UInt8](repeating: 0, count: w * h)
+        for y in 0..<h { for x in 0..<w { gray[y * w + x] = UInt8((x * 3 + y * 5) & 0xFF) } }
+        let image = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .grayscale, data: gray)
+
+        var baseCfg = JLIEncoderConfiguration.default
+        baseCfg.progressive = false; baseCfg.chromaSubsampling = .yuv400
+        var progCfg = JLIEncoderConfiguration.default
+        progCfg.progressive = true; progCfg.chromaSubsampling = .yuv400
+        progCfg.progressiveMode = .successiveApproximation
+
+        let baseDec = try JLIDecoder().decode(from: try JLIEncoder().encode(image, configuration: baseCfg))
+        let progDec = try JLIDecoder().decode(from: try JLIEncoder().encode(image, configuration: progCfg))
+        var maxDiff = 0
+        for i in 0..<min(baseDec.data.count, progDec.data.count) {
+            maxDiff = max(maxDiff, abs(Int(baseDec.data[i]) - Int(progDec.data[i])))
+        }
+        #expect(maxDiff == 0, "SA-progressive grayscale vs baseline max pixel diff \(maxDiff)")
+    }
 }

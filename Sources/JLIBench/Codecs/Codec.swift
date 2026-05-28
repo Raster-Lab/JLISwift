@@ -38,12 +38,15 @@ struct JLISwiftCodec: Codec, Gray16Codec {
     let name: String
     let subsampling: JLIChromaSubsampling
     let progressive: Bool
+    let progressiveMode: JLIProgressiveMode
     // Explicit (both Codec and Gray16Codec supply a default — disambiguate).
     let isExternal = false
 
-    init(subsampling: JLIChromaSubsampling, progressive: Bool = false) {
+    init(subsampling: JLIChromaSubsampling, progressive: Bool = false,
+         progressiveMode: JLIProgressiveMode = .spectralSelection) {
         self.subsampling = subsampling
         self.progressive = progressive
+        self.progressiveMode = progressiveMode
         let tag: String
         switch subsampling {
         case .yuv444: tag = "4:4:4"
@@ -51,7 +54,14 @@ struct JLISwiftCodec: Codec, Gray16Codec {
         case .yuv420: tag = "4:2:0"
         case .yuv400: tag = "gray"
         }
-        self.name = "JLISwift(\(tag)\(progressive ? ",prog" : ""))"
+        // ",prog" = spectral selection; ",progSA" = successive approximation.
+        let progTag: String
+        switch (progressive, progressiveMode) {
+        case (false, _): progTag = ""
+        case (true, .spectralSelection): progTag = ",prog"
+        case (true, .successiveApproximation): progTag = ",progSA"
+        }
+        self.name = "JLISwift(\(tag)\(progTag))"
     }
 
     func encode(rgb: [UInt8], width: Int, height: Int, quality: Int) throws -> [UInt8] {
@@ -64,6 +74,7 @@ struct JLISwiftCodec: Codec, Gray16Codec {
         config.quality = Double(quality)
         config.chromaSubsampling = subsampling
         config.progressive = progressive
+        config.progressiveMode = progressiveMode
         return try JLIEncoder().encode(image, configuration: config)
     }
 

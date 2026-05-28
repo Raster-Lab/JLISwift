@@ -288,11 +288,11 @@ public struct JLIEncoder: Sendable {
                 blocksPerRow: bpr, realBlocksW: rW, realBlocksH: rH,
                 quant: quantArrays
             )
-            let out = prog.build()
-            mw.writeDHT(tables: out.dhtTables)
-            for scan in out.scans {
+            for scan in prog.build(mode: configuration.progressiveMode) {
+                if !scan.dht.isEmpty { mw.writeDHT(tables: scan.dht) }
                 mw.writeSOS(components: scan.sosComponents,
-                            spectralStart: scan.ss, spectralEnd: scan.se)
+                            spectralStart: scan.ss, spectralEnd: scan.se,
+                            successiveApproxHigh: scan.ah, successiveApproxLow: scan.al)
                 mw.writeEntropyData(scan.entropy)
             }
             mw.writeEOI()

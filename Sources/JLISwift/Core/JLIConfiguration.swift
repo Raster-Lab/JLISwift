@@ -16,6 +16,22 @@ public enum JLIChromaSubsampling: Sendable {
     case yuv400
 }
 
+/// The scan script used when encoding a progressive (SOF2) JPEG.
+public enum JLIProgressiveMode: Sendable {
+    /// Spectral selection only: one DC scan plus one full-band AC scan per
+    /// component, using end-of-band runs (EOBRUN). Best for flat / low-frequency
+    /// content such as medical imaging — a run of AC-empty blocks collapses to a
+    /// single EOBn symbol. This is the default.
+    case spectralSelection
+
+    /// Spectral selection **and** successive approximation: libjpeg's canonical
+    /// `jpeg_simple_progression` script (band-split luma, Al=2 luma / Al=1
+    /// chroma, refined to 0). Slightly smaller on textured / photographic
+    /// content, but larger on flat content where the extra scans fragment EOB
+    /// runs. Opt in when encoding natural photographs rather than medical plates.
+    case successiveApproximation
+}
+
 /// The color space to use for encoding the JPEG.
 public enum JLIEncodingColorSpace: Sendable {
     /// Standard YCbCr encoding (default, maximum compatibility).
@@ -55,6 +71,11 @@ public struct JLIEncoderConfiguration: Sendable {
     /// Whether to produce a progressive JPEG.
     public var progressive: Bool
 
+    /// The scan script for progressive encoding (ignored unless ``progressive``
+    /// is set). Defaults to ``JLIProgressiveMode/spectralSelection``, which
+    /// compresses flat / medical content best.
+    public var progressiveMode: JLIProgressiveMode
+
     /// Whether to use optimised Huffman coding.
     public var optimiseHuffman: Bool
 
@@ -75,6 +96,7 @@ public struct JLIEncoderConfiguration: Sendable {
         chromaSubsampling: .yuv420,
         colorSpace: .yCbCr,
         progressive: false,
+        progressiveMode: .spectralSelection,
         optimiseHuffman: true,
         adaptiveQuantization: true
     )
@@ -95,6 +117,7 @@ public struct JLIEncoderConfiguration: Sendable {
         chromaSubsampling: JLIChromaSubsampling = .yuv420,
         colorSpace: JLIEncodingColorSpace = .yCbCr,
         progressive: Bool = true,
+        progressiveMode: JLIProgressiveMode = .spectralSelection,
         optimiseHuffman: Bool = true,
         adaptiveQuantization: Bool = true
     ) {
@@ -103,6 +126,7 @@ public struct JLIEncoderConfiguration: Sendable {
         self.chromaSubsampling = chromaSubsampling
         self.colorSpace = colorSpace
         self.progressive = progressive
+        self.progressiveMode = progressiveMode
         self.optimiseHuffman = optimiseHuffman
         self.adaptiveQuantization = adaptiveQuantization
     }

@@ -1,111 +1,128 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024 Raster Lab. All rights reserved.
 
-/// Encodes per-component quantized coefficients (zigzag order) into progressive
-/// (SOF2) scans — the inverse of ``ProgressiveDecoder``.
+/// Encodes per-component quantized coefficients (natural order) into progressive
+/// (SOF2) scans — the inverse of ``ProgressiveDecoder``. Faithful port of
+/// libjpeg `jcphuff.c`. Two scan scripts are supported (see ``JLIProgressiveMode``):
 ///
-/// Scan script (spectral selection only, no successive approximation):
-/// - one **DC scan**, all components interleaved (Ss=Se=0);
-/// - one **AC scan per component** over the full band (Ss=1, Se=63),
-///   non-interleaved, with end-of-band runs (EOBRUN) — the main progressive
-///   compression lever: a run of blocks empty in the band collapses to one EOBn
-///   symbol.
+/// **Spectral selection** (default, `jpeg_simple_progression` would call this
+/// "no successive approximation") — one DC scan, then one full-band AC scan per
+/// component (Ss=1 Se=63, Ah=Al=0) with end-of-band runs. A run of AC-empty
+/// blocks collapses to one EOBn symbol, which is why flat / medical content
+/// compresses best here.
 ///
-/// Four optimal Huffman tables (DC/AC × luma/chroma) are built from a counting
-/// pass over the exact same walk the emit pass uses, and defined once up front;
-/// every scan references them. Successive approximation (finer progressive
-/// rendering, smaller files) is left for a later revision.
+/// **Successive approximation** — libjpeg's canonical YCbCr script (10 scans) /
+/// all-purpose script (6 scans for grayscale): band-split luma, Al=2 luma /
+/// Al=1 chroma in the first passes, refined down to Al=0. Smaller on textured
+/// content, larger on flat content (extra scans fragment EOB runs).
+///
+/// Each Huffman-coded scan carries its own optimal DHT, built from a counting
+/// pass over the exact walk its emit pass uses. DC refine emits raw bits only.
+/// DC successive approximation uses an arithmetic (sign-extending) shift; AC
+/// uses a magnitude-preserving point transform with a separate sign bit.
 struct ProgressiveEncoder {
-    let components: [JPEGComponentInfo]   // id, sampling, quantTableIndex
+    let components: [JPEGComponentInfo]
     let isGrayscale: Bool
     let mcuCountH: Int
     let mcuCountV: Int
-    /// MCU-padded blocks per row, per component (coefficient storage stride).
-    let blocksPerRow: [Int]
-    /// Real data-unit grid per component (non-interleaved AC scans address this).
-    let realBlocksW: [Int]
+    let blocksPerRow: [Int]      // MCU-padded stride / interleaved DC grid
+    let realBlocksW: [Int]       // component data-unit grid (non-interleaved AC)
     let realBlocksH: [Int]
-    /// Per-component **natural-order** quantized coefficients, block `b` at
-    /// `b*64` (as produced by `quantizePlane`). AC indexing goes through
-    /// `Quantization.zigzagOrder` to walk the spectral band in zigzag sequence.
-    let quant: [[Int32]]
+    let quant: [[Int32]]         // natural order, block b at b*64
+
+    private let zz = Quantization.zigzagOrder
+    private func tableId(_ c: Int) -> Int { c == 0 ? 0 : 1 }
 
     struct ScanPlan {
+        let dht: [(tableClass: Int, tableId: Int, bits: [UInt8], values: [UInt8])]
         let sosComponents: [(selector: UInt8, dcTableId: Int, acTableId: Int)]
-        let ss: Int
-        let se: Int
+        let ss: Int, se: Int, ah: Int, al: Int
         let entropy: [UInt8]
     }
 
-    struct Output {
-        /// (tableClass, tableId, bits, values) for a single DHT segment.
-        let dhtTables: [(tableClass: Int, tableId: Int, bits: [UInt8], values: [UInt8])]
-        let scans: [ScanPlan]
-        let estimatedSize: Int
+    /// Magnitude-preserving point transform for AC: |coef| >> al, sign kept.
+    private func pt(_ c: Int32, _ al: Int) -> Int32 {
+        if c >= 0 { return c >> al }
+        return -((-c) >> al)
     }
 
-    /// Component index → table id: luma (component 0) uses table 0, chroma uses 1.
-    private func tableId(_ compIndex: Int) -> Int { compIndex == 0 ? 0 : 1 }
-
-    func build() -> Output {
-        // 1. Counting pass → four symbol-frequency histograms.
-        var dcLumFreq = [Int](repeating: 0, count: 256)
-        var dcChrFreq = [Int](repeating: 0, count: 256)
-        var acLumFreq = [Int](repeating: 0, count: 256)
-        var acChrFreq = [Int](repeating: 0, count: 256)
-
-        countDC(dcLum: &dcLumFreq, dcChr: &dcChrFreq)
-        for c in 0..<components.count {
-            if c == 0 { countAC(component: c, freq: &acLumFreq) }
-            else { countAC(component: c, freq: &acChrFreq) }
+    func build(mode: JLIProgressiveMode) -> [ScanPlan] {
+        switch mode {
+        case .spectralSelection: return buildSpectralSelection()
+        case .successiveApproximation: return buildSuccessiveApproximation()
         }
+    }
 
-        // 2. Build optimal tables.
-        let dcLum = HuffmanTableBuilder.build(frequencies: dcLumFreq, fallback: StandardHuffmanTables.dcLuminance)
-        let acLum = HuffmanTableBuilder.build(frequencies: acLumFreq, fallback: StandardHuffmanTables.acLuminance)
-        var dht: [(tableClass: Int, tableId: Int, bits: [UInt8], values: [UInt8])] = [
-            (0, 0, dcLum.bits, dcLum.values),
-            (1, 0, acLum.bits, acLum.values),
-        ]
-        var dcChr = dcLum, acChr = acLum
-        if !isGrayscale {
-            dcChr = HuffmanTableBuilder.build(frequencies: dcChrFreq, fallback: StandardHuffmanTables.dcChrominance)
-            acChr = HuffmanTableBuilder.build(frequencies: acChrFreq, fallback: StandardHuffmanTables.acChrominance)
-            dht.append((0, 1, dcChr.bits, dcChr.values))
-            dht.append((1, 1, acChr.bits, acChr.values))
-        }
-
-        // 3. Emit each scan.
+    /// One DC scan + one full-band AC scan per component, no successive
+    /// approximation (Ah=Al=0 everywhere). The full-precision coefficients are
+    /// sent once; EOBRUN over AC-empty blocks is the compression lever.
+    private func buildSpectralSelection() -> [ScanPlan] {
         var scans = [ScanPlan]()
-        var total = 0
-
-        // DC scan: all components interleaved, Ss=Se=0.
-        var dcSOS = [(selector: UInt8, dcTableId: Int, acTableId: Int)]()
+        scans.append(makeDCScan(ah: 0, al: 0))
         for c in 0..<components.count {
-            dcSOS.append((components[c].id, tableId(c), 0))
+            scans.append(makeACScan(c: c, ss: 1, se: 63, ah: 0, al: 0))
         }
-        let dcEntropy = emitDC(dcLum: dcLum, dcChr: dcChr)
-        scans.append(ScanPlan(sosComponents: dcSOS, ss: 0, se: 0, entropy: dcEntropy))
-        total += dcEntropy.count
-
-        // AC scans: one per component, full band, non-interleaved.
-        for c in 0..<components.count {
-            let table = c == 0 ? acLum : acChr
-            let entropy = emitAC(component: c, table: table)
-            scans.append(ScanPlan(
-                sosComponents: [(components[c].id, 0, tableId(c))],
-                ss: 1, se: 63, entropy: entropy
-            ))
-            total += entropy.count
-        }
-
-        return Output(dhtTables: dht, scans: scans, estimatedSize: total + 1024)
+        return scans
     }
 
-    // MARK: - DC scan (interleaved)
+    /// libjpeg `jpeg_simple_progression`: 10-scan YCbCr / 6-scan grayscale,
+    /// band-split luma with multi-level successive approximation.
+    private func buildSuccessiveApproximation() -> [ScanPlan] {
+        var scans = [ScanPlan]()
+        if isGrayscale {
+            scans.append(makeDCScan(ah: 0, al: 1))
+            scans.append(makeACScan(c: 0, ss: 1, se: 5, ah: 0, al: 2))
+            scans.append(makeACScan(c: 0, ss: 6, se: 63, ah: 0, al: 2))
+            scans.append(makeACScan(c: 0, ss: 1, se: 63, ah: 2, al: 1))
+            scans.append(makeDCScan(ah: 1, al: 0))
+            scans.append(makeACScan(c: 0, ss: 1, se: 63, ah: 1, al: 0))
+        } else {
+            scans.append(makeDCScan(ah: 0, al: 1))
+            scans.append(makeACScan(c: 0, ss: 1, se: 5, ah: 0, al: 2))
+            scans.append(makeACScan(c: 2, ss: 1, se: 63, ah: 0, al: 1))
+            scans.append(makeACScan(c: 1, ss: 1, se: 63, ah: 0, al: 1))
+            scans.append(makeACScan(c: 0, ss: 6, se: 63, ah: 0, al: 2))
+            scans.append(makeACScan(c: 0, ss: 1, se: 63, ah: 2, al: 1))
+            scans.append(makeDCScan(ah: 1, al: 0))
+            scans.append(makeACScan(c: 2, ss: 1, se: 63, ah: 1, al: 0))
+            scans.append(makeACScan(c: 1, ss: 1, se: 63, ah: 1, al: 0))
+            scans.append(makeACScan(c: 0, ss: 1, se: 63, ah: 1, al: 0))
+        }
+        return scans
+    }
 
-    private func countDC(dcLum: inout [Int], dcChr: inout [Int]) {
-        var pred = [Int32](repeating: 0, count: components.count)
+    // MARK: - DC scan (interleaved across all components)
+
+    private func makeDCScan(ah: Int, al: Int) -> ScanPlan {
+        var sos = [(selector: UInt8, dcTableId: Int, acTableId: Int)]()
+        for c in 0..<components.count { sos.append((components[c].id, tableId(c), 0)) }
+
+        if ah == 0 {
+            // First pass: DPCM-coded magnitudes, optimal Huffman per table.
+            var dcLumF = [Int](repeating: 0, count: 256)
+            var dcChrF = [Int](repeating: 0, count: 256)
+            dcFirstPass(al: al, onSymbol: { c, sym in
+                if c == 0 { dcLumF[sym] += 1 } else { dcChrF[sym] += 1 }
+            }, onBits: { _, _ in })
+            let dcLum = HuffmanTableBuilder.build(frequencies: dcLumF, fallback: StandardHuffmanTables.dcLuminance)
+            let dcChr = isGrayscale ? dcLum
+                : HuffmanTableBuilder.build(frequencies: dcChrF, fallback: StandardHuffmanTables.dcChrominance)
+            var dht: [(tableClass: Int, tableId: Int, bits: [UInt8], values: [UInt8])] =
+                [(0, 0, dcLum.bits, dcLum.values)]
+            if !isGrayscale { dht.append((0, 1, dcChr.bits, dcChr.values)) }
+
+            var w = BitWriter(estimatedMaxSize: mcuCountH * mcuCountV * 8 + 1024)
+            dcFirstPass(al: al, onSymbol: { c, sym in
+                let t = c == 0 ? dcLum : dcChr
+                let e = t.encodingTable[sym]
+                w.writeBits(UInt32(e.code), count: Int(e.length))
+            }, onBits: { bits, n in w.writeBits(bits, count: n) })
+            w.flush()
+            return ScanPlan(dht: dht, sosComponents: sos, ss: 0, se: 0, ah: 0, al: al, entropy: w.data)
+        }
+
+        // Refine pass: one raw bit (bit `al`) per block, no Huffman.
+        var w = BitWriter(estimatedMaxSize: mcuCountH * mcuCountV + 1024)
         for mcuY in 0..<mcuCountV {
             for mcuX in 0..<mcuCountH {
                 for c in 0..<components.count {
@@ -114,115 +131,202 @@ struct ProgressiveEncoder {
                         for bx in 0..<comp.horizontalSampling {
                             let bidx = (mcuY * comp.verticalSampling + by) * blocksPerRow[c]
                                 + (mcuX * comp.horizontalSampling + bx)
-                            let dc = quant[c][bidx * 64]
-                            let diff = dc - pred[c]
-                            pred[c] = dc
-                            let cat = HuffmanEncoder.category(for: diff)
-                            if c == 0 { dcLum[cat] += 1 } else { dcChr[cat] += 1 }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private func emitDC(dcLum: HuffmanTable, dcChr: HuffmanTable) -> [UInt8] {
-        var w = BitWriter(estimatedMaxSize: mcuCountH * mcuCountV * 8 + 1024)
-        var pred = [Int32](repeating: 0, count: components.count)
-        for mcuY in 0..<mcuCountV {
-            for mcuX in 0..<mcuCountH {
-                for c in 0..<components.count {
-                    let comp = components[c]
-                    let table = c == 0 ? dcLum : dcChr
-                    for by in 0..<comp.verticalSampling {
-                        for bx in 0..<comp.horizontalSampling {
-                            let bidx = (mcuY * comp.verticalSampling + by) * blocksPerRow[c]
-                                + (mcuX * comp.horizontalSampling + bx)
-                            let dc = quant[c][bidx * 64]
-                            let diff = dc - pred[c]
-                            pred[c] = dc
-                            HuffmanEncoder.encodeDC(diff, table: table, writer: &w)
+                            let bit = UInt32((quant[c][bidx * 64] >> al) & 1)
+                            w.writeBits(bit, count: 1)
                         }
                     }
                 }
             }
         }
         w.flush()
-        return w.data
+        return ScanPlan(dht: [], sosComponents: sos, ss: 0, se: 0, ah: ah, al: al, entropy: w.data)
     }
 
-    // MARK: - AC scan (non-interleaved, single component, band 1–63)
-
-    /// Walks a component's AC band, invoking `onSymbol` for each Huffman symbol
-    /// (run/size byte) with its coefficient value (0 for EOBn/ZRL), and tracking
-    /// EOBRUN. Shared by the count and emit passes.
-    private func walkAC(
-        component c: Int,
-        onNonzero: (_ symbol: Int, _ coef: Int32) -> Void,
-        onEOBRun: (_ eobrun: Int) -> Void
+    /// Drives the interleaved DC-first walk. DC successive approximation uses an
+    /// arithmetic (sign-extending) shift — the decoder reconstructs DC as
+    /// `(accumulatedDiff << Al) | refineBit`, which only round-trips negatives
+    /// under arithmetic shift (unlike AC's magnitude-preserving transform).
+    private func dcFirstPass(
+        al: Int, onSymbol: (Int, Int) -> Void, onBits: (UInt32, Int) -> Void
     ) {
-        let stride = blocksPerRow[c]
-        let zz = Quantization.zigzagOrder
-        var eobrun = 0
-        for blockY in 0..<realBlocksH[c] {
-            for blockX in 0..<realBlocksW[c] {
-                let base = (blockY * stride + blockX) * 64
-                var run = 0
-                for k in 1...63 {
-                    let coef = quant[c][base + zz[k]]
-                    if coef == 0 { run += 1; continue }
-                    // A nonzero ends any pending EOB run.
-                    if eobrun > 0 { onEOBRun(eobrun); eobrun = 0 }
-                    while run > 15 { onNonzero(0xF0, 0); run -= 16 }  // ZRL
-                    let size = HuffmanEncoder.category(for: coef)
-                    onNonzero((run << 4) | size, coef)
-                    run = 0
-                }
-                if run > 0 {  // block ends with zeros → contributes to EOB run
-                    eobrun += 1
-                    if eobrun == 0x7FFF { onEOBRun(eobrun); eobrun = 0 }
+        var pred = [Int32](repeating: 0, count: components.count)
+        for mcuY in 0..<mcuCountV {
+            for mcuX in 0..<mcuCountH {
+                for c in 0..<components.count {
+                    let comp = components[c]
+                    for by in 0..<comp.verticalSampling {
+                        for bx in 0..<comp.horizontalSampling {
+                            let bidx = (mcuY * comp.verticalSampling + by) * blocksPerRow[c]
+                                + (mcuX * comp.horizontalSampling + bx)
+                            let dc = quant[c][bidx * 64] >> al
+                            let diff = dc - pred[c]
+                            pred[c] = dc
+                            let cat = HuffmanEncoder.category(for: diff)
+                            onSymbol(c, cat)
+                            if cat > 0 { onBits(HuffmanEncoder.additionalBits(for: diff, category: cat), cat) }
+                        }
+                    }
                 }
             }
         }
-        if eobrun > 0 { onEOBRun(eobrun) }
     }
 
-    /// EOBn symbol for a run: size field 0, run field = floor(log2(eobrun)).
+    // MARK: - AC scan (single component, band [ss, se])
+
+    private func makeACScan(c: Int, ss: Int, se: Int, ah: Int, al: Int) -> ScanPlan {
+        let fallback = c == 0 ? StandardHuffmanTables.acLuminance : StandardHuffmanTables.acChrominance
+        var f = [Int](repeating: 0, count: 256)
+        if ah == 0 {
+            acFirstPass(component: c, ss: ss, se: se, al: al, onSymbol: { f[$0] += 1 }, onBits: { _, _ in })
+        } else {
+            acRefinePass(component: c, ss: ss, se: se, al: al, onSymbol: { f[$0] += 1 }, onBit: { _ in })
+        }
+        let table = HuffmanTableBuilder.build(frequencies: f, fallback: fallback)
+        let entropy = ah == 0
+            ? emitACFirst(component: c, ss: ss, se: se, al: al, table: table)
+            : emitACRefine(component: c, ss: ss, se: se, al: al, table: table)
+        return ScanPlan(
+            dht: [(1, tableId(c), table.bits, table.values)],
+            sosComponents: [(components[c].id, 0, tableId(c))],
+            ss: ss, se: se, ah: ah, al: al, entropy: entropy
+        )
+    }
+
     private func eobnSymbol(_ eobrun: Int) -> Int {
-        var nbits = 0
-        var t = eobrun >> 1
+        var nbits = 0; var t = eobrun >> 1
         while t != 0 { nbits += 1; t >>= 1 }
         return nbits << 4
     }
 
-    private func countAC(component c: Int, freq: inout [Int]) {
-        var f = freq
-        walkAC(component: c,
-               onNonzero: { symbol, _ in f[symbol] += 1 },
-               onEOBRun: { eobrun in f[self.eobnSymbol(eobrun)] += 1 })
-        freq = f
+    /// MSB-first bit positions for an n-bit value: [n-1, n-2, ..., 0].
+    private func msbFirst(_ n: Int) -> StrideThrough<Int> { stride(from: n - 1, through: 0, by: -1) }
+
+    // MARK: - AC first (band [ss, se], EOBRUN)
+
+    private func acFirstPass(
+        component c: Int, ss: Int, se: Int, al: Int,
+        onSymbol: (Int) -> Void, onBits: (UInt32, Int) -> Void
+    ) {
+        let stride = blocksPerRow[c]
+        var eobrun = 0
+        func flushEOB() {
+            guard eobrun > 0 else { return }
+            let sym = eobnSymbol(eobrun); onSymbol(sym)
+            let nbits = sym >> 4
+            if nbits > 0 { onBits(UInt32(eobrun & ((1 << nbits) - 1)), nbits) }
+            eobrun = 0
+        }
+        for blockY in 0..<realBlocksH[c] {
+            for blockX in 0..<realBlocksW[c] {
+                let base = (blockY * stride + blockX) * 64
+                var run = 0
+                for k in ss...se {
+                    let coef = pt(quant[c][base + zz[k]], al)
+                    if coef == 0 { run += 1; continue }
+                    flushEOB()
+                    while run > 15 { onSymbol(0xF0); run -= 16 }
+                    let size = HuffmanEncoder.category(for: coef)
+                    onSymbol((run << 4) | size)
+                    onBits(HuffmanEncoder.additionalBits(for: coef, category: size), size)
+                    run = 0
+                }
+                if run > 0 {
+                    eobrun += 1
+                    if eobrun == 0x7FFF { flushEOB() }
+                }
+            }
+        }
+        flushEOB()
     }
 
-    private func emitAC(component c: Int, table: HuffmanTable) -> [UInt8] {
+    private func emitACFirst(component c: Int, ss: Int, se: Int, al: Int, table: HuffmanTable) -> [UInt8] {
         var w = BitWriter(estimatedMaxSize: realBlocksW[c] * realBlocksH[c] * 16 + 1024)
-        walkAC(component: c,
-               onNonzero: { symbol, coef in
-                   let entry = table.encodingTable[symbol]
-                   w.writeBits(UInt32(entry.code), count: Int(entry.length))
-                   let size = symbol & 0x0F
-                   if size > 0 {
-                       w.writeBits(HuffmanEncoder.additionalBits(for: coef, category: size), count: size)
-                   }
-               },
-               onEOBRun: { eobrun in
-                   let symbol = self.eobnSymbol(eobrun)
-                   let entry = table.encodingTable[symbol]
-                   w.writeBits(UInt32(entry.code), count: Int(entry.length))
-                   let nbits = symbol >> 4
-                   if nbits > 0 {
-                       w.writeBits(UInt32(eobrun & ((1 << nbits) - 1)), count: nbits)
-                   }
-               })
+        acFirstPass(component: c, ss: ss, se: se, al: al, onSymbol: { sym in
+            let e = table.encodingTable[sym]
+            w.writeBits(UInt32(e.code), count: Int(e.length))
+        }, onBits: { bits, n in w.writeBits(bits, count: n) })
+        w.flush()
+        return w.data
+    }
+
+    // MARK: - AC refine (band [ss, se], correction bits + EOBRUN with buffered bits)
+
+    /// Drives the AC-refinement walk. `onSymbol` receives Huffman symbols
+    /// (`(run<<4)|1`, `0xF0` ZRL, EOBn); `onBit` receives raw 1-bit values
+    /// (sign bits, correction bits). Correction bits for already-significant
+    /// coefficients are buffered and flushed after the symbol they belong to
+    /// (per libjpeg `encode_mcu_AC_refine`).
+    private func acRefinePass(
+        component c: Int, ss: Int, se: Int, al: Int,
+        onSymbol: (Int) -> Void, onBit: (UInt32) -> Void
+    ) {
+        let stride = blocksPerRow[c]
+        var eobrun = 0
+        var eobBits = [UInt32]()      // correction bits accumulated for the pending EOB run
+        var absv = [Int32](repeating: 0, count: 64)
+
+        func flushEOB() {
+            guard eobrun > 0 else { return }
+            let sym = eobnSymbol(eobrun); onSymbol(sym)
+            let nbits = sym >> 4
+            // EOBn appended bits: low `nbits` of the run count, MSB-first.
+            for i in msbFirst(nbits) { onBit(UInt32((eobrun >> i) & 1)) }
+            for b in eobBits { onBit(b) }
+            eobBits.removeAll(keepingCapacity: true)
+            eobrun = 0
+        }
+
+        for blockY in 0..<realBlocksH[c] {
+            for blockX in 0..<realBlocksW[c] {
+                let base = (blockY * stride + blockX) * 64
+                var eob = 0
+                for k in ss...se {
+                    let a = abs(quant[c][base + zz[k]]) >> al
+                    absv[k] = a
+                    if a == 1 { eob = k }   // last newly-significant position
+                }
+                var run = 0
+                var blockBits = [UInt32]()   // correction bits for this block's run
+                for k in ss...se {
+                    let a = absv[k]
+                    if a == 0 { run += 1; continue }
+                    // significant coefficient (newly or already)
+                    while run > 15 && k <= eob {
+                        flushEOB()
+                        onSymbol(0xF0)
+                        for b in blockBits { onBit(b) }
+                        blockBits.removeAll(keepingCapacity: true)
+                        run -= 16
+                    }
+                    if a > 1 {
+                        // already significant → buffer correction bit, run continues
+                        blockBits.append(UInt32((abs(quant[c][base + zz[k]]) >> al) & 1))
+                        continue
+                    }
+                    // newly significant (a == 1)
+                    flushEOB()
+                    onSymbol((run << 4) | 1)
+                    onBit(quant[c][base + zz[k]] < 0 ? 0 : 1)   // sign bit
+                    for b in blockBits { onBit(b) }
+                    blockBits.removeAll(keepingCapacity: true)
+                    run = 0
+                }
+                if run > 0 || !blockBits.isEmpty {
+                    eobrun += 1
+                    eobBits.append(contentsOf: blockBits)
+                    if eobrun == 0x7FFF { flushEOB() }
+                }
+            }
+        }
+        flushEOB()
+    }
+
+    private func emitACRefine(component c: Int, ss: Int, se: Int, al: Int, table: HuffmanTable) -> [UInt8] {
+        var w = BitWriter(estimatedMaxSize: realBlocksW[c] * realBlocksH[c] * 16 + 1024)
+        acRefinePass(component: c, ss: ss, se: se, al: al, onSymbol: { sym in
+            let e = table.encodingTable[sym]
+            w.writeBits(UInt32(e.code), count: Int(e.length))
+        }, onBit: { bit in w.writeBits(bit, count: 1) })
         w.flush()
         return w.data
     }
