@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-28 (scaled 1/8 decode)._
+_Last updated: 2026-05-28 (scaled 1/8 decode; remaining work re-assessed)._
 
 ## Completed
 
@@ -26,17 +26,22 @@ _Last updated: 2026-05-28 (scaled 1/8 decode)._
 
 ## Remaining
 
-### Tier 1 — high value, validatable, do next
-- [ ] **jpegli perceptual quant tables** · quality / jpegli-parity on 8-bit photographic content · medium risk (λ-tuned trellis interaction); butteraugli-gated — ship only if measurably better, else revert
+> Honest status: the easy, high-confidence wins are done. What's left is either a
+> **large effort** (its own mini-project) or **marginal/niche/risky**. Pick
+> deliberately — or proceed to release.
 
-### Tier 2 — useful, lower value / more niche
-- [ ] **1/2 & 1/4 scaled decode** · partial (2×2 / 4×4) IDCT for intermediate preview sizes · moderate (1/8 already covers thumbnails)
-- [ ] 16-bit / float32 **input** · accept wider source buffers (down-convert to 12/8-bit) · safe, low value
-- [ ] EXIF / ICC **metadata passthrough** · preserve APP1/APP2 across decode→encode · niche for medical (DICOM holds metadata separately)
-- [ ] Progressive **+ restart markers** · completeness (restart is baseline-only today) · moderate
-- [ ] **Multi-threaded encode** of large plates · parallelize trellis across blocks / Huffman across restart intervals · concurrency risk; must stay bit-identical
+### Large efforts (high value, but multi-stage)
+- [ ] **Lossless JPEG (SOF3)** · true lossless for medical archival (often a hard requirement) · large — a separate coding mode (predictive + lossless Huffman, no DCT/quant); validatable bit-exact + cross-codec vs libjpeg-turbo lossless
+- [ ] **jpegli-style quantizer** · quality / jpegli-parity · large — jpegli computes tables from a perceptual model per distance (not a matrix swap); butteraugli-gated, uncertain payoff without XYB
 
-### Tier 3 — deferred (high risk / low reward / unvalidatable)
+### Marginal / niche (safe, bounded, lower value)
+- [ ] **1/2 & 1/4 scaled decode** · either fiddly (partial 2×2/4×4 IDCT, real speedup; validate vs `djpeg -scale`) or trivial-but-no-IDCT-speedup (full IDCT + box-downsample) · 1/8 already covers thumbnails
+- [ ] 16-bit / float32 **input** · accept wider source buffers (down-convert) · safe, low value (callers can pre-scale)
+- [ ] EXIF / ICC **metadata passthrough** · preserve APP1/APP2 across decode→encode · API addition; niche for medical (DICOM holds metadata)
+- [ ] Progressive **+ restart markers** · completeness (restart is baseline-only) · moderate, niche
+- [ ] **Multi-threaded encode** of large plates · parallelize trellis / Huffman-per-restart-interval · concurrency risk; must stay bit-identical
+
+### Deferred (high risk / low reward / unvalidatable)
 - [ ] XYB color · no jpegli reference available to cross-validate against — high risk of subtly-wrong perceptual color
 - [ ] Table-driven Huffman decode · ~2–3 ms · conflicts with the restart decode path (buffered bytes vs byte alignment)
 - [ ] Metal hot path · marginal over Accelerate (already AMX/GPU-accelerated GEMM)
