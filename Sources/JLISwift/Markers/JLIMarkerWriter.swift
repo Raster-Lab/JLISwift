@@ -18,6 +18,7 @@ enum JPEGMarker {
     static let sof0: UInt8 = 0xC0  // Baseline DCT (8-bit only)
     static let sof1: UInt8 = 0xC1  // Extended sequential DCT (8 or 12-bit)
     static let sof2: UInt8 = 0xC2  // Progressive DCT
+    static let sof3: UInt8 = 0xC3  // Lossless (sequential, predictive)
 
     // Huffman tables
     static let dht: UInt8 = 0xC4   // Define Huffman Table

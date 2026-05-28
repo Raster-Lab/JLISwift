@@ -23,6 +23,9 @@ struct JPEGFrameInfo: Sendable {
     let height: Int
     let components: [JPEGComponentInfo]
     let isProgressive: Bool
+    /// SOF3 — lossless (predictive, no DCT). The SOS `spectralStart` carries the
+    /// predictor selection (1–7) and `successiveApproxLow` the point transform.
+    var isLossless: Bool = false
 }
 
 /// Scan header information from the SOS marker.
@@ -79,10 +82,11 @@ struct MarkerReader {
             guard let marker = try nextMarker() else { break }
 
             switch marker {
-            case JPEGMarker.sof0, JPEGMarker.sof1, JPEGMarker.sof2:
+            case JPEGMarker.sof0, JPEGMarker.sof1, JPEGMarker.sof2, JPEGMarker.sof3:
                 // SOF0 baseline + SOF1 extended sequential decode identically
                 // (both Huffman sequential); SOF1 just permits 12-bit precision.
-                frameInfo = try readSOF(progressive: marker == JPEGMarker.sof2)
+                frameInfo = try readSOF(progressive: marker == JPEGMarker.sof2,
+                                        lossless: marker == JPEGMarker.sof3)
 
             case JPEGMarker.eoi:
                 break
@@ -133,10 +137,11 @@ struct MarkerReader {
             guard let marker = try nextMarker() else { break }
 
             switch marker {
-            case JPEGMarker.sof0, JPEGMarker.sof1, JPEGMarker.sof2:
+            case JPEGMarker.sof0, JPEGMarker.sof1, JPEGMarker.sof2, JPEGMarker.sof3:
                 // SOF0 baseline + SOF1 extended sequential decode identically
                 // (both Huffman sequential); SOF1 just permits 12-bit precision.
-                frameInfo = try readSOF(progressive: marker == JPEGMarker.sof2)
+                frameInfo = try readSOF(progressive: marker == JPEGMarker.sof2,
+                                        lossless: marker == JPEGMarker.sof3)
 
             case JPEGMarker.dqt:
                 let tables = try readDQT()
@@ -238,7 +243,7 @@ struct MarkerReader {
     }
 
     /// Reads a SOF (Start of Frame) marker.
-    private mutating func readSOF(progressive: Bool) throws -> JPEGFrameInfo {
+    private mutating func readSOF(progressive: Bool, lossless: Bool = false) throws -> JPEGFrameInfo {
         let length = try readUInt16()
         let endOffset = offset + Int(length) - 2
 
@@ -266,7 +271,8 @@ struct MarkerReader {
             width: width,
             height: height,
             components: components,
-            isProgressive: progressive
+            isProgressive: progressive,
+            isLossless: lossless
         )
     }
 

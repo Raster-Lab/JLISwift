@@ -67,6 +67,11 @@ public struct JLIDecoder: Sendable {
             throw JLIError.decodingFailed("No scan data found in JPEG")
         }
 
+        // Lossless (SOF3) is predictive, not DCT — fully separate path.
+        if frame.isLossless {
+            return try decodeLossless(frame: frame, scans: parsed.scans, configuration: configuration)
+        }
+
         // Step 2: Prepare quantization tables (convert from zigzag to natural order)
         let quantTables = parsed.quantTables.map { zigzagTable -> [Int] in
             var natural = [Int](repeating: 0, count: 64)
@@ -398,6 +403,91 @@ public struct JLIDecoder: Sendable {
             colorModel: outputColorModel,
             data: outputData
         )
+    }
+
+    // MARK: - Lossless (SOF3) decode
+
+    /// Decodes a lossless (SOF3) JPEG by spatial prediction (ITU-T T.81 Annex H):
+    /// each sample is predicted from already-decoded neighbours (selector 1–7 in
+    /// the SOS `spectralStart`), and the Huffman-coded difference (DC mechanism,
+    /// SSSS=16 ⇒ −32768 special case) is added back. Grayscale only for now.
+    private func decodeLossless(
+        frame: JPEGFrameInfo, scans: [JPEGScanData], configuration: JLIDecoderConfiguration
+    ) throws -> JLIImage {
+        let precision = frame.precision
+        guard (2...16).contains(precision) else {
+            throw JLIError.unsupportedJPEGFeature("lossless precision \(precision)")
+        }
+        let w = frame.width, h = frame.height
+        guard w >= 1, h >= 1, w <= 65535, h <= 65535 else {
+            throw JLIError.decodingFailed("invalid lossless dimensions \(w)×\(h)")
+        }
+        guard frame.components.count == 1 else {
+            throw JLIError.unsupportedJPEGFeature("lossless color (only grayscale supported)")
+        }
+        guard let scan = scans.first else { throw JLIError.decodingFailed("no lossless scan") }
+        let predictor = scan.header.spectralStart       // 1–7
+        let pt = scan.header.successiveApproxLow         // point transform
+        guard (1...7).contains(predictor) else {
+            throw JLIError.decodingFailed("invalid lossless predictor \(predictor)")
+        }
+        let dcTables = prepareDCTables(scan.dcTables)
+        let table = dcTables[scan.header.components.first?.dcTableId ?? 0]
+            ?? StandardHuffmanTables.dcLuminance
+
+        var reader = BitReader(data: scan.entropyData)
+        var samples = [Int32](repeating: 0, count: w * h)
+        let half = Int32(1 << (precision - 1 - pt))   // predictor for the very first sample
+        let mask: Int32 = 0xFFFF                       // T.81: differences are modulo 2^16
+
+        for y in 0..<h {
+            let row = y * w
+            let prevRow = row - w
+            for x in 0..<w {
+                let px: Int32
+                if x == 0 {
+                    px = y == 0 ? half : samples[prevRow]          // Rb (or initial)
+                } else if y == 0 {
+                    px = samples[row + x - 1]                       // Ra
+                } else {
+                    let ra = samples[row + x - 1]
+                    let rb = samples[prevRow + x]
+                    let rc = samples[prevRow + x - 1]
+                    switch predictor {
+                    case 1: px = ra
+                    case 2: px = rb
+                    case 3: px = rc
+                    case 4: px = ra + rb - rc
+                    case 5: px = ra + ((rb - rc) >> 1)
+                    case 6: px = rb + ((ra - rc) >> 1)
+                    default: px = (ra + rb) >> 1                    // 7
+                    }
+                }
+                // Huffman-coded difference category, then the difference itself.
+                let cat = Int(try HuffmanDecoder.decodeSymbol(from: &reader, table: table))
+                let diff: Int32
+                if cat == 0 { diff = 0 }
+                else if cat == 16 { diff = -32768 }                // T.81 lossless special case
+                else { diff = try HuffmanDecoder.decodeValue(from: &reader, category: cat) }
+                samples[row + x] = (px + (diff << pt)) & mask
+            }
+        }
+
+        let model = configuration.outputColorModel ?? .grayscale
+        if precision <= 8 {
+            let bytes = samples.map { UInt8(clamping: Int($0)) }
+            return try JLIImage(width: w, height: h,
+                                pixelFormat: configuration.outputPixelFormat ?? .uint8,
+                                colorModel: model, data: bytes)
+        }
+        var bytes = [UInt8](repeating: 0, count: samples.count * 2)
+        for i in 0..<samples.count {
+            let v = UInt16(clamping: Int(samples[i]))
+            bytes[i * 2] = UInt8(v & 0xFF); bytes[i * 2 + 1] = UInt8(v >> 8)
+        }
+        return try JLIImage(width: w, height: h,
+                            pixelFormat: configuration.outputPixelFormat ?? .uint16,
+                            colorModel: model, data: bytes)
     }
 
     // MARK: - Private Helpers
