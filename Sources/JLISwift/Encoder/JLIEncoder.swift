@@ -330,12 +330,17 @@ public struct JLIEncoder: Sendable {
                 .map { ($0 + 7) / 8 }
             let rH = compInfos.map { (height * $0.verticalSampling + vMax - 1) / vMax }
                 .map { ($0 + 7) / 8 }
-            let prog = ProgressiveEncoder(
+            var prog = ProgressiveEncoder(
                 components: compInfos, isGrayscale: isGrayscale,
                 mcuCountH: mcuCountH, mcuCountV: mcuCountV,
                 blocksPerRow: bpr, realBlocksW: rW, realBlocksH: rH,
                 quant: quantArrays
             )
+            prog.restartInterval = configuration.restartInterval
+            // DRI applies to every subsequent scan; emit once before the first.
+            if configuration.restartInterval > 0 {
+                mw.writeDRI(interval: configuration.restartInterval)
+            }
             for scan in prog.build(mode: configuration.progressiveMode) {
                 if !scan.dht.isEmpty { mw.writeDHT(tables: scan.dht) }
                 mw.writeSOS(components: scan.sosComponents,

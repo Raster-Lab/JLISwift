@@ -80,7 +80,9 @@ public struct JLIEncoderConfiguration: Sendable {
     /// interval. `0` (default) disables restart markers. Restart markers add
     /// resync points so a corrupt run only damages one interval rather than the
     /// rest of the scan, and enable segmented decoding — at a small size cost.
-    /// Applies to the baseline / extended-sequential path (not progressive).
+    /// Applies to the baseline / extended-sequential and progressive paths; in
+    /// progressive scans the interval counts interleaved MCUs in the DC scan and
+    /// data units in the (non-interleaved) AC scans, matching the decoder.
     public var restartInterval: Int
 
     /// Produce a lossless (SOF3) JPEG — exact reconstruction via spatial

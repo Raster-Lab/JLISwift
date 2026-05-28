@@ -29,6 +29,9 @@ struct ProgressiveEncoder {
     let realBlocksW: [Int]       // component data-unit grid (non-interleaved AC)
     let realBlocksH: [Int]
     let quant: [[Int32]]         // natural order, block b at b*64
+    /// Emit a restart marker every `restartInterval` MCUs (interleaved MCUs in the
+    /// DC scan, data units in the non-interleaved AC scans). 0 disables restart.
+    var restartInterval: Int = 0
 
     private let zz = Quantization.zigzagOrder
     private func tableId(_ c: Int) -> Int { c == 0 ? 0 : 1 }
@@ -112,19 +115,27 @@ struct ProgressiveEncoder {
             if !isGrayscale { dht.append((0, 1, dcChr.bits, dcChr.values)) }
 
             var w = BitWriter(estimatedMaxSize: mcuCountH * mcuCountV * 8 + 1024)
+            var rstIndex = 0
             dcFirstPass(al: al, onSymbol: { c, sym in
                 let t = c == 0 ? dcLum : dcChr
                 let e = t.encodingTable[sym]
                 w.writeBits(UInt32(e.code), count: Int(e.length))
-            }, onBits: { bits, n in w.writeBits(bits, count: n) })
+            }, onBits: { bits, n in w.writeBits(bits, count: n) },
+               onRestart: { w.emitRestartMarker(rstIndex); rstIndex = (rstIndex + 1) & 7 })
             w.flush()
             return ScanPlan(dht: dht, sosComponents: sos, ss: 0, se: 0, ah: 0, al: al, entropy: w.data)
         }
 
         // Refine pass: one raw bit (bit `al`) per block, no Huffman.
         var w = BitWriter(estimatedMaxSize: mcuCountH * mcuCountV + 1024)
+        var mcu = 0
+        var rstIndex = 0
         for mcuY in 0..<mcuCountV {
             for mcuX in 0..<mcuCountH {
+                if restartInterval > 0 && mcu > 0 && mcu % restartInterval == 0 {
+                    w.emitRestartMarker(rstIndex); rstIndex = (rstIndex + 1) & 7
+                }
+                mcu += 1
                 for c in 0..<components.count {
                     let comp = components[c]
                     for by in 0..<comp.verticalSampling {
@@ -147,11 +158,18 @@ struct ProgressiveEncoder {
     /// `(accumulatedDiff << Al) | refineBit`, which only round-trips negatives
     /// under arithmetic shift (unlike AC's magnitude-preserving transform).
     private func dcFirstPass(
-        al: Int, onSymbol: (Int, Int) -> Void, onBits: (UInt32, Int) -> Void
+        al: Int, onSymbol: (Int, Int) -> Void, onBits: (UInt32, Int) -> Void,
+        onRestart: () -> Void = {}
     ) {
         var pred = [Int32](repeating: 0, count: components.count)
+        var mcu = 0
         for mcuY in 0..<mcuCountV {
             for mcuX in 0..<mcuCountH {
+                if restartInterval > 0 && mcu > 0 && mcu % restartInterval == 0 {
+                    for i in pred.indices { pred[i] = 0 }   // reset DC predictors at the boundary
+                    onRestart()                              // (emit pass) flush + RSTn
+                }
+                mcu += 1
                 for c in 0..<components.count {
                     let comp = components[c]
                     for by in 0..<comp.verticalSampling {
@@ -205,10 +223,12 @@ struct ProgressiveEncoder {
 
     private func acFirstPass(
         component c: Int, ss: Int, se: Int, al: Int,
-        onSymbol: (Int) -> Void, onBits: (UInt32, Int) -> Void
+        onSymbol: (Int) -> Void, onBits: (UInt32, Int) -> Void,
+        onRestart: () -> Void = {}
     ) {
         let stride = blocksPerRow[c]
         var eobrun = 0
+        var unit = 0
         func flushEOB() {
             guard eobrun > 0 else { return }
             let sym = eobnSymbol(eobrun); onSymbol(sym)
@@ -218,6 +238,11 @@ struct ProgressiveEncoder {
         }
         for blockY in 0..<realBlocksH[c] {
             for blockX in 0..<realBlocksW[c] {
+                if restartInterval > 0 && unit > 0 && unit % restartInterval == 0 {
+                    flushEOB()        // EOB run cannot span a restart boundary
+                    onRestart()       // (emit pass) flush + RSTn
+                }
+                unit += 1
                 let base = (blockY * stride + blockX) * 64
                 var run = 0
                 for k in ss...se {
@@ -241,10 +266,12 @@ struct ProgressiveEncoder {
 
     private func emitACFirst(component c: Int, ss: Int, se: Int, al: Int, table: HuffmanTable) -> [UInt8] {
         var w = BitWriter(estimatedMaxSize: realBlocksW[c] * realBlocksH[c] * 16 + 1024)
+        var rstIndex = 0
         acFirstPass(component: c, ss: ss, se: se, al: al, onSymbol: { sym in
             let e = table.encodingTable[sym]
             w.writeBits(UInt32(e.code), count: Int(e.length))
-        }, onBits: { bits, n in w.writeBits(bits, count: n) })
+        }, onBits: { bits, n in w.writeBits(bits, count: n) },
+           onRestart: { w.emitRestartMarker(rstIndex); rstIndex = (rstIndex + 1) & 7 })
         w.flush()
         return w.data
     }
@@ -258,12 +285,14 @@ struct ProgressiveEncoder {
     /// (per libjpeg `encode_mcu_AC_refine`).
     private func acRefinePass(
         component c: Int, ss: Int, se: Int, al: Int,
-        onSymbol: (Int) -> Void, onBit: (UInt32) -> Void
+        onSymbol: (Int) -> Void, onBit: (UInt32) -> Void,
+        onRestart: () -> Void = {}
     ) {
         let stride = blocksPerRow[c]
         var eobrun = 0
         var eobBits = [UInt32]()      // correction bits accumulated for the pending EOB run
         var absv = [Int32](repeating: 0, count: 64)
+        var unit = 0
 
         func flushEOB() {
             guard eobrun > 0 else { return }
@@ -278,6 +307,11 @@ struct ProgressiveEncoder {
 
         for blockY in 0..<realBlocksH[c] {
             for blockX in 0..<realBlocksW[c] {
+                if restartInterval > 0 && unit > 0 && unit % restartInterval == 0 {
+                    flushEOB()        // flush pending EOB run + its buffered correction bits
+                    onRestart()       // (emit pass) flush + RSTn
+                }
+                unit += 1
                 let base = (blockY * stride + blockX) * 64
                 var eob = 0
                 for k in ss...se {
@@ -323,10 +357,12 @@ struct ProgressiveEncoder {
 
     private func emitACRefine(component c: Int, ss: Int, se: Int, al: Int, table: HuffmanTable) -> [UInt8] {
         var w = BitWriter(estimatedMaxSize: realBlocksW[c] * realBlocksH[c] * 16 + 1024)
+        var rstIndex = 0
         acRefinePass(component: c, ss: ss, se: se, al: al, onSymbol: { sym in
             let e = table.encodingTable[sym]
             w.writeBits(UInt32(e.code), count: Int(e.length))
-        }, onBit: { bit in w.writeBits(bit, count: 1) })
+        }, onBit: { bit in w.writeBits(bit, count: 1) },
+           onRestart: { w.emitRestartMarker(rstIndex); rstIndex = (rstIndex + 1) & 7 })
         w.flush()
         return w.data
     }

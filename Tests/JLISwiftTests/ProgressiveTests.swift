@@ -242,4 +242,66 @@ struct ProgressiveTests {
         }
         #expect(maxDiff == 0, "SA-progressive grayscale vs baseline max pixel diff \(maxDiff)")
     }
+
+    // MARK: - Progressive + restart markers
+
+    /// True if `jpeg` carries a DRI marker (FFDD) and ≥1 restart marker (FFD0–D7),
+    /// scanning only header markers (entropy data never contains an unstuffed FF).
+    private func hasRestartMarkers(_ jpeg: [UInt8]) -> (dri: Bool, rst: Bool) {
+        var dri = false, rst = false
+        var i = 0
+        while i + 1 < jpeg.count {
+            if jpeg[i] == 0xFF {
+                let m = jpeg[i + 1]
+                if m == 0xDD { dri = true }
+                if (0xD0...0xD7).contains(m) { rst = true }
+            }
+            i += 1
+        }
+        return (dri, rst)
+    }
+
+    @Test("Progressive + restart round-trips identically to no-restart and is djpeg-shaped")
+    func progressiveRestartRoundTrip() throws {
+        let w = 64, h = 48
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 3
+                rgb[i] = UInt8(20 + (x * 3) % 200)
+                rgb[i + 1] = UInt8(30 + (y * 5) % 200)
+                rgb[i + 2] = UInt8((x + y) % 200)
+            }
+        }
+        let color = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
+        var gray = [UInt8](repeating: 0, count: w * h)
+        for i in 0..<gray.count { gray[i] = UInt8((i * 7) % 240 + 8) }
+        let grayImg = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .grayscale, data: gray)
+
+        let dec = JLIDecoder()
+        for mode in [JLIProgressiveMode.spectralSelection, .successiveApproximation] {
+            for (img, sub) in [(color, JLIChromaSubsampling.yuv444), (color, .yuv420), (grayImg, .yuv400)] {
+                var base = JLIEncoderConfiguration.default
+                base.progressive = true; base.progressiveMode = mode
+                base.chromaSubsampling = sub; base.quality = 85
+                var rst = base; rst.restartInterval = 5
+
+                let jpegNo = try JLIEncoder().encode(img, configuration: base)
+                let jpegRst = try JLIEncoder().encode(img, configuration: rst)
+
+                // Restart only adds resync points — the decoded image must be identical.
+                let pNo = try dec.decode(from: jpegNo)
+                let pRst = try dec.decode(from: jpegRst)
+                #expect(pRst.data == pNo.data,
+                        "progressive restart changed pixels (mode=\(mode), sub=\(sub))")
+
+                // The restart stream must actually carry DRI + RST markers.
+                let markers = hasRestartMarkers(jpegRst)
+                #expect(markers.dri && markers.rst,
+                        "progressive restart stream missing DRI/RST (mode=\(mode), sub=\(sub))")
+                #expect(!hasRestartMarkers(jpegNo).rst,
+                        "no-restart stream unexpectedly has RST markers")
+            }
+        }
+    }
 }
