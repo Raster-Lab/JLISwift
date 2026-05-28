@@ -190,9 +190,12 @@ public struct JLIDecoderConfiguration: Sendable {
     public var outputColorModel: JLIColorModel?
 
     /// Decode at a reduced scale of `1/scale` for fast previews/thumbnails of
-    /// large images. Supported: `1` (full, default) and `8` (1/8 — DC-only, one
-    /// pixel per 8×8 block = the block average, so it's exact and very fast).
-    /// Output dimensions are `ceil(width/scale) × ceil(height/scale)`.
+    /// large images. Supported: `1` (full, default), `2`, `4`, and `8`. Each
+    /// output sample is the exact average of its `scale × scale` source-pixel box,
+    /// reconstructed directly from the low-frequency DCT coefficients (no full
+    /// IDCT) — so the result is exact and faster than decoding then downsampling.
+    /// `8` is the DC-only special case. Output dimensions are
+    /// `ceil(width/scale) × ceil(height/scale)`.
     public var scale: Int
 
     /// A sensible default configuration that auto-detects precision and color model.

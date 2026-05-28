@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-28 (lossless SOF3 complete incl. 16-bit precision + near-lossless point transform)._
+_Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decode via exact low-freq box-average)._
 
 ## Completed
 
@@ -41,7 +41,7 @@ _Last updated: 2026-05-28 (lossless SOF3 complete incl. 16-bit precision + near-
 - [ ] **jpegli-style quantizer** · quality / jpegli-parity · large — jpegli computes tables from a perceptual model per distance (not a matrix swap); butteraugli-gated, uncertain payoff without XYB
 
 ### Marginal / niche (safe, bounded, lower value)
-- [ ] **1/2 & 1/4 scaled decode** · either fiddly (partial 2×2/4×4 IDCT, real speedup; validate vs `djpeg -scale`) or trivial-but-no-IDCT-speedup (full IDCT + box-downsample) · 1/8 already covers thumbnails
+- [x] **1/2 & 1/4 scaled decode** · `config.scale = 2/4` — each output sample is the *exact* mean of its scale×scale box, formed straight from the dequantized coefficients via a separable `A·F·Aᵀ` contraction (no full IDCT, so faster). Validated == box-average of the full decode (gray/color, 8/12-bit) and within ≤6 of `djpeg -scale` (embedded CI-safe fixtures)
 - [x] 16-bit **input** (via lossless `losslessPrecision`) · float32 input still TODO (DCT modes stay 8/12-bit)
 - [ ] EXIF / ICC **metadata passthrough** · preserve APP1/APP2 across decode→encode · API addition; niche for medical (DICOM holds metadata)
 - [ ] Progressive **+ restart markers** · completeness (restart is baseline-only) · moderate, niche

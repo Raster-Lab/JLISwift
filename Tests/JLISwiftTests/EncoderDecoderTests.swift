@@ -499,6 +499,92 @@ struct EncoderDecoderTests {
         #expect(t12.data.count == ((w + 7) / 8) * ((h + 7) / 8) * 2)
     }
 
+    @Test("1/2 & 1/4 scaled decode equal the box-average of the full decode (color 4:4:4)")
+    func scaledDecodeBoxAverageColor() throws {
+        let w = 64, h = 48
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 3
+                rgb[i] = UInt8(40 + x)              // smooth, mid-range → no clipping
+                rgb[i + 1] = UInt8(50 + y)
+                rgb[i + 2] = UInt8(60 + (x + y) / 2)
+            }
+        }
+        let image = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
+        var cfg = JLIEncoderConfiguration.default
+        cfg.quality = 92; cfg.chromaSubsampling = .yuv444   // 4:4:4 → linear convert, tight match
+        let jpeg = try JLIEncoder().encode(image, configuration: cfg)
+        let full = try JLIDecoder().decode(from: jpeg)
+
+        for scale in [2, 4] {
+            var sc = JLIDecoderConfiguration.default; sc.scale = scale
+            let small = try JLIDecoder().decode(from: jpeg, configuration: sc)
+            #expect(small.width == w / scale && small.height == h / scale)
+            #expect(small.colorModel == .rgb && small.pixelFormat == .uint8)
+            var maxErr = 0
+            for ty in 0..<small.height {
+                for tx in 0..<small.width {
+                    for c in 0..<3 {
+                        var sum = 0
+                        for dy in 0..<scale { for dx in 0..<scale {
+                            sum += Int(full.data[((ty * scale + dy) * w + (tx * scale + dx)) * 3 + c])
+                        } }
+                        let avg = (sum + scale * scale / 2) / (scale * scale)
+                        let tv = Int(small.data[(ty * small.width + tx) * 3 + c])
+                        maxErr = max(maxErr, abs(tv - avg))
+                    }
+                }
+            }
+            #expect(maxErr <= 4, "scale 1/\(scale) vs box-average max err \(maxErr)")
+        }
+    }
+
+    @Test("1/2 & 1/4 scaled decode: grayscale (8/12-bit) box-average + non-multiple dims")
+    func scaledDecodeBoxAverageGray() throws {
+        let w = 48, h = 32
+        var gray = [UInt8](repeating: 0, count: w * h)
+        for y in 0..<h { for x in 0..<w { gray[y * w + x] = UInt8(50 + (x + y) % 120) } }
+        let img8 = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .grayscale, data: gray)
+        var cfg = JLIEncoderConfiguration.default; cfg.quality = 92; cfg.chromaSubsampling = .yuv400
+        let jpeg8 = try JLIEncoder().encode(img8, configuration: cfg)
+        let full8 = try JLIDecoder().decode(from: jpeg8)
+        for scale in [2, 4] {
+            var sc = JLIDecoderConfiguration.default; sc.scale = scale
+            let small = try JLIDecoder().decode(from: jpeg8, configuration: sc)
+            #expect(small.width == w / scale && small.height == h / scale)
+            var maxErr = 0
+            for ty in 0..<small.height {
+                for tx in 0..<small.width {
+                    var sum = 0
+                    for dy in 0..<scale { for dx in 0..<scale {
+                        sum += Int(full8.data[(ty * scale + dy) * w + (tx * scale + dx)])
+                    } }
+                    let avg = (sum + scale * scale / 2) / (scale * scale)
+                    maxErr = max(maxErr, abs(Int(small.data[ty * small.width + tx]) - avg))
+                }
+            }
+            #expect(maxErr <= 4, "gray scale 1/\(scale) vs box-average max err \(maxErr)")
+        }
+
+        // 12-bit grayscale → uint16 output, and non-multiple dimensions → ceil sizing.
+        let w2 = 50, h2 = 30
+        var s16 = [UInt8](repeating: 0, count: w2 * h2 * 2)
+        for i in 0..<(w2 * h2) {
+            let v = UInt16(1000 + (i % 2000))
+            s16[i * 2] = UInt8(v & 0xFF); s16[i * 2 + 1] = UInt8(v >> 8)
+        }
+        let img12 = try JLIImage(width: w2, height: h2, pixelFormat: .uint16, colorModel: .grayscale, data: s16)
+        let jpeg12 = try JLIEncoder().encode(img12, configuration: cfg)
+        for scale in [2, 4] {
+            var sc = JLIDecoderConfiguration.default; sc.scale = scale
+            let t = try JLIDecoder().decode(from: jpeg12, configuration: sc)
+            #expect(t.width == (w2 + scale - 1) / scale && t.height == (h2 + scale - 1) / scale)
+            #expect(t.pixelFormat == .uint16)
+            #expect(t.data.count == t.width * t.height * 2)
+        }
+    }
+
     // MARK: - Distance parameter
 
     @Test("Larger distance produces smaller output (monotonic rate)")

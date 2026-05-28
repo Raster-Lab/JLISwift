@@ -84,10 +84,12 @@ public struct JLIDecoder: Sendable {
         // Reject structurally-invalid frames before any size math or indexing.
         try validateDecodable(frame, quantTableCount: quantTables.count)
 
-        // Reduced-scale (thumbnail) decode. 1 = full; 8 = 1/8 (DC-only).
+        // Reduced-scale (thumbnail) decode. 1 = full; 2/4 = low-freq box average;
+        // 8 = 1/8 (DC-only). Each output sample is the exact mean of its
+        // scale×scale source box, formed directly from the DCT coefficients.
         let scale = configuration.scale
-        guard scale == 1 || scale == 8 else {
-            throw JLIError.unsupportedJPEGFeature("decode scale \(scale) (only 1 and 8 supported)")
+        guard scale == 1 || scale == 2 || scale == 4 || scale == 8 else {
+            throw JLIError.unsupportedJPEGFeature("decode scale \(scale) (only 1, 2, 4, 8 supported)")
         }
 
         // Step 3: Prepare Huffman tables (use standard tables as fallback)
@@ -266,6 +268,64 @@ public struct JLIDecoder: Sendable {
             AccelerateDSP.dequantizeBatch(
                 natural, table: qtF, into: &dctBuf, blockCount: blockCount
             )
+
+            // 1/2 & 1/4 box-average path: each 8×8 block reduces to a bs×bs tile
+            // (bs = 8/scale) whose samples are the exact means of the scale×scale
+            // source-pixel boxes, formed straight from the coefficients via the
+            // separable A·F·Aᵀ contraction (A = ``boxAverageMatrix``). No IDCT.
+            if scale == 2 || scale == 4 {
+                let bs = 8 / scale
+                let a = Self.boxAverageMatrix(scale: scale)        // bs×8, row-major
+                let pw = blocksH * bs, ph = blocksV * bs
+                var plane = [Float](repeating: 0, count: pw * ph)
+                let center = Float(1 << (frame.precision - 1))
+                let maxV = Float((1 << frame.precision) - 1)
+                dctBuf.withUnsafeBufferPointer { fb in
+                    plane.withUnsafeMutableBufferPointer { pb in
+                        let f = fb.baseAddress!
+                        var tmp = [Float](repeating: 0, count: bs * 8)   // tmp[J*8+u]
+                        for b in 0..<blockCount {
+                            let base = b * 64
+                            // tmp[J,u] = Σ_v A[J,v]·F[v*8+u]
+                            for j in 0..<bs {
+                                for u in 0..<8 {
+                                    var acc: Float = 0
+                                    for v in 0..<8 { acc += a[j * 8 + v] * f[base + v * 8 + u] }
+                                    tmp[j * 8 + u] = acc
+                                }
+                            }
+                            let blockX = (b % blocksH) * bs
+                            let blockY = (b / blocksH) * bs
+                            for j in 0..<bs {
+                                let py = blockY + j
+                                if py >= ph { break }
+                                let rowBase = py * pw
+                                for i in 0..<bs {
+                                    let px = blockX + i
+                                    if px >= pw { break }
+                                    // out[i,j] = Σ_u A[i,u]·tmp[J,u]
+                                    var acc: Float = 0
+                                    for u in 0..<8 { acc += a[i * 8 + u] * tmp[j * 8 + u] }
+                                    pb[rowBase + px] = min(max(acc + center, 0), maxV)
+                                }
+                            }
+                        }
+                    }
+                }
+                let cwS = (compWidth + scale - 1) / scale
+                let chS = (compHeight + scale - 1) / scale
+                if pw != cwS || ph != chS {
+                    var trimmed = [Float](repeating: 0, count: cwS * chS)
+                    for y in 0..<chS {
+                        for x in 0..<cwS { trimmed[y * cwS + x] = plane[y * pw + x] }
+                    }
+                    componentPlanes.append((trimmed, cwS, chS))
+                } else {
+                    componentPlanes.append((plane, pw, ph))
+                }
+                continue
+            }
+
             AccelerateDSP.inverseDCTBatch(
                 dctBuf, into: &pixelsBuf, scratch: &idctScratch, blockCount: blockCount
             )
@@ -507,6 +567,29 @@ public struct JLIDecoder: Sendable {
     }
 
     // MARK: - Private Helpers
+
+    /// Separable contraction matrix `A` (size `bs × 8`, `bs = 8/scale`, row-major)
+    /// that turns an 8×8 block of dequantized DCT coefficients `F` into its
+    /// `bs × bs` box-averaged tile via `out = A · F · Aᵀ`. Row `I` averages the
+    /// 8-point inverse-DCT basis over the `scale` source positions of output `I`:
+    /// `A[I,u] = ½·C(u)·(1/scale)·Σ_{x∈box_I} cos((2x+1)uπ/16)`, `C(0)=1/√2`.
+    /// This is an exact (not approximate) mean of the full-IDCT output over each
+    /// `scale × scale` box, matching the DC-only `scale == 8` case when `bs == 1`.
+    private static func boxAverageMatrix(scale: Int) -> [Float] {
+        let bs = 8 / scale
+        var a = [Float](repeating: 0, count: bs * 8)
+        for capI in 0..<bs {
+            for u in 0..<8 {
+                let cu = u == 0 ? (1.0 / 2.0.squareRoot()) : 1.0
+                var s = 0.0
+                for x in (capI * scale)..<(capI * scale + scale) {
+                    s += cos((Double(2 * x + 1) * Double(u) * Double.pi) / 16.0)
+                }
+                a[capI * 8 + u] = Float(0.5 * cu * (s / Double(scale)))
+            }
+        }
+        return a
+    }
 
     /// DC Huffman tables keyed by table id, with standard tables filled in for
     /// ids 0/1. Keyed (not positional) so a scan referencing any 4-bit table id
