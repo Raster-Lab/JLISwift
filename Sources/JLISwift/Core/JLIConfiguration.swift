@@ -66,13 +66,15 @@ public struct JLIEncoderConfiguration: Sendable {
     public var adaptiveQuantization: Bool
 
     /// A sensible default configuration: quality 90, YCbCr, 4:2:0 subsampling,
-    /// progressive encoding with adaptive quantization enabled.
+    /// baseline (non-progressive) with optimized Huffman + adaptive quantization.
+    /// Progressive is opt-in — it's a multi-pass encode and most callers want the
+    /// faster baseline path by default.
     public static let `default` = JLIEncoderConfiguration(
         quality: 90.0,
         distance: nil,
         chromaSubsampling: .yuv420,
         colorSpace: .yCbCr,
-        progressive: true,
+        progressive: false,
         optimiseHuffman: true,
         adaptiveQuantization: true
     )

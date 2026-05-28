@@ -250,6 +250,56 @@ public struct JLIEncoder: Sendable {
             )
         }
 
+        // Step 6: Assemble JPEG bitstream. Shared prefix: SOI, APP0, DQT.
+        var mw = MarkerWriter()
+        mw.writeSOI()
+        mw.writeAPP0()
+        let lumZZ = zigzagQuantTable(lumQT)
+        if isGrayscale {
+            mw.writeDQT(tables: [(id: 0, values: lumZZ)])
+        } else {
+            mw.writeDQT(tables: [(id: 0, values: lumZZ),
+                                 (id: 1, values: zigzagQuantTable(chromQT))])
+        }
+
+        let sofComponents: [(id: UInt8, hSampling: Int, vSampling: Int, quantTableId: Int)] =
+            isGrayscale
+            ? [(1, 1, 1, 0)]
+            : [(1, hMax, vMax, 0), (2, 1, 1, 1), (3, 1, 1, 1)]
+
+        if configuration.progressive {
+            // Progressive (SOF2): DC scan + per-component AC scans, optimal tables.
+            mw.writeSOF(progressive: true, precision: precision, width: width, height: height,
+                        components: sofComponents)
+            let compInfos: [JPEGComponentInfo] = isGrayscale
+                ? [JPEGComponentInfo(id: 1, horizontalSampling: 1, verticalSampling: 1, quantTableIndex: 0)]
+                : [JPEGComponentInfo(id: 1, horizontalSampling: hMax, verticalSampling: vMax, quantTableIndex: 0),
+                   JPEGComponentInfo(id: 2, horizontalSampling: 1, verticalSampling: 1, quantTableIndex: 1),
+                   JPEGComponentInfo(id: 3, horizontalSampling: 1, verticalSampling: 1, quantTableIndex: 1)]
+            let quantArrays = isGrayscale ? [yQuant] : [yQuant, cbQuant, crQuant]
+            let bpr = isGrayscale ? [yBlocksPerRow] : [yBlocksPerRow, mcuCountH, mcuCountH]
+            let rW = compInfos.map { (width * $0.horizontalSampling + hMax - 1) / hMax }
+                .map { ($0 + 7) / 8 }
+            let rH = compInfos.map { (height * $0.verticalSampling + vMax - 1) / vMax }
+                .map { ($0 + 7) / 8 }
+            let prog = ProgressiveEncoder(
+                components: compInfos, isGrayscale: isGrayscale,
+                mcuCountH: mcuCountH, mcuCountV: mcuCountV,
+                blocksPerRow: bpr, realBlocksW: rW, realBlocksH: rH,
+                quant: quantArrays
+            )
+            let out = prog.build()
+            mw.writeDHT(tables: out.dhtTables)
+            for scan in out.scans {
+                mw.writeSOS(components: scan.sosComponents,
+                            spectralStart: scan.ss, spectralEnd: scan.se)
+                mw.writeEntropyData(scan.entropy)
+            }
+            mw.writeEOI()
+            return mw.data
+        }
+
+        // Baseline path below.
         // Step 5b: Select Huffman tables. With `optimiseHuffman`, run a counting
         // pass over the exact MCU walk the emit pass uses (DC DPCM state must
         // match) to gather per-image symbol frequencies, then build optimal
@@ -345,32 +395,9 @@ public struct JLIEncoder: Sendable {
         }
         bitWriter.flush()
 
-        // Step 6: Assemble JPEG bitstream
-        var mw = MarkerWriter()
-        mw.writeSOI()
-        mw.writeAPP0()
-
-        // DQT
-        let lumZZ = zigzagQuantTable(lumQT)
-        if isGrayscale {
-            mw.writeDQT(tables: [(id: 0, values: lumZZ)])
-        } else {
-            mw.writeDQT(tables: [(id: 0, values: lumZZ),
-                                 (id: 1, values: zigzagQuantTable(chromQT))])
-        }
-
-        // SOF0 (baseline) — precision 8 or 12.
-        if isGrayscale {
-            mw.writeSOF(progressive: false, precision: precision, width: width, height: height,
-                        components: [(id: 1, hSampling: 1, vSampling: 1, quantTableId: 0)])
-        } else {
-            mw.writeSOF(progressive: false, precision: 8, width: width, height: height,
-                        components: [
-                            (id: 1, hSampling: hMax, vSampling: vMax, quantTableId: 0),
-                            (id: 2, hSampling: 1, vSampling: 1, quantTableId: 1),
-                            (id: 3, hSampling: 1, vSampling: 1, quantTableId: 1)
-                        ])
-        }
+        // SOF0 (baseline) / SOF1 (12-bit) — precision 8 or 12.
+        mw.writeSOF(progressive: false, precision: precision, width: width, height: height,
+                    components: sofComponents)
 
         // DHT — embed whichever tables we actually encoded with (standard or
         // per-image optimal). The decoder reads these back from the DHT markers.

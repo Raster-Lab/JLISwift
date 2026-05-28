@@ -51,13 +51,14 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | **12-bit grayscale** encode + decode (`.uint16` → SOF1 precision-12 JPEG) | ✅ |
 | SOF1 (extended sequential) decode — reads 12-bit JPEGs from libjpeg/ImageIO | ✅ |
 | **Progressive (SOF2) decode** — multi-scan, spectral selection, successive approximation | ✅ |
+| **Progressive (SOF2) encode** — DC + per-component AC scans, EOBRUN (`progressive`, opt-in) | ✅ |
 | `inspect()` — metadata parse without full decode | ✅ |
 | Accelerate `vDSP_mmul` DCT, `vDSP_vmul` quant, vectorized BT.601 color conversion | ✅ |
 | Round-trip + cross-codec tested (ImageIO, libjpeg-turbo, mozjpeg) on synthetic + DICOM | ✅ |
 | Trellis quantization — keep/drop + HF magnitude reduction (`adaptiveQuantization`, 8-bit, default on) | ✅ |
 | 12-bit *color* / 16-bit / float32 input | ❌ planned (12-bit grayscale works; color path still assumes 8-bit BT.601) |
 | XYB color space JPEG | ❌ planned (XYB transform math exists, encoder doesn't emit XYB) |
-| Progressive (SOF2) *encode* | ❌ planned (decode works; encoder still emits baseline) |
+| Progressive *successive approximation* (finer multi-pass, smaller files) | ❌ planned (spectral-selection progressive works) |
 | Metal GPU pipeline | ⚠️ kernels compile but are not wired into encode/decode |
 
 ### Optimized Huffman tables
@@ -113,6 +114,9 @@ config.chromaSubsampling = .yuv444     // .yuv444, .yuv422, .yuv420, .yuv400
 // Or drive quality by jpegli/JPEG-XL distance (overrides quality when set).
 // ~1.0 is visually lossless; larger compresses harder.
 config.distance = 1.0
+
+// Opt into progressive (SOF2) output — DC then per-component AC scans.
+config.progressive = true
 ```
 
 `distance` maps to an effective IJG quality (libjxl's `JpegQualityToDistance`

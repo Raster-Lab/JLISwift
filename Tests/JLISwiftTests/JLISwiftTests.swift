@@ -95,7 +95,7 @@ struct CoreTypeTests {
         let config = JLIEncoderConfiguration.default
         #expect(config.quality == 90.0)
         #expect(config.distance == nil)
-        #expect(config.progressive == true)
+        #expect(config.progressive == false)  // progressive is opt-in (multi-pass)
         #expect(config.adaptiveQuantization == true)
     }
 

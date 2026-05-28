@@ -124,4 +124,66 @@ struct ProgressiveTests {
         }
         #expect(maxDiff == 0, "progressive vs baseline max pixel diff \(maxDiff)")
     }
+
+    // MARK: - Progressive encode (round-trip via own decoder)
+
+    /// Encodes a textured RGB image both baseline and progressive; both use the
+    /// same quantized coefficients, so decoding each must yield identical pixels.
+    /// Exercises the full progressive encode→decode loop (DC + per-component AC
+    /// scans, EOBRUN, optimal per-scan tables). 48×40 isn't a whole number of
+    /// 4:2:0 MCUs, so it exercises the non-interleaved real-grid path.
+    @Test("Progressive encode round-trips identically to baseline (color)")
+    func progressiveEncodeColor() throws {
+        let w = 48, h = 40
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 3
+                rgb[i] = UInt8((x * 5) & 0xFF)
+                rgb[i + 1] = UInt8((y * 7) & 0xFF)
+                rgb[i + 2] = UInt8(((x + y) * 3) & 0xFF)
+            }
+        }
+        let image = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
+
+        var baseCfg = JLIEncoderConfiguration.default
+        baseCfg.progressive = false; baseCfg.chromaSubsampling = .yuv420
+        var progCfg = JLIEncoderConfiguration.default
+        progCfg.progressive = true; progCfg.chromaSubsampling = .yuv420
+
+        let baseJPEG = try JLIEncoder().encode(image, configuration: baseCfg)
+        let progJPEG = try JLIEncoder().encode(image, configuration: progCfg)
+        #expect(try JLIDecoder().inspect(data: progJPEG).isProgressive)
+        #expect(!(try JLIDecoder().inspect(data: baseJPEG).isProgressive))
+
+        let baseDec = try JLIDecoder().decode(from: baseJPEG)
+        let progDec = try JLIDecoder().decode(from: progJPEG)
+        #expect(progDec.width == w && progDec.height == h)
+        var maxDiff = 0
+        for i in 0..<min(baseDec.data.count, progDec.data.count) {
+            maxDiff = max(maxDiff, abs(Int(baseDec.data[i]) - Int(progDec.data[i])))
+        }
+        #expect(maxDiff == 0, "progressive encode vs baseline max pixel diff \(maxDiff)")
+    }
+
+    @Test("Progressive encode round-trips identically to baseline (grayscale)")
+    func progressiveEncodeGrayscale() throws {
+        let w = 40, h = 24
+        var gray = [UInt8](repeating: 0, count: w * h)
+        for y in 0..<h { for x in 0..<w { gray[y * w + x] = UInt8((x * 3 + y * 5) & 0xFF) } }
+        let image = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .grayscale, data: gray)
+
+        var baseCfg = JLIEncoderConfiguration.default
+        baseCfg.progressive = false; baseCfg.chromaSubsampling = .yuv400
+        var progCfg = JLIEncoderConfiguration.default
+        progCfg.progressive = true; progCfg.chromaSubsampling = .yuv400
+
+        let baseDec = try JLIDecoder().decode(from: try JLIEncoder().encode(image, configuration: baseCfg))
+        let progDec = try JLIDecoder().decode(from: try JLIEncoder().encode(image, configuration: progCfg))
+        var maxDiff = 0
+        for i in 0..<min(baseDec.data.count, progDec.data.count) {
+            maxDiff = max(maxDiff, abs(Int(baseDec.data[i]) - Int(progDec.data[i])))
+        }
+        #expect(maxDiff == 0, "grayscale progressive vs baseline max pixel diff \(maxDiff)")
+    }
 }
