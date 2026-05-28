@@ -89,6 +89,7 @@ let jli444 = JLISwiftCodec(subsampling: .yuv444)
 let jli444prog = JLISwiftCodec(subsampling: .yuv444, progressive: true)
 let jli444progSA = JLISwiftCodec(subsampling: .yuv444, progressive: true,
                                  progressiveMode: .successiveApproximation)
+let jli444rst = JLISwiftCodec(subsampling: .yuv444, restartInterval: 4)
 let imageIO = ImageIOCodec()
 
 // Reference codecs shell out to external binaries; each probes its install
@@ -100,7 +101,7 @@ let refCodecs: [CLICodec] = [
     ReferenceCodecs.jpegli(),
 ]
 
-var codecs: [Codec] = [jli420, jli444, jli444prog, jli444progSA, imageIO]
+var codecs: [Codec] = [jli420, jli444, jli444prog, jli444progSA, jli444rst, imageIO]
 for c in refCodecs where c.enabled { codecs.append(c) }
 
 // Cross-codec pairs:
@@ -111,7 +112,7 @@ for c in refCodecs where c.enabled { codecs.append(c) }
 // variant in the encoder set checks that ImageIO/libjpeg/mozjpeg decode
 // JLISwift's progressive output.
 var crossPairs: [(encoder: Codec, decoder: Codec)] = []
-let jlEncoders: [Codec] = [jli444, jli420, jli444prog, jli444progSA]
+let jlEncoders: [Codec] = [jli444, jli420, jli444prog, jli444progSA, jli444rst]
 let otherCodecs: [Codec] = [imageIO] + refCodecs.filter { $0.enabled }
 for jl in jlEncoders {
     for other in otherCodecs {
@@ -120,6 +121,12 @@ for jl in jlEncoders {
 }
 for other in otherCodecs {
     crossPairs.append((other, jli444))
+}
+// Reverse restart direction: an independent encoder's restart-marker output must
+// decode in JLISwift. (Forward — JLISwift restart → others — is covered above.)
+let ltRestart = ReferenceCodecs.libjpegTurboRestart()
+if ltRestart.enabled {
+    crossPairs.append((ltRestart, jli444))
 }
 
 print("active codecs: \(codecs.map(\.name).joined(separator: ", "))")

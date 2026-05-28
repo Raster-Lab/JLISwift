@@ -180,6 +180,25 @@ enum ReferenceCodecs {
         )
     }
 
+    /// libjpeg-turbo emitting restart markers (`-restart 4B` = RST every 4 MCUs).
+    /// Used to confirm JLISwift decodes restart-marker output from an independent
+    /// encoder, the mirror of JLISwift-restart → libjpeg-turbo.
+    static func libjpegTurboRestart() -> CLICodec {
+        let enc = firstExisting([
+            "/opt/homebrew/opt/jpeg-turbo/bin/cjpeg",
+            "/usr/local/opt/jpeg-turbo/bin/cjpeg",
+            ProcessInfo.processInfo.environment["JLIBENCH_LIBJPEG_TURBO_BIN"] ?? "",
+        ])
+        let dec = firstExisting([
+            "/opt/homebrew/opt/jpeg-turbo/bin/djpeg",
+            "/usr/local/opt/jpeg-turbo/bin/djpeg",
+        ])
+        return CLICodec(
+            name: "libjpeg-turbo-rst", encoderPath: enc, decoderPath: dec,
+            encoderArgs: { q in ["-quality", "\(q)", "-restart", "4B"] }
+        )
+    }
+
     /// libjpeg-turbo in 12-bit mode (`cjpeg -precision 12`). The cross-codec
     /// reference for JLISwift's 12-bit grayscale output.
     static func libjpegTurbo12() -> Gray16CLICodec {
