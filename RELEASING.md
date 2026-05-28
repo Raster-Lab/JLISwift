@@ -22,9 +22,8 @@ MAJOR.MINOR.PATCH[-PRERELEASE]
 **Trigger:** Every push to `main`/`develop` and all pull requests
 
 **What it does:**
-- ✅ Builds on macOS with latest Xcode
-- ✅ Builds on Linux with Swift 6.0
-- ✅ Runs all 87+ unit tests
+- ✅ Builds + tests on macOS (Xcode 26 / Swift 6.2) — the only supported platform family
+- ✅ Runs all 107 unit tests
 - ✅ Generates code coverage reports
 - ✅ Validates builds for iOS, tvOS, watchOS, visionOS
 

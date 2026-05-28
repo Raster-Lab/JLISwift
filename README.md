@@ -6,7 +6,7 @@ A native-Swift JPEG codec for Apple platforms, with Accelerate-backed DSP.
 [![Platforms](https://img.shields.io/badge/Platforms-macOS%20|%20iOS%20|%20tvOS%20|%20watchOS%20|%20visionOS-blue.svg)](#platform-support)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 
-> **Status:** experimental, pre-1.0. Today JLISwift ships a working **baseline (SOF0) JPEG encoder and decoder** in pure Swift, backed by Accelerate (`vDSP_mmul`, `vDSP_vsma`) for hot paths. The long-term goal is feature parity with Google's [jpegli](https://github.com/google/jpegli) — adaptive quantization, distance-driven quality, XYB color space, 10+ bit precision. None of those jpegli-specific features are implemented yet; see [Roadmap](#roadmap) for what's real vs. planned.
+> **Status:** experimental, pre-1.0, Apple-only. JLISwift is a pure-Swift JPEG codec (Accelerate-backed DSP) that encodes and decodes **baseline (SOF0)**, **extended-sequential (SOF1, 12-bit)**, and **progressive (SOF2)** JPEG, with **optimized per-image Huffman tables**, **trellis (rate-distortion) quantization**, and **jpegli/JPEG-XL distance-driven quality**. It targets feature parity with Google's [jpegli](https://github.com/google/jpegli); the main features still missing are **XYB color JPEG** and **12-bit color** (12-bit grayscale works). See [What's actually implemented](#whats-actually-implemented) for the full matrix.
 
 ## Quick start
 
@@ -51,14 +51,13 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | **12-bit grayscale** encode + decode (`.uint16` → SOF1 precision-12 JPEG) | ✅ |
 | SOF1 (extended sequential) decode — reads 12-bit JPEGs from libjpeg/ImageIO | ✅ |
 | **Progressive (SOF2) decode** — multi-scan, spectral selection, successive approximation | ✅ |
-| **Progressive (SOF2) encode** — DC + per-component AC scans, EOBRUN (`progressive`, opt-in) | ✅ |
+| **Progressive (SOF2) encode** — spectral-selection *and* successive-approximation scan scripts (`progressive` + `progressiveMode`, opt-in) | ✅ |
 | `inspect()` — metadata parse without full decode | ✅ |
 | Accelerate `vDSP_mmul` DCT, `vDSP_vmul` quant, vectorized BT.601 color conversion | ✅ |
 | Round-trip + cross-codec tested (ImageIO, libjpeg-turbo, mozjpeg) on synthetic + DICOM | ✅ |
 | Trellis quantization — keep/drop + HF magnitude reduction (`adaptiveQuantization`, 8-bit, default on) | ✅ |
 | 12-bit *color* / 16-bit / float32 input | ❌ planned (12-bit grayscale works; color path still assumes 8-bit BT.601) |
 | XYB color space JPEG | ❌ planned (XYB transform math exists, encoder doesn't emit XYB) |
-| Progressive *successive approximation* (finer multi-pass, smaller files) | ❌ planned (spectral-selection progressive works) |
 | Metal GPU pipeline | ⚠️ kernels compile but are not wired into encode/decode |
 
 ### Optimized Huffman tables
@@ -106,11 +105,15 @@ coeffs) skip the O(m²) DP, bounding worst-case encode time.
 are all honored. `colorSpace = .xyb` is still a stub (the XYB transform math
 exists but the encoder doesn't emit XYB JPEGs yet).
 
-On the DICOM corpus, progressive 4:4:4 is **36–39% smaller than baseline 4:4:4
-at identical PSNR** (CT q50: 3889 → 2356 B): the AC-scan EOBRUN codes the long
-runs of DC-only blocks in flat medical regions far more compactly than
-baseline's per-block EOB. Validated on the bench against ImageIO /
-libjpeg-turbo / mozjpeg, which all decode JLISwift's progressive output.
+On the DICOM corpus, **spectral-selection** progressive 4:4:4 is ~5% smaller
+than baseline 4:4:4 at identical PSNR — the AC-scan EOBRUN codes the long runs
+of DC-only blocks in flat medical regions more compactly than baseline's
+per-block EOB. **Successive-approximation** progressive (opt in via
+`progressiveMode = .successiveApproximation`) is only ~2% on the same corpus:
+its extra scans fragment those EOB runs, so it pulls ahead only on textured /
+photographic content where the finer multi-pass refinement pays off. Both are
+validated on the bench against ImageIO / libjpeg-turbo / mozjpeg, which all
+decode JLISwift's progressive output.
 
 ## Encoder configuration
 
@@ -170,8 +173,8 @@ swift run -c release JLIBench
 ```
 Sources/JLISwift/
 ├── Core/                 JLIImage, JLIError, JLIConfiguration, JLIJPEGInfo
-├── Encoder/              JLIEncoder — SOF0 encode pipeline
-├── Decoder/              JLIDecoder — SOF0 decode + inspect()
+├── Encoder/              JLIEncoder (SOF0/SOF1/SOF2 encode) + JLIProgressiveEncoder
+├── Decoder/              JLIDecoder (SOF0/SOF1/SOF2 decode + inspect()) + JLIProgressiveDecoder
 ├── DSP/                  JLIDCT (Accelerate façade), JLIQuantization
 ├── Entropy/              BitWriter/BitReader (incl. JPEG byte stuffing), Huffman tables + encode/decode
 ├── Markers/              SOI/APP0/SOF0/DHT/DQT/SOS/EOI writer + parser
@@ -188,7 +191,7 @@ Sources/JLIBench/
 ├── Harness.swift         Median-of-N timing, PSNR, self/cross runners
 └── main.swift            CLI: synthetic + DICOM modes, regression flags
 
-Tests/JLISwiftTests/      89 tests across 7 suites (Swift Testing framework)
+Tests/JLISwiftTests/      107 tests across 8 suites (Swift Testing framework)
 ```
 
 ## Bench: cross-codec + regression
@@ -253,23 +256,22 @@ JLISwift ↔ libjpeg-turbo-12 cross-decode passes both directions.
 
 ## Roadmap
 
-JLISwift's long-term direction is feature parity with [jpegli](https://github.com/google/jpegli) — Google's improved JPEG encoder that ships ~35% smaller files at matched visual quality. The current 0.1.x line is the foundation: a working baseline codec with measured benchmarks. Subsequent releases will progressively add the jpegli-specific features.
+JLISwift's long-term direction is feature parity with [jpegli](https://github.com/google/jpegli) — Google's improved JPEG encoder that ships ~35% smaller files at matched visual quality. The 0.1.x line already covers baseline, extended-sequential (12-bit), and progressive JPEG with optimized Huffman, trellis quantization, and distance-driven quality; subsequent releases add the remaining jpegli-specific features.
 
 Next-up candidates (rough order):
 
 Remaining:
 
-1. **Progressive successive approximation** — finer multi-pass + smaller files than spectral selection; the *decoder* already handles it, so this is encode-only work (the intricate AC-refinement correction-bit coding).
-2. **XYB color-space encoding** — perceptual color space from JPEG XL; the transform math exists but the encoder doesn't emit XYB JPEGs.
-3. **12-bit color** — extend the YCbCr path to 12-bit (12-bit grayscale works; color still assumes 8-bit BT.601). Low priority — clinical corpora are grayscale.
-4. **Metal hot path** — actually invoke the existing `JLIMetalPipeline` kernels (marginal over the Accelerate CPU path).
+1. **XYB color-space encoding** — perceptual color space from JPEG XL; the transform math exists but the encoder doesn't emit XYB JPEGs.
+2. **12-bit color** — extend the YCbCr path to 12-bit (12-bit grayscale works; color still assumes 8-bit BT.601). Low priority — clinical corpora are grayscale.
+3. **Metal hot path** — actually invoke the existing `JLIMetalPipeline` kernels (marginal over the Accelerate CPU path).
 
-Done since 0.1 — all cross-validated against libjpeg-turbo, mozjpeg, and ImageIO with PSNR + butteraugli, regression-tracked: spec-compliance fixes (byte-unstuffing, DRI/RST, SOF1), Accelerate-backed batched DCT, **optimized Huffman tables** (≈ libjpeg-turbo `-optimize`), **12-bit grayscale** encode/decode, **distance parameter**, **trellis quantization** (keep/drop + HF magnitude reduction), and **progressive (SOF2) decode and encode**.
+Done since 0.1 — all cross-validated against libjpeg-turbo, mozjpeg, and ImageIO with PSNR + butteraugli, regression-tracked: spec-compliance fixes (byte-unstuffing, DRI/RST, SOF1), Accelerate-backed batched DCT, **optimized Huffman tables** (≈ libjpeg-turbo `-optimize`), **12-bit grayscale** encode/decode, **distance parameter**, **trellis quantization** (keep/drop + HF magnitude reduction), and **progressive (SOF2) decode and encode** (spectral selection + successive approximation).
 
 ## Requirements
 
 - Swift 6.2+ (strict concurrency)
-- Xcode 16.3+ for Apple platforms
+- Xcode 26+ for Apple platforms
 
 ## License
 
