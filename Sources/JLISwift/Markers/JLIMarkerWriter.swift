@@ -15,7 +15,8 @@ enum JPEGMarker {
     static let eoi: UInt8 = 0xD9   // End of Image
 
     // Frame types
-    static let sof0: UInt8 = 0xC0  // Baseline DCT
+    static let sof0: UInt8 = 0xC0  // Baseline DCT (8-bit only)
+    static let sof1: UInt8 = 0xC1  // Extended sequential DCT (8 or 12-bit)
     static let sof2: UInt8 = 0xC2  // Progressive DCT
 
     // Huffman tables
@@ -124,7 +125,12 @@ struct MarkerWriter {
         components: [(id: UInt8, hSampling: Int, vSampling: Int, quantTableId: Int)]
     ) {
         data.append(JPEGMarker.prefix)
-        data.append(progressive ? JPEGMarker.sof2 : JPEGMarker.sof0)
+        // Baseline SOF0 is 8-bit only; 12-bit requires Extended Sequential (SOF1).
+        let sofMarker: UInt8
+        if progressive { sofMarker = JPEGMarker.sof2 }
+        else if precision > 8 { sofMarker = JPEGMarker.sof1 }
+        else { sofMarker = JPEGMarker.sof0 }
+        data.append(sofMarker)
 
         let length = 8 + components.count * 3
         writeUInt16(UInt16(length))

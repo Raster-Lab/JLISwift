@@ -74,7 +74,9 @@ struct MarkerReader {
             guard let marker = try nextMarker() else { break }
 
             switch marker {
-            case JPEGMarker.sof0, JPEGMarker.sof2:
+            case JPEGMarker.sof0, JPEGMarker.sof1, JPEGMarker.sof2:
+                // SOF0 baseline + SOF1 extended sequential decode identically
+                // (both Huffman sequential); SOF1 just permits 12-bit precision.
                 frameInfo = try readSOF(progressive: marker == JPEGMarker.sof2)
 
             case JPEGMarker.eoi:
@@ -126,7 +128,9 @@ struct MarkerReader {
             guard let marker = try nextMarker() else { break }
 
             switch marker {
-            case JPEGMarker.sof0, JPEGMarker.sof2:
+            case JPEGMarker.sof0, JPEGMarker.sof1, JPEGMarker.sof2:
+                // SOF0 baseline + SOF1 extended sequential decode identically
+                // (both Huffman sequential); SOF1 just permits 12-bit precision.
                 frameInfo = try readSOF(progressive: marker == JPEGMarker.sof2)
 
             case JPEGMarker.dqt:
