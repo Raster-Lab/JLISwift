@@ -102,7 +102,15 @@ magnitude reduction adds a further ~0.1–0.5% and contributes more on
 mid-magnitude (photographic) content. 12-bit stays exact round-to-nearest
 (medical precision is not traded for bytes). High-entropy blocks (>32 nonzero AC
 coeffs) skip the O(m²) DP, bounding worst-case encode time.
-The configuration fields `progressive`, `optimiseHuffman`, `adaptiveQuantization`, `distance`, and `colorSpace = .xyb` are present on `JLIEncoderConfiguration` but are not yet honored — they exist as the planned API surface.
+`optimiseHuffman`, `adaptiveQuantization` (trellis), `distance`, and `progressive`
+are all honored. `colorSpace = .xyb` is still a stub (the XYB transform math
+exists but the encoder doesn't emit XYB JPEGs yet).
+
+On the DICOM corpus, progressive 4:4:4 is **36–39% smaller than baseline 4:4:4
+at identical PSNR** (CT q50: 3889 → 2356 B): the AC-scan EOBRUN codes the long
+runs of DC-only blocks in flat medical regions far more compactly than
+baseline's per-block EOB. Validated on the bench against ImageIO /
+libjpeg-turbo / mozjpeg, which all decode JLISwift's progressive output.
 
 ## Encoder configuration
 
@@ -249,16 +257,14 @@ JLISwift's long-term direction is feature parity with [jpegli](https://github.co
 
 Next-up candidates (rough order):
 
-1. **Distance parameter** — wire `JLIEncoderConfiguration.distance` to control quantization-table scaling (jpegli/JPEG-XL convention; lower distance = higher quality).
-2. **Batched DCT** — process N blocks per `vDSP_mmul` call to amortize per-call overhead; expected 2–3× encode/decode speedup.
-3. **Real-image fidelity harness** — Kodak suite + butteraugli/SSIMULACRA2 scores, not just round-trip PSNR.
-4. **Adaptive dead-zone quantization** — spatially-varying quantization thresholds; the headline jpegli win.
-5. **XYB color-space encoding** — perceptual color space from JPEG XL.
-6. **12-bit color + bench wiring** — extend the YCbCr path to 12-bit, and the bench `Codec` protocol to 16-bit metrics so the DICOM corpus can cross-codec at native precision.
-7. **Progressive (SOF2) encode & decode**.
-8. **Metal hot path** — actually invoke the existing `JLIMetalPipeline` kernels from the encoder/decoder.
+Remaining:
 
-Done since 0.1: spec-compliance fixes (byte-unstuffing, DRI/RST decode), Accelerate-backed batched DCT, **optimized Huffman tables** (matches libjpeg-turbo's `-optimize`), **12-bit grayscale** encode/decode, **distance parameter**, **trellis quantization** (keep/drop + HF magnitude reduction), and **progressive (SOF2) decode** (reads libjpeg-turbo/mozjpeg/ImageIO progressive output) — all cross-validated against libjpeg-turbo, mozjpeg + ImageIO with PSNR and butteraugli.
+1. **Progressive successive approximation** — finer multi-pass + smaller files than spectral selection; the *decoder* already handles it, so this is encode-only work (the intricate AC-refinement correction-bit coding).
+2. **XYB color-space encoding** — perceptual color space from JPEG XL; the transform math exists but the encoder doesn't emit XYB JPEGs.
+3. **12-bit color** — extend the YCbCr path to 12-bit (12-bit grayscale works; color still assumes 8-bit BT.601). Low priority — clinical corpora are grayscale.
+4. **Metal hot path** — actually invoke the existing `JLIMetalPipeline` kernels (marginal over the Accelerate CPU path).
+
+Done since 0.1 — all cross-validated against libjpeg-turbo, mozjpeg, and ImageIO with PSNR + butteraugli, regression-tracked: spec-compliance fixes (byte-unstuffing, DRI/RST, SOF1), Accelerate-backed batched DCT, **optimized Huffman tables** (≈ libjpeg-turbo `-optimize`), **12-bit grayscale** encode/decode, **distance parameter**, **trellis quantization** (keep/drop + HF magnitude reduction), and **progressive (SOF2) decode and encode**.
 
 ## Requirements
 

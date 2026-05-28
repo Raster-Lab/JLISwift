@@ -86,6 +86,7 @@ if opts.rebuildCache { DICOMCorpus.clearCache() }
 
 let jli420 = JLISwiftCodec(subsampling: .yuv420)
 let jli444 = JLISwiftCodec(subsampling: .yuv444)
+let jli444prog = JLISwiftCodec(subsampling: .yuv444, progressive: true)
 let imageIO = ImageIOCodec()
 
 // Reference codecs shell out to external binaries; each probes its install
@@ -97,16 +98,18 @@ let refCodecs: [CLICodec] = [
     ReferenceCodecs.jpegli(),
 ]
 
-var codecs: [Codec] = [jli420, jli444, imageIO]
+var codecs: [Codec] = [jli420, jli444, jli444prog, imageIO]
 for c in refCodecs where c.enabled { codecs.append(c) }
 
 // Cross-codec pairs:
-//   - JLISwift (both subsamplings) → every other codec's decoder
+//   - JLISwift (4:4:4, 4:2:0, progressive) → every other codec's decoder
 //   - every other codec's encoder → JLISwift decoder
 // We deliberately skip third-party ↔ third-party pairs — they exercise
-// libraries we don't ship and don't validate JLISwift.
+// libraries we don't ship and don't validate JLISwift. The progressive
+// variant in the encoder set checks that ImageIO/libjpeg/mozjpeg decode
+// JLISwift's progressive output.
 var crossPairs: [(encoder: Codec, decoder: Codec)] = []
-let jlEncoders: [Codec] = [jli444, jli420]
+let jlEncoders: [Codec] = [jli444, jli420, jli444prog]
 let otherCodecs: [Codec] = [imageIO] + refCodecs.filter { $0.enabled }
 for jl in jlEncoders {
     for other in otherCodecs {

@@ -37,11 +37,13 @@ extension Gray16Codec {
 struct JLISwiftCodec: Codec, Gray16Codec {
     let name: String
     let subsampling: JLIChromaSubsampling
+    let progressive: Bool
     // Explicit (both Codec and Gray16Codec supply a default — disambiguate).
     let isExternal = false
 
-    init(subsampling: JLIChromaSubsampling) {
+    init(subsampling: JLIChromaSubsampling, progressive: Bool = false) {
         self.subsampling = subsampling
+        self.progressive = progressive
         let tag: String
         switch subsampling {
         case .yuv444: tag = "4:4:4"
@@ -49,7 +51,7 @@ struct JLISwiftCodec: Codec, Gray16Codec {
         case .yuv420: tag = "4:2:0"
         case .yuv400: tag = "gray"
         }
-        self.name = "JLISwift(\(tag))"
+        self.name = "JLISwift(\(tag)\(progressive ? ",prog" : ""))"
     }
 
     func encode(rgb: [UInt8], width: Int, height: Int, quality: Int) throws -> [UInt8] {
@@ -61,6 +63,7 @@ struct JLISwiftCodec: Codec, Gray16Codec {
         var config = JLIEncoderConfiguration.default
         config.quality = Double(quality)
         config.chromaSubsampling = subsampling
+        config.progressive = progressive
         return try JLIEncoder().encode(image, configuration: config)
     }
 
