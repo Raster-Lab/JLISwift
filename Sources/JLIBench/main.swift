@@ -19,6 +19,9 @@ struct BenchOptions {
     var maxPixels: Int = 4_000_000  // skip huge plates (e.g. 5k×5k DX) to keep runtime bounded
     /// Run the 12-bit grayscale DICOM bench (native clinical precision).
     var dicom12: Bool = false
+    /// Compute butteraugli perceptual distance for self-codec rows (slow:
+    /// shell-out per row). Needs libjxl's `butteraugli_main`.
+    var butteraugli: Bool = false
 }
 
 func parseArgs(_ argv: [String]) -> BenchOptions {
@@ -30,6 +33,7 @@ func parseArgs(_ argv: [String]) -> BenchOptions {
         case "--dicom":             opts.mode = .both
         case "--dicom-only":        opts.mode = .dicomOnly
         case "--dicom12":           opts.dicom12 = true
+        case "--butteraugli":       opts.butteraugli = true
         case "--rebuild-cache":     opts.rebuildCache = true
         case "--dicom-root":
             i += 1; opts.dicomRoot = argv[i]
@@ -66,6 +70,7 @@ func printHelp() {
       --per-modality <N>     DICOM images per modality (default: 3)
       --max-pixels <N>       Skip DICOMs above this pixel count (default: 4000000)
       --dicom12              Run the 12-bit grayscale DICOM bench (native precision)
+      --butteraugli          Add butteraugli perceptual distance to self-codec rows (slow)
       --rebuild-cache        Clear ~/.cache/jlibench/corpus before running
 
     Regression flags:
@@ -155,7 +160,7 @@ if opts.mode != .dicomOnly {
             for q in [50, 75, 90] {
                 for codec in codecs {
                     do {
-                        let r = try Harness.run(codec: codec, image: image, quality: q)
+                        let r = try Harness.run(codec: codec, image: image, quality: q, butteraugli: opts.butteraugli)
                         selfResults.append(r); recordSelf(r)
                     } catch {
                         print("FAIL \(codec.name) / \(image.name) / q=\(q): \(error)")
@@ -222,7 +227,7 @@ if opts.mode != .syntheticOnly {
             for q in opts.dicomQualities {
                 for codec in codecs {
                     do {
-                        let r = try Harness.run(codec: codec, image: testImage, quality: q)
+                        let r = try Harness.run(codec: codec, image: testImage, quality: q, butteraugli: opts.butteraugli)
                         dicomSelf.append(r); recordSelf(r)
                     } catch {
                         print("FAIL self \(codec.name) / \(img.id) / q=\(q): \(error)")

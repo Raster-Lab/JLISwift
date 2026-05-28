@@ -83,6 +83,9 @@ struct Result {
     /// `.infinity` means lossless; below ~25 dB is visibly bad.
     let psnrDB: Double
     let bpp: Double
+    /// Butteraugli perceptual distance (lower better; ~1.0 = JND). `nil` when the
+    /// metric wasn't requested or `butteraugli_main` is unavailable.
+    var butteraugli: Double? = nil
 }
 
 enum Harness {
@@ -127,7 +130,9 @@ enum Harness {
         return 10.0 * log10((peak * peak) / mse)
     }
 
-    static func run(codec: Codec, image: TestImage, quality: Int) throws -> Result {
+    static func run(
+        codec: Codec, image: TestImage, quality: Int, butteraugli: Bool = false
+    ) throws -> Result {
         // Shell-out codecs are overhead-dominated; one sample is enough.
         let iters = codec.isExternal ? 1 : 5
 
@@ -148,10 +153,18 @@ enum Harness {
         let psnr = Harness.psnr(Array(image.rgb.prefix(cmp)), Array(decoded.rgb.prefix(cmp)))
         let bpp = Double(jpegBytes.count * 8) / Double(image.width * image.height)
 
+        var ba: Double? = nil
+        if butteraugli, decoded.width == image.width, decoded.height == image.height {
+            ba = Butteraugli.distance(
+                reference: image.rgb, distorted: decoded.rgb,
+                width: image.width, height: image.height
+            )
+        }
+
         return Result(
             codec: codec.name, image: image.name, quality: quality,
             encodedBytes: jpegBytes.count, encodeMs: encMs, decodeMs: decMs,
-            psnrDB: psnr, bpp: bpp
+            psnrDB: psnr, bpp: bpp, butteraugli: ba
         )
     }
 }
@@ -317,7 +330,9 @@ extension Harness {
 }
 
 func printTable(_ results: [Result]) {
-    let header = String(
+    // Show the butteraugli column only when at least one row carries it.
+    let withBA = results.contains { $0.butteraugli != nil }
+    var header = String(
         format: "%-10s  %-18s  %4s  %10s  %7s  %9s  %9s  %7s",
         ("codec" as NSString).utf8String!,
         ("image" as NSString).utf8String!,
@@ -328,17 +343,22 @@ func printTable(_ results: [Result]) {
         ("dec ms" as NSString).utf8String!,
         ("PSNR" as NSString).utf8String!
     )
+    if withBA { header += "   btrgli" }
     print(header)
     print(String(repeating: "-", count: header.count))
     for r in results {
         let psnrStr = r.psnrDB.isInfinite ? "  ∞ " : String(format: "%6.2f", r.psnrDB)
-        print(String(
+        var row = String(
             format: "%-10s  %-18s  %4d  %10d  %7.3f  %9.3f  %9.3f  %7s",
             (r.codec as NSString).utf8String!,
             (r.image as NSString).utf8String!,
             r.quality, r.encodedBytes, r.bpp,
             r.encodeMs, r.decodeMs,
             (psnrStr as NSString).utf8String!
-        ))
+        )
+        if withBA {
+            row += r.butteraugli.map { String(format: "  %7.4f", $0) } ?? "      -- "
+        }
+        print(row)
     }
 }

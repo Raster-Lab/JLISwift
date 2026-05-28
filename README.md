@@ -184,6 +184,14 @@ External codecs spawn a process per encode/decode (~70 ms overhead each on
 macOS) so the harness times them with a single sample rather than the
 median-of-5 it uses for native codecs. Bytes and PSNR are unaffected.
 
+### Perceptual metric (butteraugli)
+
+`--butteraugli` adds a butteraugli perceptual-distance column to self-codec
+rows (lower is better; ~1.0 = just-noticeable-difference). It shells out to
+libjxl's `butteraugli_main` (Homebrew `jpeg-xl`), comparing the original and
+round-tripped images. This is the right metric for perceptually-tuned
+techniques — PSNR can't see them. Slow (a process per row), so it's opt-in.
+
 ### DICOM corpus
 
 `JLIBench --dicom` loads a small sample from a clinical DICOM tree
