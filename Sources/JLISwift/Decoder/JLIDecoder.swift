@@ -79,6 +79,12 @@ public struct JLIDecoder: Sendable {
         // Reject structurally-invalid frames before any size math or indexing.
         try validateDecodable(frame, quantTableCount: quantTables.count)
 
+        // Reduced-scale (thumbnail) decode. 1 = full; 8 = 1/8 (DC-only).
+        let scale = configuration.scale
+        guard scale == 1 || scale == 8 else {
+            throw JLIError.unsupportedJPEGFeature("decode scale \(scale) (only 1 and 8 supported)")
+        }
+
         // Step 3: Prepare Huffman tables (use standard tables as fallback)
         let dcTables = prepareDCTables(parsed.huffmanDCTables)
         let acTables = prepareACTables(parsed.huffmanACTables)
@@ -208,6 +214,37 @@ public struct JLIDecoder: Sendable {
             let planeHeight = blocksV * 8
             let qtF = quantTables[comp.quantTableIndex].map { Float($0) }
 
+            let compWidth = (frame.width * comp.horizontalSampling + hMaxSampling - 1) / hMaxSampling
+            let compHeight = (frame.height * comp.verticalSampling + vMaxSampling - 1) / vMaxSampling
+
+            // 1/8 DC-only path: each 8×8 block reduces to one pixel — its average,
+            // which for the normalized DCT is (1/8)·dequant(DC) + level shift. No
+            // inverse DCT; output plane is the block grid, trimmed to ceil(comp/8).
+            if scale == 8 {
+                let center = Float(1 << (frame.precision - 1))
+                let maxV = Float((1 << frame.precision) - 1)
+                let dcStep = Float(quantTables[comp.quantTableIndex][0])  // DC quant (natural order)
+                var small = [Float](repeating: 0, count: blocksH * blocksV)
+                componentZigzag[compIdx].withUnsafeBufferPointer { src in
+                    for b in 0..<blockCount {
+                        let dc = Float(src[b * 64]) * dcStep
+                        small[b] = min(max(dc * (1.0 / 8.0) + center, 0), maxV)
+                    }
+                }
+                let cwS = (compWidth + 7) / 8
+                let chS = (compHeight + 7) / 8
+                if blocksH != cwS || blocksV != chS {
+                    var trimmed = [Float](repeating: 0, count: cwS * chS)
+                    for y in 0..<chS {
+                        for x in 0..<cwS { trimmed[y * cwS + x] = small[y * blocksH + x] }
+                    }
+                    componentPlanes.append((trimmed, cwS, chS))
+                } else {
+                    componentPlanes.append((small, blocksH, blocksV))
+                }
+                continue
+            }
+
             // Inverse zigzag every block: out[block*64 + zigzagOrder[i]] = in[block*64 + i].
             let zigzag = Quantization.zigzagOrder
             componentZigzag[compIdx].withUnsafeBufferPointer { srcBuf in
@@ -262,10 +299,7 @@ public struct JLIDecoder: Sendable {
                 }
             }
 
-            // Trim to actual component dimensions
-            let compWidth = (frame.width * comp.horizontalSampling + hMaxSampling - 1) / hMaxSampling
-            let compHeight = (frame.height * comp.verticalSampling + vMaxSampling - 1) / vMaxSampling
-
+            // Trim to actual component dimensions (computed at the loop top).
             if planeWidth != compWidth || planeHeight != compHeight {
                 var trimmed = [Float](repeating: 0, count: compWidth * compHeight)
                 for y in 0..<compHeight {
@@ -279,7 +313,10 @@ public struct JLIDecoder: Sendable {
             }
         }
 
-        // Step 8: Chroma upsample and color convert
+        // Step 8: Chroma upsample and color convert. Output dimensions are the
+        // image dimensions reduced by `scale` (= full dims when scale == 1).
+        let outW = (frame.width + scale - 1) / scale
+        let outH = (frame.height + scale - 1) / scale
         let outputData: [UInt8]
         let outputColorModel: JLIColorModel
         // 12-bit (grayscale or color) decodes to a uint16 buffer (little-endian
@@ -310,22 +347,22 @@ public struct JLIDecoder: Sendable {
                 componentPlanes[1].data,
                 width: componentPlanes[1].width,
                 height: componentPlanes[1].height,
-                targetWidth: frame.width, targetHeight: frame.height
+                targetWidth: outW, targetHeight: outH
             )
             let crUp = ChromaSampling.upsample(
                 componentPlanes[2].data,
                 width: componentPlanes[2].width,
                 height: componentPlanes[2].height,
-                targetWidth: frame.width, targetHeight: frame.height
+                targetWidth: outW, targetHeight: outH
             )
 
             // Trim Y plane if padded
             let yTrimmed: [Float]
-            if yPlane.width != frame.width || yPlane.height != frame.height {
-                var trimmed = [Float](repeating: 0, count: frame.width * frame.height)
-                for y in 0..<frame.height {
-                    for x in 0..<frame.width {
-                        trimmed[y * frame.width + x] = yPlane.data[y * yPlane.width + x]
+            if yPlane.width != outW || yPlane.height != outH {
+                var trimmed = [Float](repeating: 0, count: outW * outH)
+                for y in 0..<outH {
+                    for x in 0..<outW {
+                        trimmed[y * outW + x] = yPlane.data[y * yPlane.width + x]
                     }
                 }
                 yTrimmed = trimmed
@@ -338,14 +375,14 @@ public struct JLIDecoder: Sendable {
                 // reconstructed in 0...2^P-1 with chroma centered at 2^(P-1).
                 outputData = ColorConversion.imageYCbCr16ToRGB(
                     y: yTrimmed, cb: cbUp, cr: crUp,
-                    width: frame.width, height: frame.height,
+                    width: outW, height: outH,
                     center: Float(1 << (frame.precision - 1)),
                     maxValue: Float((1 << frame.precision) - 1)
                 )
             } else {
                 outputData = ColorConversion.imageYCbCrToRGB(
                     y: yTrimmed, cb: cbUp, cr: crUp,
-                    width: frame.width, height: frame.height
+                    width: outW, height: outH
                 )
             }
             outputColorModel = configuration.outputColorModel ?? .rgb
@@ -355,8 +392,8 @@ public struct JLIDecoder: Sendable {
             ?? (isExtendedPrecision ? .uint16 : .uint8)
 
         return try JLIImage(
-            width: frame.width,
-            height: frame.height,
+            width: outW,
+            height: outH,
             pixelFormat: outputPixelFormat,
             colorModel: outputColorModel,
             data: outputData

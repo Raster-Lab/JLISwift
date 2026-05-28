@@ -155,6 +155,12 @@ public struct JLIDecoderConfiguration: Sendable {
     /// When `nil`, the decoder outputs in the JPEG's native color model (typically RGB).
     public var outputColorModel: JLIColorModel?
 
+    /// Decode at a reduced scale of `1/scale` for fast previews/thumbnails of
+    /// large images. Supported: `1` (full, default) and `8` (1/8 — DC-only, one
+    /// pixel per 8×8 block = the block average, so it's exact and very fast).
+    /// Output dimensions are `ceil(width/scale) × ceil(height/scale)`.
+    public var scale: Int
+
     /// A sensible default configuration that auto-detects precision and color model.
     public static let `default` = JLIDecoderConfiguration(
         outputPixelFormat: nil,
@@ -166,11 +172,14 @@ public struct JLIDecoderConfiguration: Sendable {
     /// - Parameters:
     ///   - outputPixelFormat: Desired output pixel format, or `nil` for auto-detection.
     ///   - outputColorModel: Desired output color model, or `nil` for auto-detection.
+    ///   - scale: Decode at `1/scale` resolution (`1` full, `8` for 1/8 thumbnails).
     public init(
         outputPixelFormat: JLIPixelFormat? = nil,
-        outputColorModel: JLIColorModel? = nil
+        outputColorModel: JLIColorModel? = nil,
+        scale: Int = 1
     ) {
         self.outputPixelFormat = outputPixelFormat
         self.outputColorModel = outputColorModel
+        self.scale = scale
     }
 }

@@ -424,6 +424,81 @@ struct EncoderDecoderTests {
         #expect(maxDiff == 0, "restart vs no-restart decode differ by \(maxDiff)")
     }
 
+    // MARK: - Scaled (thumbnail) decode
+
+    @Test("1/8 scaled decode yields a block-average thumbnail (color)")
+    func scaledDecode8Color() throws {
+        let w = 64, h = 48   // exact 8-multiples → no partial (edge-replicated) blocks
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 3
+                rgb[i] = UInt8(40 + x)          // mid-range + smooth → no clipping
+                rgb[i + 1] = UInt8(50 + y)
+                rgb[i + 2] = UInt8(60 + (x + y) / 2)
+            }
+        }
+        let image = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
+        var cfg = JLIEncoderConfiguration.default
+        cfg.quality = 92; cfg.chromaSubsampling = .yuv444
+        let jpeg = try JLIEncoder().encode(image, configuration: cfg)
+
+        let full = try JLIDecoder().decode(from: jpeg)
+        var thumbCfg = JLIDecoderConfiguration.default; thumbCfg.scale = 8
+        let thumb = try JLIDecoder().decode(from: jpeg, configuration: thumbCfg)
+
+        #expect(thumb.width == w / 8 && thumb.height == h / 8)
+        #expect(thumb.pixelFormat == .uint8 && thumb.colorModel == .rgb)
+
+        // DC = block average, and YCbCr→RGB is linear, so each thumbnail pixel
+        // matches the average of the full decode over its 8×8 region (no clipping
+        // in this image, so the per-pixel clamp doesn't perturb the average).
+        var maxErr = 0
+        for ty in 0..<thumb.height {
+            for tx in 0..<thumb.width {
+                for c in 0..<3 {
+                    var sum = 0
+                    for dy in 0..<8 { for dx in 0..<8 {
+                        sum += Int(full.data[((ty * 8 + dy) * w + (tx * 8 + dx)) * 3 + c])
+                    } }
+                    let avg = (sum + 32) / 64
+                    let tv = Int(thumb.data[(ty * thumb.width + tx) * 3 + c])
+                    maxErr = max(maxErr, abs(tv - avg))
+                }
+            }
+        }
+        #expect(maxErr <= 6, "thumbnail vs block-average max err \(maxErr)")
+    }
+
+    @Test("1/8 scaled decode handles non-multiple dims and 12-bit grayscale")
+    func scaledDecode8Gray() throws {
+        // Non-multiple-of-8 dimensions → ceil sizing.
+        let w = 50, h = 30
+        var gray = [UInt8](repeating: 0, count: w * h)
+        for i in 0..<gray.count { gray[i] = UInt8(64 + (i % 64)) }
+        let img8 = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .grayscale, data: gray)
+        var cfg = JLIEncoderConfiguration.default; cfg.chromaSubsampling = .yuv400
+        let jpeg8 = try JLIEncoder().encode(img8, configuration: cfg)
+        var thumbCfg = JLIDecoderConfiguration.default; thumbCfg.scale = 8
+        let t8 = try JLIDecoder().decode(from: jpeg8, configuration: thumbCfg)
+        #expect(t8.width == (w + 7) / 8 && t8.height == (h + 7) / 8)
+        #expect(t8.pixelFormat == .uint8 && t8.colorModel == .grayscale)
+        #expect(t8.data.count == ((w + 7) / 8) * ((h + 7) / 8))
+
+        // 12-bit grayscale thumbnail → uint16 output at 1/8 dims.
+        var s = [UInt8](repeating: 0, count: w * h * 2)
+        for i in 0..<(w * h) {
+            let v = UInt16(1000 + (i % 2000))
+            s[i * 2] = UInt8(v & 0xFF); s[i * 2 + 1] = UInt8(v >> 8)
+        }
+        let img12 = try JLIImage(width: w, height: h, pixelFormat: .uint16, colorModel: .grayscale, data: s)
+        let jpeg12 = try JLIEncoder().encode(img12, configuration: cfg)
+        let t12 = try JLIDecoder().decode(from: jpeg12, configuration: thumbCfg)
+        #expect(t12.width == (w + 7) / 8 && t12.height == (h + 7) / 8)
+        #expect(t12.pixelFormat == .uint16)
+        #expect(t12.data.count == ((w + 7) / 8) * ((h + 7) / 8) * 2)
+    }
+
     // MARK: - Distance parameter
 
     @Test("Larger distance produces smaller output (monotonic rate)")
