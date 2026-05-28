@@ -39,6 +39,28 @@ struct FuzzTests {
         return try JLIEncoder().encode(img, configuration: cfg)
     }
 
+    /// A valid grayscale JPEG: 8-bit (SOF0) or 12-bit (SOF1, 16-bit DQT, uint16
+    /// output buffer) — the clinical-precision path that DICOM actually uses.
+    static func validGrayJPEG(bits: Int) throws -> [UInt8] {
+        let w = 32, h = 24
+        let img: JLIImage
+        if bits == 8 {
+            var gray = [UInt8](repeating: 0, count: w * h)
+            for i in 0..<gray.count { gray[i] = UInt8((i &* 7) & 0xFF) }
+            img = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .grayscale, data: gray)
+        } else {
+            var bytes = [UInt8](repeating: 0, count: w * h * 2)  // little-endian uint16
+            for i in 0..<(w * h) {
+                let v = UInt16((i &* 17) & 0x0FFF)               // 12-bit samples 0–4095
+                bytes[i * 2] = UInt8(v & 0xFF); bytes[i * 2 + 1] = UInt8(v >> 8)
+            }
+            img = try JLIImage(width: w, height: h, pixelFormat: .uint16, colorModel: .grayscale, data: bytes)
+        }
+        var cfg = JLIEncoderConfiguration.default
+        cfg.chromaSubsampling = .yuv400
+        return try JLIEncoder().encode(img, configuration: cfg)
+    }
+
     /// Feed bytes to both entry points; thrown errors are fine, a trap is not.
     private func probe(_ data: [UInt8]) {
         _ = try? JLIDecoder().inspect(data: data)
@@ -47,7 +69,13 @@ struct FuzzTests {
 
     @Test("Truncation at every prefix length never crashes")
     func truncations() throws {
-        for valid in [try Self.validJPEG(), try Self.validJPEG(progressive: true)] {
+        let corpus = [
+            try Self.validJPEG(),
+            try Self.validJPEG(progressive: true),
+            try Self.validGrayJPEG(bits: 8),
+            try Self.validGrayJPEG(bits: 12),
+        ]
+        for valid in corpus {
             for len in 0...valid.count {
                 probe(Array(valid[0..<len]))
             }
@@ -59,6 +87,19 @@ struct FuzzTests {
         for valid in [try Self.validJPEG(), try Self.validJPEG(progressive: true)] {
             for pos in 0..<valid.count {
                 for v: UInt8 in [0x00, 0xFF, 0xD8, 0xD9, 0xC0, 0xC2, 0x01, 0x80] {
+                    var m = valid
+                    m[pos] = v
+                    probe(m)
+                }
+            }
+        }
+    }
+
+    @Test("Single-byte mutations never crash (8-bit + 12-bit grayscale)")
+    func grayscaleMutations() throws {
+        for valid in [try Self.validGrayJPEG(bits: 8), try Self.validGrayJPEG(bits: 12)] {
+            for pos in 0..<valid.count {
+                for v: UInt8 in [0x00, 0xFF, 0xC0, 0xC1, 0xC2, 0x80] {
                     var m = valid
                     m[pos] = v
                     probe(m)
@@ -100,6 +141,86 @@ struct FuzzTests {
                 m[pos + 2] = hi
                 m[pos + 3] = lo
                 probe(m)
+            }
+        }
+    }
+}
+
+/// Encoder edge cases. `JLIImage.init` already rejects bad dimensions / buffer
+/// sizes, so the encoder always gets a consistent image — the risk is edge-case
+/// *valid* inputs: tiny and odd dimensions stress MCU padding and chroma
+/// subsampling (progressive's non-interleaved grid had off-by-one bugs on
+/// non-MCU-multiple sizes). Every combination must encode without trapping and
+/// round-trip to the original dimensions.
+@Suite("Encoder robustness / edge cases")
+struct EncoderEdgeTests {
+    /// Tiny, sub-block, odd, and non-MCU-multiple dimensions.
+    static let dims: [(Int, Int)] = [
+        (1, 1), (1, 8), (8, 1), (7, 7), (8, 8), (9, 9), (16, 16),
+        (17, 3), (3, 17), (13, 31), (1, 64), (64, 1), (32, 24),
+    ]
+
+    static let modes: [(progressive: Bool, mode: JLIProgressiveMode)] = [
+        (false, .spectralSelection),
+        (true, .spectralSelection),
+        (true, .successiveApproximation),
+    ]
+
+    @Test("RGB encode across dimensions × subsampling × progressive modes round-trips")
+    func rgbSweep() throws {
+        let subs: [JLIChromaSubsampling] = [.yuv444, .yuv422, .yuv420]
+        for (w, h) in Self.dims {
+            var rgb = [UInt8](repeating: 0, count: w * h * 3)
+            for i in 0..<rgb.count { rgb[i] = UInt8((i &* 31) & 0xFF) }
+            let img = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
+            for sub in subs {
+                for m in Self.modes {
+                    for q in [1, 50, 100] {
+                        var cfg = JLIEncoderConfiguration.default
+                        cfg.quality = Double(q)
+                        cfg.chromaSubsampling = sub
+                        cfg.progressive = m.progressive
+                        cfg.progressiveMode = m.mode
+                        let jpeg = try JLIEncoder().encode(img, configuration: cfg)
+                        let dec = try JLIDecoder().decode(from: jpeg)
+                        #expect(dec.width == w && dec.height == h,
+                                "RGB \(w)×\(h) sub=\(sub) prog=\(m.progressive)/\(m.mode) q=\(q)")
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("Grayscale 8/12-bit encode across dimensions round-trips")
+    func graySweep() throws {
+        for bits in [8, 12] {
+            for (w, h) in Self.dims {
+                let img: JLIImage
+                if bits == 8 {
+                    var g = [UInt8](repeating: 0, count: w * h)
+                    for i in 0..<g.count { g[i] = UInt8((i &* 31) & 0xFF) }
+                    img = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .grayscale, data: g)
+                } else {
+                    var b = [UInt8](repeating: 0, count: w * h * 2)
+                    for i in 0..<(w * h) {
+                        let v = UInt16((i &* 53) & 0x0FFF)
+                        b[i * 2] = UInt8(v & 0xFF); b[i * 2 + 1] = UInt8(v >> 8)
+                    }
+                    img = try JLIImage(width: w, height: h, pixelFormat: .uint16, colorModel: .grayscale, data: b)
+                }
+                for m in Self.modes {
+                    for q in [1, 50, 100] {
+                        var cfg = JLIEncoderConfiguration.default
+                        cfg.quality = Double(q)
+                        cfg.chromaSubsampling = .yuv400
+                        cfg.progressive = m.progressive
+                        cfg.progressiveMode = m.mode
+                        let jpeg = try JLIEncoder().encode(img, configuration: cfg)
+                        let dec = try JLIDecoder().decode(from: jpeg)
+                        #expect(dec.width == w && dec.height == h,
+                                "gray\(bits) \(w)×\(h) prog=\(m.progressive)/\(m.mode) q=\(q)")
+                    }
+                }
             }
         }
     }
