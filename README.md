@@ -46,6 +46,7 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | **Optimized (per-image) Huffman tables** (Annex K.2, `optimiseHuffman`, default on) | ✅ |
 | Restart marker (DRI / RST) decode — interop with ImageIO/libjpeg output | ✅ |
 | Quality-scaled standard quantization tables (IJG formula) | ✅ |
+| Distance parameter (jpegli/JXL convention; maps to IJG quality) | ✅ |
 | RGB / RGBA / grayscale / pre-converted YCbCr input (8-bit) | ✅ |
 | **12-bit grayscale** encode + decode (`.uint16` → SOF1 precision-12 JPEG) | ✅ |
 | SOF1 (extended sequential) decode — reads 12-bit JPEGs from libjpeg/ImageIO | ✅ |
@@ -53,7 +54,6 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | Accelerate `vDSP_mmul` DCT, `vDSP_vmul` quant, vectorized BT.601 color conversion | ✅ |
 | Round-trip + cross-codec tested (ImageIO, libjpeg-turbo) on synthetic + DICOM | ✅ |
 | Adaptive dead-zone quantization | ❌ planned |
-| Distance-parameter quantization tuning | ❌ planned (API stub exists; ignored today) |
 | 12-bit *color* / 16-bit / float32 input | ❌ planned (12-bit grayscale works; color path still assumes 8-bit BT.601) |
 | XYB color space JPEG | ❌ planned (XYB transform math exists, encoder doesn't emit XYB) |
 | Progressive (SOF2) encode/decode | ❌ planned (SOF2 header parses; no progressive entropy decode) |
@@ -82,7 +82,16 @@ The configuration fields `progressive`, `optimiseHuffman`, `adaptiveQuantization
 var config = JLIEncoderConfiguration.default
 config.quality = 85.0                  // 1–100, IJG-compatible scaling
 config.chromaSubsampling = .yuv444     // .yuv444, .yuv422, .yuv420, .yuv400
+
+// Or drive quality by jpegli/JPEG-XL distance (overrides quality when set).
+// ~1.0 is visually lossless; larger compresses harder.
+config.distance = 1.0
 ```
+
+`distance` maps to an effective IJG quality (libjxl's `JpegQualityToDistance`
+curve, inverted) that scales the standard quant tables — same monotonic
+rate/distance behavior as jpegli, but not byte-identical since JLISwift scales
+the standard tables rather than jpegli's perceptual base matrices.
 
 ## Platform support
 

@@ -328,6 +328,66 @@ struct EncoderDecoderTests {
         #expect(maxErr <= 40, "max 12-bit error \(maxErr) exceeds tolerance")
     }
 
+    // MARK: - Distance parameter
+
+    @Test("Larger distance produces smaller output (monotonic rate)")
+    func distanceMonotonicRate() throws {
+        let w = 64, h = 64
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        // A textured pattern so quantization actually bites.
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 3
+                let v = UInt8((x * 7 + y * 13) & 0xFF)
+                rgb[i] = v; rgb[i + 1] = 255 &- v; rgb[i + 2] = v
+            }
+        }
+        let image = try JLIImage(
+            width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb
+        )
+
+        func sizeAt(distance: Double) throws -> Int {
+            var cfg = JLIEncoderConfiguration.default
+            cfg.distance = distance
+            cfg.chromaSubsampling = .yuv444
+            return try JLIEncoder().encode(image, configuration: cfg).count
+        }
+
+        // Distances from visually lossless to aggressive — sizes must not increase.
+        let distances = [0.5, 1.0, 2.0, 4.0, 8.0]
+        var sizes = [Int]()
+        for d in distances { sizes.append(try sizeAt(distance: d)) }
+        for k in 1..<sizes.count {
+            #expect(sizes[k] <= sizes[k - 1],
+                    "size rose at distance \(distances[k]): \(sizes) ")
+        }
+    }
+
+    @Test("Distance overrides quality when both are set")
+    func distanceOverridesQuality() throws {
+        let w = 32, h = 32
+        let rgb = (0..<(w * h * 3)).map { UInt8($0 % 256) }
+        let image = try JLIImage(
+            width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb
+        )
+        // quality says "low" but distance says "near-lossless" — distance wins,
+        // so output should match the equivalent distance-only encode and be
+        // markedly larger than the quality-only low-quality encode.
+        var lowQ = JLIEncoderConfiguration.default
+        lowQ.quality = 10; lowQ.distance = nil; lowQ.chromaSubsampling = .yuv444
+        var distOverride = JLIEncoderConfiguration.default
+        distOverride.quality = 10; distOverride.distance = 0.5; distOverride.chromaSubsampling = .yuv444
+
+        let lowQData = try JLIEncoder().encode(image, configuration: lowQ)
+        let overrideData = try JLIEncoder().encode(image, configuration: distOverride)
+        #expect(overrideData.count > lowQData.count,
+                "distance 0.5 should override quality 10 and yield a larger file")
+
+        // And it round-trips.
+        let decoded = try JLIDecoder().decode(from: overrideData)
+        #expect(decoded.width == w && decoded.height == h)
+    }
+
     @Test("12-bit preserves more precision than 8-bit on a fine gradient")
     func twelveBitBeatsEightBit() throws {
         // A gradient with fine steps that 8-bit can't represent: 16 distinct

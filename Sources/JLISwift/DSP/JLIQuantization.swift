@@ -89,6 +89,38 @@ enum Quantization {
         99, 99, 99, 99, 99, 99, 99, 99
     ]
 
+    /// Maps a jpegli/JPEG-XL **distance** to an IJG quality (1–100).
+    ///
+    /// Distance is jpegli's native quality knob: it targets a Butteraugli
+    /// distance, where ~1.0 is visually lossless and larger values compress
+    /// harder. This is the inverse of libjxl's `JpegQualityToDistance`:
+    ///
+    ///     q ≥ 100  → d = 0.01
+    ///     q ≥ 30   → d = 0.1 + (100 − q)·0.09          (linear)
+    ///     q < 30   → d = (53/3000)q² − (23/20)q + 25   (quadratic)
+    ///
+    /// JLISwift scales the standard IJG tables by this quality rather than
+    /// jpegli's perceptually-tuned base matrices, so this is an approximation
+    /// of jpegli's distance semantics — same monotonic rate/distance behavior,
+    /// not byte-identical output. Returns a Double so callers can round as they
+    /// see fit.
+    static func qualityForDistance(_ distance: Double) -> Double {
+        let d = max(0.0, distance)
+        if d < 0.1 { return 100.0 }
+        // Linear branch maps d ∈ [0.1, 6.4] → q ∈ [100, 30].
+        if d <= 6.4 {
+            return 100.0 - (d - 0.1) / 0.09
+        }
+        // Quadratic branch for q < 30: (53/3000)q² − (23/20)q + (25 − d) = 0.
+        let a = 53.0 / 3000.0
+        let b = -23.0 / 20.0
+        let c = 25.0 - d
+        let disc = b * b - 4 * a * c
+        if disc <= 0 { return 1.0 }
+        let q = (-b - disc.squareRoot()) / (2 * a)   // lower root = lower quality
+        return max(1.0, min(30.0, q))
+    }
+
     /// Scales a quantization table for a given JPEG quality (0–100).
     ///
     /// Uses the standard IJG quality scaling formula.

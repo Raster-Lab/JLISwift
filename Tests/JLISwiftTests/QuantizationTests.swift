@@ -123,4 +123,40 @@ struct QuantizationTests {
                     "Error at index \(i) exceeds quantization step")
         }
     }
+
+    // MARK: - Distance → Quality (jpegli convention)
+
+    @Test("Distance maps to expected IJG quality landmarks")
+    func distanceToQualityLandmarks() {
+        // d < 0.1 → top quality.
+        #expect(Quantization.qualityForDistance(0.0) == 100.0)
+        #expect(Quantization.qualityForDistance(0.05) == 100.0)
+        // Linear branch landmarks: d=0.1 → q≈100, d=6.4 → q≈30.
+        #expect(abs(Quantization.qualityForDistance(0.1) - 100.0) < 0.01)
+        #expect(abs(Quantization.qualityForDistance(6.4) - 30.0) < 0.5)
+        // d=1.0 (visually lossless) → q≈90.
+        let q1 = Quantization.qualityForDistance(1.0)
+        #expect(q1 > 88 && q1 < 92, "distance 1.0 should map to ~q90, got \(q1)")
+        // Quadratic branch: large distance → near minimum quality.
+        #expect(Quantization.qualityForDistance(100.0) == 1.0)
+    }
+
+    @Test("Distance → quality is monotonically decreasing")
+    func distanceToQualityMonotonic() {
+        var prev = Quantization.qualityForDistance(0.0)
+        for step in 1...250 {
+            let d = Double(step) * 0.1
+            let q = Quantization.qualityForDistance(d)
+            #expect(q <= prev + 1e-6, "quality rose from \(prev) to \(q) at distance \(d)")
+            prev = q
+        }
+    }
+
+    @Test("Distance is continuous across the q=30 branch boundary")
+    func distanceContinuityAtBoundary() {
+        // The linear and quadratic branches meet at d=6.4 (q=30).
+        let below = Quantization.qualityForDistance(6.39)
+        let above = Quantization.qualityForDistance(6.41)
+        #expect(abs(below - above) < 0.5, "discontinuity at branch boundary: \(below) vs \(above)")
+    }
 }

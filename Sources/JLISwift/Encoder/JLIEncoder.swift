@@ -38,7 +38,16 @@ public struct JLIEncoder: Sendable {
 
         let width = image.width
         let height = image.height
-        let quality = max(1, min(100, Int(configuration.quality)))
+        // The distance parameter (jpegli/JPEG-XL convention) overrides quality
+        // when set: it's mapped to an effective IJG quality that scales the
+        // standard quant tables.
+        let effectiveQuality: Double
+        if let distance = configuration.distance {
+            effectiveQuality = Quantization.qualityForDistance(distance)
+        } else {
+            effectiveQuality = configuration.quality
+        }
+        let quality = max(1, min(100, Int(effectiveQuality.rounded())))
 
         // Sample precision: 8-bit for uint8, 12-bit for uint16 (JPEG supports 8
         // or 12). 12-bit is currently grayscale-only — the color path still
