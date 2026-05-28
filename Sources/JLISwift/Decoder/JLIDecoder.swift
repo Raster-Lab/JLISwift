@@ -410,7 +410,8 @@ public struct JLIDecoder: Sendable {
     /// Decodes a lossless (SOF3) JPEG by spatial prediction (ITU-T T.81 Annex H):
     /// each sample is predicted from already-decoded neighbours (selector 1–7 in
     /// the SOS `spectralStart`), and the Huffman-coded difference (DC mechanism,
-    /// SSSS=16 ⇒ −32768 special case) is added back. Grayscale only for now.
+    /// SSSS=16 ⇒ −32768 special case) is added back. Grayscale (1) or RGB (3,
+    /// stored directly — no color transform, like libjpeg-turbo's lossless).
     private func decodeLossless(
         frame: JPEGFrameInfo, scans: [JPEGScanData], configuration: JLIDecoderConfiguration
     ) throws -> JLIImage {
@@ -422,8 +423,12 @@ public struct JLIDecoder: Sendable {
         guard w >= 1, h >= 1, w <= 65535, h <= 65535 else {
             throw JLIError.decodingFailed("invalid lossless dimensions \(w)×\(h)")
         }
-        guard frame.components.count == 1 else {
-            throw JLIError.unsupportedJPEGFeature("lossless color (only grayscale supported)")
+        let nc = frame.components.count
+        guard nc == 1 || nc == 3 else {
+            throw JLIError.unsupportedJPEGFeature("lossless \(nc)-component (only 1 or 3)")
+        }
+        for c in frame.components where c.horizontalSampling != 1 || c.verticalSampling != 1 {
+            throw JLIError.unsupportedJPEGFeature("subsampled lossless")
         }
         guard let scan = scans.first else { throw JLIError.decodingFailed("no lossless scan") }
         let predictor = scan.header.spectralStart       // 1–7
@@ -432,11 +437,13 @@ public struct JLIDecoder: Sendable {
             throw JLIError.decodingFailed("invalid lossless predictor \(predictor)")
         }
         let dcTables = prepareDCTables(scan.dcTables)
-        let table = dcTables[scan.header.components.first?.dcTableId ?? 0]
-            ?? StandardHuffmanTables.dcLuminance
+        let tables = frame.components.map { fc -> HuffmanTable in
+            let sc = scan.header.components.first { $0.componentSelector == fc.id }
+            return dcTables[sc?.dcTableId ?? 0] ?? StandardHuffmanTables.dcLuminance
+        }
 
         var reader = BitReader(data: scan.entropyData)
-        var samples = [Int32](repeating: 0, count: w * h)
+        var planes = [[Int32]](repeating: [Int32](repeating: 0, count: w * h), count: nc)
         let half = Int32(1 << (precision - 1 - pt))   // predictor for the very first sample
         let mask: Int32 = 0xFFFF                       // T.81: differences are modulo 2^16
 
@@ -444,46 +451,53 @@ public struct JLIDecoder: Sendable {
             let row = y * w
             let prevRow = row - w
             for x in 0..<w {
-                let px: Int32
-                if x == 0 {
-                    px = y == 0 ? half : samples[prevRow]          // Rb (or initial)
-                } else if y == 0 {
-                    px = samples[row + x - 1]                       // Ra
-                } else {
-                    let ra = samples[row + x - 1]
-                    let rb = samples[prevRow + x]
-                    let rc = samples[prevRow + x - 1]
-                    switch predictor {
-                    case 1: px = ra
-                    case 2: px = rb
-                    case 3: px = rc
-                    case 4: px = ra + rb - rc
-                    case 5: px = ra + ((rb - rc) >> 1)
-                    case 6: px = rb + ((ra - rc) >> 1)
-                    default: px = (ra + rb) >> 1                    // 7
+                // Components are interleaved per sample (1×1 sampling).
+                for c in 0..<nc {
+                    let p = planes[c]
+                    let px: Int32
+                    if x == 0 {
+                        px = y == 0 ? half : p[prevRow]                // Rb (or initial)
+                    } else if y == 0 {
+                        px = p[row + x - 1]                            // Ra
+                    } else {
+                        let ra = p[row + x - 1], rb = p[prevRow + x], rc = p[prevRow + x - 1]
+                        switch predictor {
+                        case 1: px = ra
+                        case 2: px = rb
+                        case 3: px = rc
+                        case 4: px = ra + rb - rc
+                        case 5: px = ra + ((rb - rc) >> 1)
+                        case 6: px = rb + ((ra - rc) >> 1)
+                        default: px = (ra + rb) >> 1                   // 7
+                        }
                     }
+                    let cat = Int(try HuffmanDecoder.decodeSymbol(from: &reader, table: tables[c]))
+                    let diff: Int32
+                    if cat == 0 { diff = 0 }
+                    else if cat == 16 { diff = -32768 }               // T.81 special case
+                    else { diff = try HuffmanDecoder.decodeValue(from: &reader, category: cat) }
+                    planes[c][row + x] = (px + (diff << pt)) & mask
                 }
-                // Huffman-coded difference category, then the difference itself.
-                let cat = Int(try HuffmanDecoder.decodeSymbol(from: &reader, table: table))
-                let diff: Int32
-                if cat == 0 { diff = 0 }
-                else if cat == 16 { diff = -32768 }                // T.81 lossless special case
-                else { diff = try HuffmanDecoder.decodeValue(from: &reader, category: cat) }
-                samples[row + x] = (px + (diff << pt)) & mask
             }
         }
 
-        let model = configuration.outputColorModel ?? .grayscale
+        // Interleave planes → output. 1 component = grayscale; 3 = RGB (direct).
+        let model = configuration.outputColorModel ?? (nc == 1 ? .grayscale : .rgb)
+        let count = w * h
         if precision <= 8 {
-            let bytes = samples.map { UInt8(clamping: Int($0)) }
+            var bytes = [UInt8](repeating: 0, count: count * nc)
+            for i in 0..<count { for c in 0..<nc { bytes[i * nc + c] = UInt8(clamping: Int(planes[c][i])) } }
             return try JLIImage(width: w, height: h,
                                 pixelFormat: configuration.outputPixelFormat ?? .uint8,
                                 colorModel: model, data: bytes)
         }
-        var bytes = [UInt8](repeating: 0, count: samples.count * 2)
-        for i in 0..<samples.count {
-            let v = UInt16(clamping: Int(samples[i]))
-            bytes[i * 2] = UInt8(v & 0xFF); bytes[i * 2 + 1] = UInt8(v >> 8)
+        var bytes = [UInt8](repeating: 0, count: count * nc * 2)
+        for i in 0..<count {
+            for c in 0..<nc {
+                let v = UInt16(clamping: Int(planes[c][i]))
+                bytes[(i * nc + c) * 2] = UInt8(v & 0xFF)
+                bytes[(i * nc + c) * 2 + 1] = UInt8(v >> 8)
+            }
         }
         return try JLIImage(width: w, height: h,
                             pixelFormat: configuration.outputPixelFormat ?? .uint16,

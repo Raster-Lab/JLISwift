@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-28 (lossless SOF3 grayscale encode + decode)._
+_Last updated: 2026-05-28 (lossless SOF3 complete — grayscale + color, encode + decode)._
 
 ## Completed
 
@@ -30,11 +30,12 @@ _Last updated: 2026-05-28 (lossless SOF3 grayscale encode + decode)._
 > **large effort** (its own mini-project) or **marginal/niche/risky**. Pick
 > deliberately — or proceed to release.
 
+### Completed large efforts
+- [x] **Lossless JPEG (SOF3)** — true lossless (predictive, no DCT/quant), the medical-archival item
+  - grayscale + RGB color (stored direct, Adobe APP14 transform=0), 8/12-bit, predictors 1–7
+  - bit-exact, cross-validated vs libjpeg-turbo both directions (we read theirs; djpeg reads ours)
+
 ### Large efforts (high value, but multi-stage)
-- **Lossless JPEG (SOF3)** · true lossless for medical archival (often a hard requirement) — a separate predictive coding mode (no DCT/quant)
-  - [x] grayscale **decode** (predictors 1–7) — bit-exact vs libjpeg-turbo lossless fixtures
-  - [x] grayscale **encode** (predictors 1–7, 8/12-bit) — round-trip bit-exact + djpeg decodes ours bit-exact
-  - [ ] color (RGB/YCbCr, no subsampling) decode + encode
 - [ ] **jpegli-style quantizer** · quality / jpegli-parity · large — jpegli computes tables from a perceptual model per distance (not a matrix swap); butteraugli-gated, uncertain payoff without XYB
 
 ### Marginal / niche (safe, bounded, lower value)

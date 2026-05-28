@@ -91,6 +91,20 @@ struct MarkerWriter {
         data.append(0)
     }
 
+    /// Writes an Adobe APP14 marker. `transform` 0 = no color transform (the
+    /// three components are stored directly, e.g. RGB) — used for lossless RGB so
+    /// decoders don't assume YCbCr (as they would from a JFIF 3-component frame).
+    mutating func writeAPP14(transform: UInt8) {
+        data.append(JPEGMarker.prefix)
+        data.append(0xEE)                                   // APP14
+        writeUInt16(14)
+        data.append(contentsOf: [0x41, 0x64, 0x6F, 0x62, 0x65])  // "Adobe"
+        writeUInt16(100)                                    // version
+        writeUInt16(0)                                      // flags0
+        writeUInt16(0)                                      // flags1
+        data.append(transform)
+    }
+
     /// Writes DQT (Define Quantization Table) marker for one or more tables.
     ///
     /// - Parameters:

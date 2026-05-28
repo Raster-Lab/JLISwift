@@ -475,38 +475,44 @@ public struct JLIEncoder: Sendable {
 
     /// Encodes a lossless (SOF3) JPEG by spatial prediction (ITU-T T.81 Annex H):
     /// each sample's difference from a neighbour-based predictor (selector 1–7) is
-    /// Huffman-coded with the DC mechanism. Bit-for-bit lossless. Grayscale only.
+    /// Huffman-coded with the DC mechanism. Bit-for-bit lossless. Grayscale (1) or
+    /// RGB (3, stored directly — no color transform, component ids 'R'/'G'/'B' so
+    /// decoders treat it as RGB, matching libjpeg-turbo's lossless).
     private func encodeLossless(
         _ image: JLIImage, configuration: JLIEncoderConfiguration,
         precision: Int, isGrayscale: Bool
     ) throws -> [UInt8] {
-        guard isGrayscale else {
-            throw JLIError.unsupportedColorSpaceConversion(
-                from: "\(image.colorModel)", to: "lossless JPEG (grayscale only)")
-        }
         let predictor = configuration.losslessPredictor
         guard (1...7).contains(predictor) else {
             throw JLIError.unsupportedJPEGFeature("lossless predictor \(predictor) (1–7)")
         }
+        if !isGrayscale {
+            guard image.colorModel == .rgb || image.colorModel == .rgba else {
+                throw JLIError.unsupportedColorSpaceConversion(
+                    from: "\(image.colorModel)", to: "lossless JPEG (use RGB/RGBA for color)")
+            }
+        }
         let w = image.width, h = image.height
+        let nc = isGrayscale ? 1 : 3
+        let srcCC = image.colorModel.componentCount     // 1 / 3 / 4 (alpha ignored)
+        let bps = precision == 8 ? 1 : 2
 
-        // Read samples (8-bit direct, 12-bit little-endian uint16).
-        var samples = [Int32](repeating: 0, count: w * h)
-        if precision == 8 {
-            for i in 0..<(w * h) { samples[i] = Int32(image.data[i]) }
-        } else {
-            for i in 0..<(w * h) {
-                samples[i] = Int32(UInt16(image.data[i * 2]) | (UInt16(image.data[i * 2 + 1]) << 8))
+        // De-interleave source into per-component planes (Int32 samples).
+        var planes = [[Int32]](repeating: [Int32](repeating: 0, count: w * h), count: nc)
+        for i in 0..<(w * h) {
+            for c in 0..<nc {
+                let s = (i * srcCC + c) * bps
+                planes[c][i] = bps == 1 ? Int32(image.data[s])
+                    : Int32(UInt16(image.data[s]) | (UInt16(image.data[s + 1]) << 8))
             }
         }
 
         let half = Int32(1 << (precision - 1))
-        func predict(_ x: Int, _ y: Int) -> Int32 {
-            if x == 0 { return y == 0 ? half : samples[(y - 1) * w] }          // Rb / initial
-            if y == 0 { return samples[y * w + x - 1] }                        // Ra
-            let ra = samples[y * w + x - 1]
-            let rb = samples[(y - 1) * w + x]
-            let rc = samples[(y - 1) * w + x - 1]
+        func predict(_ p: [Int32], _ x: Int, _ y: Int) -> Int32 {
+            let row = y * w
+            if x == 0 { return y == 0 ? half : p[row - w] }                   // Rb / initial
+            if y == 0 { return p[row + x - 1] }                               // Ra
+            let ra = p[row + x - 1], rb = p[row - w + x], rc = p[row - w + x - 1]
             switch predictor {
             case 1: return ra
             case 2: return rb
@@ -517,45 +523,51 @@ public struct JLIEncoder: Sendable {
             default: return (ra + rb) >> 1                                     // 7
             }
         }
-        // Difference modulo 2^16, mapped to signed 16-bit (T.81). Category 16 is
-        // the special case for −32768 (no additional bits).
-        func diffOf(_ x: Int, _ y: Int) -> Int32 {
-            var d = (samples[y * w + x] - predict(x, y)) & 0xFFFF
+        // Difference modulo 2^16, mapped to signed 16-bit (T.81); −32768 ⇒ cat 16.
+        func diffOf(_ p: [Int32], _ x: Int, _ y: Int) -> Int32 {
+            var d = (p[y * w + x] - predict(p, x, y)) & 0xFFFF
             if d >= 32768 { d -= 65536 }
             return d
         }
 
-        // Counting pass → optimal DC Huffman table over difference categories.
+        // Counting pass → one optimal DC table shared across components.
         var dcFreq = [Int](repeating: 0, count: 256)
         for y in 0..<h {
             for x in 0..<w {
-                let d = diffOf(x, y)
-                dcFreq[d == -32768 ? 16 : HuffmanEncoder.category(for: d)] += 1
+                for c in 0..<nc {
+                    let d = diffOf(planes[c], x, y)
+                    dcFreq[d == -32768 ? 16 : HuffmanEncoder.category(for: d)] += 1
+                }
             }
         }
         let table = HuffmanTableBuilder.build(
             frequencies: dcFreq, fallback: StandardHuffmanTables.dcLuminance)
 
-        // Emit pass.
+        // Emit pass. Grayscale id 1 + JFIF; RGB ids 'R','G','B' + Adobe APP14
+        // transform=0 so decoders read it as direct RGB (not JFIF-implied YCbCr).
         var mw = MarkerWriter()
         mw.writeSOI()
-        mw.writeAPP0()
+        if isGrayscale { mw.writeAPP0() } else { mw.writeAPP14(transform: 0) }
+        let comps: [(id: UInt8, hSampling: Int, vSampling: Int, quantTableId: Int)] =
+            isGrayscale ? [(1, 1, 1, 0)] : [(0x52, 1, 1, 0), (0x47, 1, 1, 0), (0x42, 1, 1, 0)]
         mw.writeSOF(progressive: false, precision: precision, width: w, height: h,
-                    components: [(1, 1, 1, 0)], lossless: true)
+                    components: comps, lossless: true)
         mw.writeDHT(tables: [(0, 0, table.bits, table.values)])
-        mw.writeSOS(components: [(selector: 1, dcTableId: 0, acTableId: 0)],
+        mw.writeSOS(components: comps.map { (selector: $0.id, dcTableId: 0, acTableId: 0) },
                     spectralStart: predictor, spectralEnd: 0,
                     successiveApproxHigh: 0, successiveApproxLow: 0)
 
-        var bw = BitWriter(estimatedMaxSize: w * h * 2 + 1024)
+        var bw = BitWriter(estimatedMaxSize: w * h * nc * 2 + 1024)
         for y in 0..<h {
             for x in 0..<w {
-                let d = diffOf(x, y)
-                let cat = d == -32768 ? 16 : HuffmanEncoder.category(for: d)
-                let e = table.encodingTable[cat]
-                bw.writeBits(UInt32(e.code), count: Int(e.length))
-                if cat > 0 && cat < 16 {
-                    bw.writeBits(HuffmanEncoder.additionalBits(for: d, category: cat), count: cat)
+                for c in 0..<nc {
+                    let d = diffOf(planes[c], x, y)
+                    let cat = d == -32768 ? 16 : HuffmanEncoder.category(for: d)
+                    let e = table.encodingTable[cat]
+                    bw.writeBits(UInt32(e.code), count: Int(e.length))
+                    if cat > 0 && cat < 16 {
+                        bw.writeBits(HuffmanEncoder.additionalBits(for: d, category: cat), count: cat)
+                    }
                 }
             }
         }
