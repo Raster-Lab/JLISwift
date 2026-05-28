@@ -17,3 +17,7 @@ DerivedData/
 *.o
 *.dylib
 *.a
+
+# Local-only datasets — patient/clinical data, never push.
+# JLIBench loads these via `--dicom-root Sources/LocalDatasets/...`.
+Sources/LocalDatasets/
