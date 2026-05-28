@@ -115,6 +115,18 @@ public struct JLIEncoderConfiguration: Sendable {
     /// are quantized more aggressively. This is a core jpegli improvement.
     public var adaptiveQuantization: Bool
 
+    /// Derive the quantization tables from jpegli's perceptual model instead of
+    /// scaling the ITU-T Annex K tables by an IJG quality factor.
+    ///
+    /// jpegli builds each quantization step from perceptually-tuned base matrices
+    /// and a per-coefficient non-linear function of the ``distance`` (see
+    /// ``Quantization/perceptualQuantTable(distance:chroma:isYUV420:)``). When no
+    /// explicit distance is set, ``quality`` is mapped to a distance first.
+    /// Applies to the YCbCr DCT path (baseline/progressive, 8-bit); ignored for
+    /// lossless and 12-bit. Defaults to `false` (the Annex K path) — opt in for
+    /// jpegli-style perceptual rate allocation.
+    public var perceptualQuantTables: Bool
+
     /// A sensible default configuration: quality 90, YCbCr, 4:2:0 subsampling,
     /// baseline (non-progressive) with optimized Huffman + adaptive quantization.
     /// Progressive is opt-in — it's a multi-pass encode and most callers want the
@@ -132,7 +144,8 @@ public struct JLIEncoderConfiguration: Sendable {
         losslessPrecision: 0,
         losslessPointTransform: 0,
         optimiseHuffman: true,
-        adaptiveQuantization: true
+        adaptiveQuantization: true,
+        perceptualQuantTables: false
     )
 
     /// Creates an encoder configuration.
@@ -158,7 +171,8 @@ public struct JLIEncoderConfiguration: Sendable {
         losslessPrecision: Int = 0,
         losslessPointTransform: Int = 0,
         optimiseHuffman: Bool = true,
-        adaptiveQuantization: Bool = true
+        adaptiveQuantization: Bool = true,
+        perceptualQuantTables: Bool = false
     ) {
         self.quality = quality
         self.distance = distance
@@ -173,6 +187,7 @@ public struct JLIEncoderConfiguration: Sendable {
         self.losslessPointTransform = losslessPointTransform
         self.optimiseHuffman = optimiseHuffman
         self.adaptiveQuantization = adaptiveQuantization
+        self.perceptualQuantTables = perceptualQuantTables
     }
 }
 

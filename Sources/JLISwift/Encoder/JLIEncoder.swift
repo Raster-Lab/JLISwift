@@ -216,12 +216,21 @@ public struct JLIEncoder: Sendable {
         }
 
         // Step 3: Quantization tables (and reciprocals for vectorized quantization).
-        let lumQT = Quantization.scaleTable(
-            Quantization.standardLuminanceTable, quality: quality
-        )
-        let chromQT = Quantization.scaleTable(
-            Quantization.standardChrominanceTable, quality: quality
-        )
+        // jpegli's perceptual model derives tables straight from the Butteraugli
+        // distance (8-bit YCbCr only); otherwise scale the Annex K tables by the
+        // IJG quality. 12-bit stays on the Annex K path (exact medical precision).
+        let lumQT: [Int]
+        let chromQT: [Int]
+        if configuration.perceptualQuantTables && precision == 8 {
+            let distance = configuration.distance
+                ?? Quantization.distanceForQuality(configuration.quality)
+            let is420 = !isGrayscale && configuration.chromaSubsampling == .yuv420
+            lumQT = Quantization.perceptualQuantTable(distance: distance, chroma: false, isYUV420: is420)
+            chromQT = Quantization.perceptualQuantTable(distance: distance, chroma: true, isYUV420: is420)
+        } else {
+            lumQT = Quantization.scaleTable(Quantization.standardLuminanceTable, quality: quality)
+            chromQT = Quantization.scaleTable(Quantization.standardChrominanceTable, quality: quality)
+        }
         let lumInv = lumQT.map { 1.0 / Float($0) }
         let chromInv = chromQT.map { 1.0 / Float($0) }
 

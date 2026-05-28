@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decode; multi-threaded trellis encode)._
+_Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decode; multi-threaded trellis; jpegli perceptual quantizer)._
 
 ## Completed
 
@@ -38,7 +38,7 @@ _Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decod
   - bit-exact (and bounded-exact for near-lossless), cross-validated vs libjpeg-turbo both directions (we read theirs; djpeg reads ours)
 
 ### Large efforts (high value, but multi-stage)
-- [ ] **jpegli-style quantizer** · quality / jpegli-parity · large — jpegli computes tables from a perceptual model per distance (not a matrix swap); butteraugli-gated, uncertain payoff without XYB
+- [x] **jpegli-style quantizer** · `perceptualQuantTables` (opt-in, 8-bit YCbCr) — faithful port of libjxl jpegli's perceptual model: per-coefficient base matrices + non-linear distance scaling (`DistanceToScale`), not a matrix swap. **Validated** (butteraugli, out-of-band): distance calibration tracks target (d=1.0→ba≈1.19, d=1.9→ba≈1.86); better quality-per-byte at high-quality 4:4:4, mixed at low quality / 4:2:0 — the "uncertain payoff without XYB" prediction, now quantified. Default stays Annex-K; 12-bit/lossless unaffected.
 
 ### Marginal / niche (safe, bounded, lower value)
 - [x] **1/2 & 1/4 scaled decode** · `config.scale = 2/4` — each output sample is the *exact* mean of its scale×scale box, formed straight from the dequantized coefficients via a separable `A·F·Aᵀ` contraction (no full IDCT, so faster). Validated == box-average of the full decode (gray/color, 8/12-bit) and within ≤6 of `djpeg -scale` (embedded CI-safe fixtures)
