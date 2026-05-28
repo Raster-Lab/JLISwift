@@ -16,10 +16,14 @@ struct BitWriter {
     private var buffer: [UInt8]
     /// Number of bytes actually written to `buffer`.
     private var byteCount: Int = 0
-    /// Current byte being assembled.
-    private var currentByte: UInt32 = 0
-    /// Number of bits currently in `currentByte` (0–8).
-    private var bitCount: Int = 0
+    /// Bit accumulator: the low `nbits` bits hold pending output, MSB-first.
+    /// A 64-bit register lets us coalesce byte emission instead of flushing one
+    /// byte (through a closure) per 8 bits — the Huffman/bit-writing path is the
+    /// hottest cost in a noisy encode, so batching here is the main lever.
+    /// Kept below 8 after every `writeBits`, so it never overflows for the
+    /// ≤16-bit writes JPEG entropy coding issues.
+    private var acc: UInt64 = 0
+    private var nbits: Int = 0
 
     /// 64 KB is enough for a typical 256×256 photo; the encoder passes a tighter
     /// upper bound derived from the image dimensions.
@@ -34,22 +38,23 @@ struct BitWriter {
 
     /// Writes `count` bits from `value` (MSB-first).
     mutating func writeBits(_ value: UInt32, count: Int) {
-        var remaining = count
-        var val = value
-
-        while remaining > 0 {
-            let space = 8 - bitCount
-            let bitsToWrite = min(space, remaining)
-            let shift = remaining - bitsToWrite
-            let bits = (val >> shift) & ((1 << bitsToWrite) - 1)
-            currentByte = (currentByte << bitsToWrite) | bits
-            bitCount += bitsToWrite
-            remaining -= bitsToWrite
-            val = val & ((1 << shift) - 1)
-
-            if bitCount == 8 {
-                flushByte()
+        guard count > 0 else { return }
+        acc = (acc << UInt64(count)) | UInt64(value & ((1 << count) - 1))
+        nbits += count
+        if nbits < 8 { return }   // no whole byte pending — skip the buffer access
+        // Each pending whole byte can expand to two with stuffing; +2 slack for
+        // the in-loop stuffing byte.
+        if byteCount + (nbits >> 3) * 2 + 2 > buffer.count { grow() }
+        buffer.withUnsafeMutableBufferPointer { buf in
+            let p = buf.baseAddress!
+            var bc = byteCount
+            while nbits >= 8 {
+                nbits -= 8
+                let byte = UInt8((acc >> UInt64(nbits)) & 0xFF)
+                p[bc] = byte; bc += 1
+                if byte == 0xFF { p[bc] = 0; bc += 1 }   // byte stuffing
             }
+            byteCount = bc
         }
     }
 
@@ -60,30 +65,18 @@ struct BitWriter {
 
     /// Flushes any remaining bits, padding with 1-bits as per JPEG spec.
     mutating func flush() {
-        if bitCount > 0 {
-            let padBits = 8 - bitCount
-            currentByte = (currentByte << padBits) | ((1 << padBits) - 1)
-            bitCount = 8
-            flushByte()
-        }
-    }
-
-    /// Emits the current byte, applying byte stuffing if needed.
-    @inline(__always)
-    private mutating func flushByte() {
-        // Worst case writes 2 bytes (data + stuffing byte).
+        guard nbits > 0 else { return }   // nbits is always 0–7 here
+        let pad = 8 - nbits
+        let byte = UInt8(((acc << UInt64(pad)) | UInt64((1 << pad) - 1)) & 0xFF)
         if byteCount + 2 > buffer.count { grow() }
-        let byte = UInt8(currentByte & 0xFF)
         buffer.withUnsafeMutableBufferPointer { buf in
             let p = buf.baseAddress!
             p[byteCount] = byte
-            if byte == 0xFF {
-                p[byteCount + 1] = 0
-            }
+            if byte == 0xFF { p[byteCount + 1] = 0 }
         }
         byteCount += (byte == 0xFF) ? 2 : 1
-        currentByte = 0
-        bitCount = 0
+        acc = 0
+        nbits = 0
     }
 
     /// Doubles the backing buffer when the initial estimate was too small.
