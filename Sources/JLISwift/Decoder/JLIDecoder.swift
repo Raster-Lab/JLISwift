@@ -69,7 +69,8 @@ public struct JLIDecoder: Sendable {
 
         // Lossless (SOF3) is predictive, not DCT — fully separate path.
         if frame.isLossless {
-            return try decodeLossless(frame: frame, scans: parsed.scans, configuration: configuration)
+            return try decodeLossless(frame: frame, scans: parsed.scans, configuration: configuration,
+                                      iccProfile: parsed.iccProfile, exif: parsed.exif)
         }
 
         // Step 2: Prepare quantization tables (convert from zigzag to natural order)
@@ -461,7 +462,9 @@ public struct JLIDecoder: Sendable {
             height: outH,
             pixelFormat: outputPixelFormat,
             colorModel: outputColorModel,
-            data: outputData
+            data: outputData,
+            iccProfile: parsed.iccProfile,
+            exif: parsed.exif
         )
     }
 
@@ -473,7 +476,8 @@ public struct JLIDecoder: Sendable {
     /// SSSS=16 ⇒ −32768 special case) is added back. Grayscale (1) or RGB (3,
     /// stored directly — no color transform, like libjpeg-turbo's lossless).
     private func decodeLossless(
-        frame: JPEGFrameInfo, scans: [JPEGScanData], configuration: JLIDecoderConfiguration
+        frame: JPEGFrameInfo, scans: [JPEGScanData], configuration: JLIDecoderConfiguration,
+        iccProfile: [UInt8]? = nil, exif: [UInt8]? = nil
     ) throws -> JLIImage {
         let precision = frame.precision
         guard (2...16).contains(precision) else {
@@ -551,7 +555,8 @@ public struct JLIDecoder: Sendable {
             for i in 0..<count { for c in 0..<nc { bytes[i * nc + c] = UInt8(clamping: Int(planes[c][i]) << pt) } }
             return try JLIImage(width: w, height: h,
                                 pixelFormat: configuration.outputPixelFormat ?? .uint8,
-                                colorModel: model, data: bytes)
+                                colorModel: model, data: bytes,
+                                iccProfile: iccProfile, exif: exif)
         }
         var bytes = [UInt8](repeating: 0, count: count * nc * 2)
         for i in 0..<count {
@@ -563,7 +568,8 @@ public struct JLIDecoder: Sendable {
         }
         return try JLIImage(width: w, height: h,
                             pixelFormat: configuration.outputPixelFormat ?? .uint16,
-                            colorModel: model, data: bytes)
+                            colorModel: model, data: bytes,
+                            iccProfile: iccProfile, exif: exif)
     }
 
     // MARK: - Private Helpers

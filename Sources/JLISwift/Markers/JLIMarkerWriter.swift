@@ -105,6 +105,43 @@ struct MarkerWriter {
         data.append(transform)
     }
 
+    /// Writes an APP1 Exif segment: `"Exif\0\0"` identifier followed by the raw
+    /// Exif (TIFF) payload. Skipped if the payload is too large for one segment
+    /// (Exif isn't chunked); the 16-bit length caps the body at 65533 bytes.
+    mutating func writeAPP1Exif(_ exif: [UInt8]) {
+        let id: [UInt8] = [0x45, 0x78, 0x69, 0x66, 0x00, 0x00]   // "Exif\0\0"
+        guard id.count + exif.count <= 65533 else { return }
+        data.append(JPEGMarker.prefix)
+        data.append(JPEGMarker.app1)
+        writeUInt16(UInt16(2 + id.count + exif.count))
+        data.append(contentsOf: id)
+        data.append(contentsOf: exif)
+    }
+
+    /// Writes the ICC color profile across one or more APP2 segments per the
+    /// "ICC profiles in JPEG" convention: each segment carries the 12-byte
+    /// `"ICC_PROFILE\0"` identifier, a 1-based sequence number, the total chunk
+    /// count, then up to 65519 profile bytes. A profile needing more than 255
+    /// chunks (~16 MB) is skipped (unrepresentable in the 1-byte count).
+    mutating func writeAPP2ICC(_ profile: [UInt8]) {
+        let id: [UInt8] = [0x49, 0x43, 0x43, 0x5F, 0x50, 0x52,
+                           0x4F, 0x46, 0x49, 0x4C, 0x45, 0x00]   // "ICC_PROFILE\0"
+        let maxChunk = 65519
+        let count = (profile.count + maxChunk - 1) / maxChunk
+        guard count >= 1, count <= 255 else { return }
+        for i in 0..<count {
+            let start = i * maxChunk
+            let end = min(start + maxChunk, profile.count)
+            data.append(JPEGMarker.prefix)
+            data.append(JPEGMarker.app2)
+            writeUInt16(UInt16(2 + id.count + 2 + (end - start)))
+            data.append(contentsOf: id)
+            data.append(UInt8(i + 1))       // sequence number (1-based)
+            data.append(UInt8(count))       // total chunk count
+            data.append(contentsOf: profile[start..<end])
+        }
+    }
+
     /// Writes DQT (Define Quantization Table) marker for one or more tables.
     ///
     /// - Parameters:

@@ -59,6 +59,10 @@ struct ParsedJPEG: Sendable {
     /// stream. Apple ImageIO and many other encoders emit DRI + RST0–RST7 for
     /// error resilience even on baseline JPEGs.
     let restartInterval: Int
+    /// ICC color profile reassembled from APP2 `ICC_PROFILE` segments, or nil.
+    let iccProfile: [UInt8]?
+    /// Exif payload (APP1 body after the `Exif\0\0` identifier), or nil.
+    let exif: [UInt8]?
 }
 
 // MARK: - Marker Reader
@@ -132,6 +136,8 @@ struct MarkerReader {
         var huffAC = [Int: HuffmanTable]()
         var scans: [JPEGScanData] = []
         var restartInterval: Int = 0
+        var exifData: [UInt8]? = nil
+        var iccChunks: [Int: [UInt8]] = [:]   // sequence number → chunk payload
 
         while offset < data.count - 1 {
             guard let marker = try nextMarker() else { break }
@@ -176,6 +182,25 @@ struct MarkerReader {
             case JPEGMarker.eoi:
                 break
 
+            case JPEGMarker.app1:
+                // Exif: "Exif\0\0" identifier then the TIFF payload we preserve.
+                let seg = try readSegmentBytes()
+                let exifID: [UInt8] = [0x45, 0x78, 0x69, 0x66, 0x00, 0x00]
+                if exifData == nil, seg.count >= 6, Array(seg[0..<6]) == exifID {
+                    exifData = Array(seg[6...])
+                }
+
+            case JPEGMarker.app2:
+                // ICC: "ICC_PROFILE\0" (12) + seq (1-based) + count, then a chunk
+                // of the profile. Accumulate by sequence number; reassemble below.
+                let seg = try readSegmentBytes()
+                let iccID: [UInt8] = [0x49, 0x43, 0x43, 0x5F, 0x50, 0x52,
+                                      0x4F, 0x46, 0x49, 0x4C, 0x45, 0x00]
+                if seg.count >= 14, Array(seg[0..<12]) == iccID {
+                    let seq = Int(seg[12])
+                    if iccChunks[seq] == nil { iccChunks[seq] = Array(seg[14...]) }
+                }
+
             case 0xD0...0xD7:
                 // RST0–RST7 — restart markers have no length field and should
                 // normally be consumed by `readEntropyData`. A bare one at the
@@ -185,6 +210,17 @@ struct MarkerReader {
 
             default:
                 try skipSegment()
+            }
+        }
+
+        // Reassemble the ICC profile from its chunks in sequence order. Only
+        // accept a contiguous 1..n run so a malformed/partial set yields nil
+        // rather than a silently-corrupt profile.
+        var iccProfile: [UInt8]? = nil
+        if !iccChunks.isEmpty {
+            let seqs = iccChunks.keys.sorted()
+            if seqs == Array(1...seqs.count) {
+                iccProfile = seqs.reduce(into: [UInt8]()) { $0 += iccChunks[$1]! }
             }
         }
 
@@ -198,7 +234,9 @@ struct MarkerReader {
             huffmanDCTables: huffDC,
             huffmanACTables: huffAC,
             scans: scans,
-            restartInterval: restartInterval
+            restartInterval: restartInterval,
+            iccProfile: iccProfile,
+            exif: exifData
         )
     }
 
@@ -240,6 +278,20 @@ struct MarkerReader {
             throw JLIError.decodingFailed("Invalid segment length")
         }
         offset += skip
+    }
+
+    /// Reads the segment length and returns the segment's payload bytes (the
+    /// `length − 2` bytes after the length field), advancing past them. Used to
+    /// capture APP1/APP2 metadata segments.
+    private mutating func readSegmentBytes() throws -> [UInt8] {
+        let length = try readUInt16()
+        let n = Int(length) - 2
+        guard n >= 0, offset + n <= data.count else {
+            throw JLIError.decodingFailed("Invalid segment length")
+        }
+        let bytes = Array(data[offset..<offset + n])
+        offset += n
+        return bytes
     }
 
     /// Reads a SOF (Start of Frame) marker.

@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decode; multi-threaded trellis; jpegli perceptual quantizer)._
+_Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decode; multi-threaded trellis; jpegli perceptual quantizer; ICC/Exif metadata)._
 
 ## Completed
 
@@ -43,7 +43,7 @@ _Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decod
 ### Marginal / niche (safe, bounded, lower value)
 - [x] **1/2 & 1/4 scaled decode** · `config.scale = 2/4` — each output sample is the *exact* mean of its scale×scale box, formed straight from the dequantized coefficients via a separable `A·F·Aᵀ` contraction (no full IDCT, so faster). Validated == box-average of the full decode (gray/color, 8/12-bit) and within ≤6 of `djpeg -scale` (embedded CI-safe fixtures)
 - [x] 16-bit **input** (via lossless `losslessPrecision`) · float32 input still TODO (DCT modes stay 8/12-bit)
-- [ ] EXIF / ICC **metadata passthrough** · preserve APP1/APP2 across decode→encode · API addition; niche for medical (DICOM holds metadata)
+- [x] EXIF / ICC **metadata** · `JLIImage.iccProfile` / `.exif` — decode extracts (APP2 `ICC_PROFILE` reassembled across segments, APP1 `Exif`), encode embeds (ICC chunked into ≤65519-byte APP2 segments) on baseline/progressive/lossless. Bit-exact round-trip; cross-validated both ways vs libjpeg-turbo (we read cjpeg's ICC; `djpeg -icc` extracts ours byte-exact, incl. a 140 KB multi-segment profile)
 - [ ] Progressive **+ restart markers** · completeness (restart is baseline-only) · moderate, niche
 - [x] **Multi-threaded encode** · trellis quantization (the largest parallelizable stage, ~22% of a big encode) is partitioned across cores via `concurrentPerform` over disjoint block ranges, each worker with private scratch — **byte-identical** to serial (verified by FNV checksum), ~15% faster on 8 cores for a 2048² plate. (Huffman-per-restart-interval emit not parallelized — separate, smaller win.)
 

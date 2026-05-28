@@ -81,6 +81,20 @@ public struct JLIImage: Sendable {
     /// The total size is `width * height * colorModel.componentCount * pixelFormat.bytesPerComponent`.
     public let data: [UInt8]
 
+    /// The embedded ICC color profile, if any.
+    ///
+    /// On decode this holds the profile reassembled from the JPEG's APP2
+    /// `ICC_PROFILE` segments (`nil` when none is present). On encode, set it (or
+    /// ``JLIEncoderConfiguration/iccProfile``) to embed a profile so color-managed
+    /// viewers interpret the pixels correctly.
+    public let iccProfile: [UInt8]?
+
+    /// The raw Exif payload (APP1 `Exif\0\0` segment body), if any.
+    ///
+    /// Preserved verbatim across decode→encode for metadata round-tripping. `nil`
+    /// when the JPEG carries no Exif segment.
+    public let exif: [UInt8]?
+
     /// The number of bytes per row (stride).
     public var bytesPerRow: Int {
         width * colorModel.componentCount * pixelFormat.bytesPerComponent
@@ -101,7 +115,9 @@ public struct JLIImage: Sendable {
         height: Int,
         pixelFormat: JLIPixelFormat,
         colorModel: JLIColorModel,
-        data: [UInt8]
+        data: [UInt8],
+        iccProfile: [UInt8]? = nil,
+        exif: [UInt8]? = nil
     ) throws {
         guard width > 0, height > 0 else {
             throw JLIError.invalidImageDimensions(width: width, height: height)
@@ -115,5 +131,7 @@ public struct JLIImage: Sendable {
         self.pixelFormat = pixelFormat
         self.colorModel = colorModel
         self.data = data
+        self.iccProfile = iccProfile
+        self.exif = exif
     }
 }

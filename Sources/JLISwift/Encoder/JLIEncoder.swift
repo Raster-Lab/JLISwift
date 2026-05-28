@@ -300,6 +300,8 @@ public struct JLIEncoder: Sendable {
         var mw = MarkerWriter()
         mw.writeSOI()
         mw.writeAPP0()
+        if let exif = image.exif { mw.writeAPP1Exif(exif) }
+        if let icc = image.iccProfile { mw.writeAPP2ICC(icc) }
         let lumZZ = zigzagQuantTable(lumQT)
         if isGrayscale {
             mw.writeDQT(tables: [(id: 0, values: lumZZ)])
@@ -584,6 +586,8 @@ public struct JLIEncoder: Sendable {
         var mw = MarkerWriter()
         mw.writeSOI()
         if isGrayscale { mw.writeAPP0() } else { mw.writeAPP14(transform: 0) }
+        if let exif = image.exif { mw.writeAPP1Exif(exif) }
+        if let icc = image.iccProfile { mw.writeAPP2ICC(icc) }
         let comps: [(id: UInt8, hSampling: Int, vSampling: Int, quantTableId: Int)] =
             isGrayscale ? [(1, 1, 1, 0)] : [(0x52, 1, 1, 0), (0x47, 1, 1, 0), (0x42, 1, 1, 0)]
         mw.writeSOF(progressive: false, precision: precision, width: w, height: h,
