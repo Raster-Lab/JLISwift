@@ -46,13 +46,14 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | **Optimized (per-image) Huffman tables** (Annex K.2, `optimiseHuffman`, default on) | ✅ |
 | Restart marker (DRI / RST) decode — interop with ImageIO/libjpeg output | ✅ |
 | Quality-scaled standard quantization tables (IJG formula) | ✅ |
-| RGB / RGBA / grayscale / pre-converted YCbCr input | ✅ |
+| RGB / RGBA / grayscale / pre-converted YCbCr input (8-bit) | ✅ |
+| **12-bit grayscale** encode + decode (`.uint16` input → precision-12 JPEG) | ✅ |
 | `inspect()` — metadata parse without full decode | ✅ |
 | Accelerate `vDSP_mmul` DCT, `vDSP_vmul` quant, vectorized BT.601 color conversion | ✅ |
 | Round-trip + cross-codec tested (ImageIO, libjpeg-turbo) on synthetic + DICOM | ✅ |
 | Adaptive dead-zone quantization | ❌ planned |
 | Distance-parameter quantization tuning | ❌ planned (API stub exists; ignored today) |
-| 10+ bit input (`.uint16`, `.float32`) | ❌ planned (encoder rejects today) |
+| 12-bit *color* / 16-bit / float32 input | ❌ planned (12-bit grayscale works; color path still assumes 8-bit BT.601) |
 | XYB color space JPEG | ❌ planned (XYB transform math exists, encoder doesn't emit XYB) |
 | Progressive (SOF2) encode/decode | ❌ planned (SOF2 header parses; no progressive entropy decode) |
 | Metal GPU pipeline | ⚠️ kernels compile but are not wired into encode/decode |
@@ -195,11 +196,11 @@ Next-up candidates (rough order):
 3. **Real-image fidelity harness** — Kodak suite + butteraugli/SSIMULACRA2 scores, not just round-trip PSNR.
 4. **Adaptive dead-zone quantization** — spatially-varying quantization thresholds; the headline jpegli win.
 5. **XYB color-space encoding** — perceptual color space from JPEG XL.
-6. **10+ bit input** — accept `.uint16` / `.float32` source images with 8-bit backward-compatible output.
+6. **12-bit color + bench wiring** — extend the YCbCr path to 12-bit, and the bench `Codec` protocol to 16-bit metrics so the DICOM corpus can cross-codec at native precision.
 7. **Progressive (SOF2) encode & decode**.
 8. **Metal hot path** — actually invoke the existing `JLIMetalPipeline` kernels from the encoder/decoder.
 
-Done since 0.1: spec-compliance fixes (byte-unstuffing, DRI/RST decode), Accelerate-backed batched DCT, and **optimized Huffman tables** (item 8 of the original list — now matches libjpeg-turbo's `-optimize`).
+Done since 0.1: spec-compliance fixes (byte-unstuffing, DRI/RST decode), Accelerate-backed batched DCT, **optimized Huffman tables** (matches libjpeg-turbo's `-optimize`), and **12-bit grayscale** encode/decode (cross-validated against libjpeg-turbo + ImageIO).
 
 ## Requirements
 

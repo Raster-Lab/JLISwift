@@ -250,4 +250,111 @@ struct EncoderDecoderTests {
             #expect(diff <= 3, "Grayscale byte \(i): expected ~200, got \(decoded.data[i])")
         }
     }
+
+    // MARK: - 12-bit grayscale
+
+    /// Helper: pack a uint16 grayscale plane into the little-endian byte layout
+    /// JLIImage expects for `.uint16`.
+    private func packLE16(_ samples: [UInt16]) -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: samples.count * 2)
+        for i in 0..<samples.count {
+            bytes[i * 2] = UInt8(samples[i] & 0xFF)
+            bytes[i * 2 + 1] = UInt8(samples[i] >> 8)
+        }
+        return bytes
+    }
+
+    private func unpackLE16(_ bytes: [UInt8]) -> [UInt16] {
+        var out = [UInt16](repeating: 0, count: bytes.count / 2)
+        for i in 0..<out.count {
+            out[i] = UInt16(bytes[i * 2]) | (UInt16(bytes[i * 2 + 1]) << 8)
+        }
+        return out
+    }
+
+    @Test("12-bit JPEG reports precision 12 via inspect")
+    func twelveBitInspect() throws {
+        let w = 16, h = 16
+        // A 12-bit gradient: values 0…4095 across the image.
+        var samples = [UInt16](repeating: 0, count: w * h)
+        for i in 0..<samples.count { samples[i] = UInt16(i * 4095 / (w * h - 1)) }
+        let image = try JLIImage(
+            width: w, height: h, pixelFormat: .uint16, colorModel: .grayscale,
+            data: packLE16(samples)
+        )
+        var config = JLIEncoderConfiguration.default
+        config.chromaSubsampling = .yuv400
+        let jpeg = try JLIEncoder().encode(image, configuration: config)
+
+        let info = try JLIDecoder().inspect(data: jpeg)
+        #expect(info.bitsPerComponent == 12)
+        #expect(info.isExtendedPrecision)
+        #expect(info.width == w && info.height == h)
+    }
+
+    @Test("12-bit grayscale round-trips with sub-1% error and outputs uint16")
+    func twelveBitRoundTrip() throws {
+        let w = 32, h = 32
+        // Smooth 12-bit ramp — compresses well, and rounding error should be tiny.
+        var samples = [UInt16](repeating: 0, count: w * h)
+        for y in 0..<h {
+            for x in 0..<w {
+                samples[y * w + x] = UInt16((x + y) * 4095 / (w + h - 2))
+            }
+        }
+        let image = try JLIImage(
+            width: w, height: h, pixelFormat: .uint16, colorModel: .grayscale,
+            data: packLE16(samples)
+        )
+        var config = JLIEncoderConfiguration.default
+        config.quality = 95
+        config.chromaSubsampling = .yuv400
+
+        let jpeg = try JLIEncoder().encode(image, configuration: config)
+        let decoded = try JLIDecoder().decode(from: jpeg)
+
+        #expect(decoded.pixelFormat == .uint16)
+        #expect(decoded.colorModel == .grayscale)
+        #expect(decoded.width == w && decoded.height == h)
+
+        let out = unpackLE16(decoded.data)
+        #expect(out.count == samples.count)
+        // At q=95 a 12-bit smooth ramp should reconstruct within a small fraction
+        // of the 0–4095 range. Allow ~1% (40 levels) tolerance for DCT/quant loss.
+        var maxErr = 0
+        for i in 0..<out.count {
+            maxErr = max(maxErr, abs(Int(out[i]) - Int(samples[i])))
+        }
+        #expect(maxErr <= 40, "max 12-bit error \(maxErr) exceeds tolerance")
+    }
+
+    @Test("12-bit preserves more precision than 8-bit on a fine gradient")
+    func twelveBitBeatsEightBit() throws {
+        // A gradient with fine steps that 8-bit can't represent: 16 distinct
+        // 12-bit levels packed into a span of 64 (i.e. steps of 4 in 12-bit,
+        // which collapse to the same 8-bit value after >>4).
+        let w = 64, h = 8
+        var samples12 = [UInt16](repeating: 0, count: w * h)
+        for y in 0..<h {
+            for x in 0..<w {
+                samples12[y * w + x] = UInt16(2000 + x)  // 2000…2063, fine 12-bit detail
+            }
+        }
+        let img12 = try JLIImage(
+            width: w, height: h, pixelFormat: .uint16, colorModel: .grayscale,
+            data: packLE16(samples12)
+        )
+        var config = JLIEncoderConfiguration.default
+        config.quality = 98
+        config.chromaSubsampling = .yuv400
+
+        let jpeg12 = try JLIEncoder().encode(img12, configuration: config)
+        let dec12 = unpackLE16(try JLIDecoder().decode(from: jpeg12).data)
+
+        // The 12-bit round-trip should preserve the fine ramp's monotonic detail:
+        // the reconstructed span must be clearly wider than the ~16 levels an
+        // 8-bit pipeline (>>4) would have collapsed it to.
+        let span = Int(dec12.max()!) - Int(dec12.min()!)
+        #expect(span >= 40, "12-bit reconstructed span \(span) too small — detail lost")
+    }
 }

@@ -36,28 +36,58 @@ public struct JLIEncoder: Sendable {
     ) throws -> [UInt8] {
         try validateConfiguration(configuration)
 
-        guard image.pixelFormat == .uint8 else {
-            throw JLIError.unsupportedColorSpaceConversion(
-                from: "\(image.pixelFormat)", to: "JPEG uint8 encoding"
-            )
-        }
-
         let width = image.width
         let height = image.height
         let quality = max(1, min(100, Int(configuration.quality)))
+
+        // Sample precision: 8-bit for uint8, 12-bit for uint16 (JPEG supports 8
+        // or 12). 12-bit is currently grayscale-only — the color path still
+        // assumes 0–255 BT.601 ranges. Level shift is 2^(P-1): 128 or 2048.
+        let precision: Int
+        switch image.pixelFormat {
+        case .uint8:
+            precision = 8
+        case .uint16:
+            precision = 12
+        case .float32:
+            throw JLIError.unsupportedColorSpaceConversion(
+                from: "\(image.pixelFormat)", to: "JPEG encoding"
+            )
+        }
+        let levelShift = Float(1 << (precision - 1))
 
         // Determine if encoding as grayscale
         let isGrayscale = image.colorModel == .grayscale
             || configuration.chromaSubsampling == .yuv400
 
-        // Step 1: Extract component planes (Float, 0–255 range)
+        if precision > 8 && !isGrayscale {
+            throw JLIError.unsupportedColorSpaceConversion(
+                from: "\(precision)-bit \(image.colorModel)", to: "12-bit JPEG (grayscale only)"
+            )
+        }
+
+        // 12-bit DC/AC coefficients exceed the categories the fixed Annex K
+        // Huffman tables define (0–11), so optimal per-image tables are required.
+        let optimiseHuffman = configuration.optimiseHuffman || precision > 8
+
+        // Reads a grayscale sample at pixel index `i`, honoring bit depth.
+        // uint16 data is little-endian 2 bytes/sample.
+        func graySample(_ data: [UInt8], _ i: Int) -> Float {
+            if precision == 8 { return Float(data[i]) }
+            return Float(UInt16(data[i * 2]) | (UInt16(data[i * 2 + 1]) << 8))
+        }
+
+        // Step 1: Extract component planes (Float, 0–maxSample range)
         let yPlane: [Float]
         var cbPlane: [Float]
         var crPlane: [Float]
 
         if isGrayscale {
             if image.colorModel == .grayscale {
-                yPlane = image.data.map { Float($0) }
+                let pixelCount = width * height
+                var y = [Float](repeating: 0, count: pixelCount)
+                for i in 0..<pixelCount { y[i] = graySample(image.data, i) }
+                yPlane = y
             } else {
                 let planes = ColorConversion.imageRGBToYCbCr(
                     data: image.data, width: width, height: height,
@@ -155,7 +185,7 @@ public struct JLIEncoder: Sendable {
         let yQuant = quantizePlane(
             yPlane, planeWidth: width, planeHeight: height,
             blocksH: yBlocksPerRow, blocksV: yBlocksPerCol,
-            invQuant: lumInv, scratch: &dctScratch
+            invQuant: lumInv, levelShift: levelShift, scratch: &dctScratch
         )
         let cbQuant: [Int32]
         let crQuant: [Int32]
@@ -165,12 +195,12 @@ public struct JLIEncoder: Sendable {
             cbQuant = quantizePlane(
                 cbPlane, planeWidth: cbWidth, planeHeight: cbHeight,
                 blocksH: mcuCountH, blocksV: mcuCountV,
-                invQuant: chromInv, scratch: &dctScratch
+                invQuant: chromInv, levelShift: levelShift, scratch: &dctScratch
             )
             crQuant = quantizePlane(
                 crPlane, planeWidth: crWidth, planeHeight: crHeight,
                 blocksH: mcuCountH, blocksV: mcuCountV,
-                invQuant: chromInv, scratch: &dctScratch
+                invQuant: chromInv, levelShift: levelShift, scratch: &dctScratch
             )
         }
 
@@ -183,7 +213,7 @@ public struct JLIEncoder: Sendable {
         let dcChrTable: HuffmanTable
         let acChrTable: HuffmanTable
 
-        if configuration.optimiseHuffman {
+        if optimiseHuffman {
             var dcLumFreq = [Int](repeating: 0, count: 256)
             var acLumFreq = [Int](repeating: 0, count: 256)
             var dcChrFreq = [Int](repeating: 0, count: 256)
@@ -283,9 +313,9 @@ public struct JLIEncoder: Sendable {
                                  (id: 1, values: zigzagQuantTable(chromQT))])
         }
 
-        // SOF0 (baseline)
+        // SOF0 (baseline) — precision 8 or 12.
         if isGrayscale {
-            mw.writeSOF(progressive: false, precision: 8, width: width, height: height,
+            mw.writeSOF(progressive: false, precision: precision, width: width, height: height,
                         components: [(id: 1, hSampling: 1, vSampling: 1, quantTableId: 0)])
         } else {
             mw.writeSOF(progressive: false, precision: 8, width: width, height: height,
@@ -348,13 +378,13 @@ public struct JLIEncoder: Sendable {
     private func quantizePlane(
         _ plane: [Float], planeWidth: Int, planeHeight: Int,
         blocksH: Int, blocksV: Int,
-        invQuant: [Float], scratch: inout [Float]
+        invQuant: [Float], levelShift: Float, scratch: inout [Float]
     ) -> [Int32] {
         let n = blocksH * blocksV
         var blockBuf = [Float](repeating: 0, count: n * 64)
         extractAllBlocksLevelShifted(
             plane, planeWidth: planeWidth, planeHeight: planeHeight,
-            blocksH: blocksH, blocksV: blocksV, into: &blockBuf
+            blocksH: blocksH, blocksV: blocksV, levelShift: levelShift, into: &blockBuf
         )
 
         var dctBuf = [Float](repeating: 0, count: n * 64)
@@ -370,11 +400,12 @@ public struct JLIEncoder: Sendable {
     }
 
     /// Extracts `blocksH × blocksV` 8×8 blocks from a plane into a per-block-contig
-    /// Float buffer with level shift (-128) folded in. Block `i` at offset `64*i`,
-    /// row-major within. Edge pixels are replicated past plane bounds.
+    /// Float buffer with the level shift (`-2^(P-1)`: 128 for 8-bit, 2048 for
+    /// 12-bit) folded in. Block `i` at offset `64*i`, row-major within. Edge
+    /// pixels are replicated past plane bounds.
     private func extractAllBlocksLevelShifted(
         _ plane: [Float], planeWidth: Int, planeHeight: Int,
-        blocksH: Int, blocksV: Int, into out: inout [Float]
+        blocksH: Int, blocksV: Int, levelShift: Float, into out: inout [Float]
     ) {
         plane.withUnsafeBufferPointer { srcBuf in
             out.withUnsafeMutableBufferPointer { dstBuf in
@@ -391,7 +422,7 @@ public struct JLIEncoder: Sendable {
                             let dstRow = blockBase + r * 8
                             for c in 0..<8 {
                                 let sx = min(startX + c, planeWidth - 1)
-                                dst[dstRow + c] = src[srcRow + sx] - 128.0
+                                dst[dstRow + c] = src[srcRow + sx] - levelShift
                             }
                         }
                     }

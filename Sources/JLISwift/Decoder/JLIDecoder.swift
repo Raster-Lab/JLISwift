@@ -200,9 +200,10 @@ public struct JLIDecoder: Sendable {
                 dctBuf, into: &pixelsBuf, scratch: &idctScratch, blockCount: blockCount
             )
 
-            // Level shift +128 + clamp [0,255] over the whole batched buffer.
-            var center: Float = 128.0
-            var lo: Float = 0.0, hi: Float = 255.0
+            // Level shift +2^(P-1) + clamp [0, 2^P-1] over the whole batched
+            // buffer. 128/255 for 8-bit, 2048/4095 for 12-bit.
+            var center = Float(1 << (frame.precision - 1))
+            var lo: Float = 0.0, hi = Float((1 << frame.precision) - 1)
             let n = vDSP_Length(blockCount * 64)
             vDSP_vsadd(pixelsBuf, 1, &center, &pixelsBuf, 1, n)
             vDSP_vclip(pixelsBuf, 1, &lo, &hi, &pixelsBuf, 1, n)
@@ -253,11 +254,24 @@ public struct JLIDecoder: Sendable {
         // Step 8: Chroma upsample and color convert
         let outputData: [UInt8]
         let outputColorModel: JLIColorModel
+        // 12-bit grayscale decodes to a uint16 buffer (little-endian samples);
+        // 8-bit stays uint8. Color is always 8-bit today.
+        let isExtendedPrecision = numComponents == 1 && frame.precision > 8
 
         if numComponents == 1 {
             // Grayscale
             let plane = componentPlanes[0]
-            outputData = plane.data.map { UInt8(clamping: Int($0.rounded())) }
+            if isExtendedPrecision {
+                var bytes = [UInt8](repeating: 0, count: plane.data.count * 2)
+                for i in 0..<plane.data.count {
+                    let v = UInt16(clamping: Int(plane.data[i].rounded()))
+                    bytes[i * 2] = UInt8(v & 0xFF)
+                    bytes[i * 2 + 1] = UInt8(v >> 8)
+                }
+                outputData = bytes
+            } else {
+                outputData = plane.data.map { UInt8(clamping: Int($0.rounded())) }
+            }
             outputColorModel = configuration.outputColorModel ?? .grayscale
         } else {
             // YCbCr → RGB
@@ -298,7 +312,8 @@ public struct JLIDecoder: Sendable {
             outputColorModel = configuration.outputColorModel ?? .rgb
         }
 
-        let outputPixelFormat = configuration.outputPixelFormat ?? .uint8
+        let outputPixelFormat = configuration.outputPixelFormat
+            ?? (isExtendedPrecision ? .uint16 : .uint8)
 
         return try JLIImage(
             width: frame.width,
