@@ -23,6 +23,13 @@ public struct JLIEncoder: Sendable {
     /// Creates a new encoder instance.
     public init() {}
 
+    /// Rate-distortion λ is `rdoLambdaK · meanACQuant²`. Tying λ to the
+    /// quantization step (R-D theory: λ ∝ Q²) keeps truncation gentle at high
+    /// quality (small Q, where surviving coefficients are perceptually real) and
+    /// firmer at low quality (large Q). Tuned on the DICOM corpus so bytes drop
+    /// without raising butteraugli at either end of the quality range.
+    static let rdoLambdaK = 0.004
+
     /// Encodes an image to JPEG data using the jpegli algorithm.
     ///
     /// - Parameters:
@@ -171,6 +178,26 @@ public struct JLIEncoder: Sendable {
         let lumInv = lumQT.map { 1.0 / Float($0) }
         let chromInv = chromQT.map { 1.0 / Float($0) }
 
+        // Rate-distortion (EOB) optimization, gated by `adaptiveQuantization`.
+        // 8-bit only: 12-bit is the medical-precision path where we deliberately
+        // keep exact round-to-nearest rather than trade detail for bytes.
+        // λ trades DCT-domain squared error (= pixel² by Parseval) against bits,
+        // scaled by the mean AC quant step² (see `rdoLambdaK`).
+        let useRDO = configuration.adaptiveQuantization && precision == 8
+        func meanACSq(_ table: [Int]) -> Double {
+            var sum = 0.0
+            for i in 1..<64 { sum += Double(table[i]) * Double(table[i]) }
+            return sum / 63.0
+        }
+        let lumRDO = useRDO
+            ? RDOContext(quantTable: lumQT, acTable: StandardHuffmanTables.acLuminance,
+                         lambda: JLIEncoder.rdoLambdaK * meanACSq(lumQT))
+            : nil
+        let chrRDO = useRDO
+            ? RDOContext(quantTable: chromQT, acTable: StandardHuffmanTables.acChrominance,
+                         lambda: JLIEncoder.rdoLambdaK * meanACSq(chromQT))
+            : nil
+
         // Step 4: MCU structure
         let hMax = isGrayscale ? 1 : hFactor
         let vMax = isGrayscale ? 1 : vFactor
@@ -194,7 +221,7 @@ public struct JLIEncoder: Sendable {
         let yQuant = quantizePlane(
             yPlane, planeWidth: width, planeHeight: height,
             blocksH: yBlocksPerRow, blocksV: yBlocksPerCol,
-            invQuant: lumInv, levelShift: levelShift, scratch: &dctScratch
+            invQuant: lumInv, levelShift: levelShift, scratch: &dctScratch, rdo: lumRDO
         )
         let cbQuant: [Int32]
         let crQuant: [Int32]
@@ -204,12 +231,12 @@ public struct JLIEncoder: Sendable {
             cbQuant = quantizePlane(
                 cbPlane, planeWidth: cbWidth, planeHeight: cbHeight,
                 blocksH: mcuCountH, blocksV: mcuCountV,
-                invQuant: chromInv, levelShift: levelShift, scratch: &dctScratch
+                invQuant: chromInv, levelShift: levelShift, scratch: &dctScratch, rdo: chrRDO
             )
             crQuant = quantizePlane(
                 crPlane, planeWidth: crWidth, planeHeight: crHeight,
                 blocksH: mcuCountH, blocksV: mcuCountV,
-                invQuant: chromInv, levelShift: levelShift, scratch: &dctScratch
+                invQuant: chromInv, levelShift: levelShift, scratch: &dctScratch, rdo: chrRDO
             )
         }
 
@@ -387,7 +414,8 @@ public struct JLIEncoder: Sendable {
     private func quantizePlane(
         _ plane: [Float], planeWidth: Int, planeHeight: Int,
         blocksH: Int, blocksV: Int,
-        invQuant: [Float], levelShift: Float, scratch: inout [Float]
+        invQuant: [Float], levelShift: Float, scratch: inout [Float],
+        rdo: RDOContext? = nil
     ) -> [Int32] {
         let n = blocksH * blocksV
         var blockBuf = [Float](repeating: 0, count: n * 64)
@@ -405,7 +433,100 @@ public struct JLIEncoder: Sendable {
         AccelerateDSP.quantizeBatch(
             dctBuf, invTable: invQuant, into: &quant, blockCount: n
         )
+        if let rdo = rdo {
+            applyEOBOptimization(dctBuf: dctBuf, quant: &quant, blockCount: n, rdo: rdo)
+        }
         return quant
+    }
+
+    /// Rate-distortion context for trellis-style quantization. `quantTable` is
+    /// the forward quant table (natural order); `acTable` provides the bit-length
+    /// rate model; `lambda` trades distortion (DCT coeff², = pixel² by Parseval)
+    /// against rate (bits).
+    struct RDOContext {
+        let quantTable: [Int]
+        let acTable: HuffmanTable
+        let lambda: Double
+    }
+
+    /// EOB-optimization pass: for each block, choose the end-of-block position
+    /// that minimizes D + λ·R, zeroing trailing AC coefficients whose coded bits
+    /// cost more than the distortion they save. Only *removes* trailing
+    /// coefficients (never grows magnitudes or touches kept coefficients), so it
+    /// strictly reduces rate with bounded, controlled distortion — and can't
+    /// introduce ZRL penalties. This is the bounded core of trellis quantization;
+    /// mozjpeg's full trellis also reconsiders per-coefficient magnitudes.
+    private func applyEOBOptimization(
+        dctBuf: [Float], quant: inout [Int32], blockCount: Int, rdo: RDOContext
+    ) {
+        let zz = Quantization.zigzagOrder
+        let lambda = rdo.lambda
+        var zzCoeff = [Int32](repeating: 0, count: 64)  // quant in zigzag order
+
+        for b in 0..<blockCount {
+            let base = b * 64
+            // Gather zigzag-ordered quantized AC coefficients and find last nonzero.
+            var lastNZ = 0
+            for z in 1..<64 {
+                let v = quant[base + zz[z]]
+                zzCoeff[z] = v
+                if v != 0 { lastNZ = z }
+            }
+            if lastNZ == 0 { continue }  // all-AC-zero: nothing to truncate
+
+            // Walk candidate EOBs from lastNZ down to 0, accumulating the
+            // distortion added by dropping each trailing nonzero.
+            var dropDist = 0.0
+            var bestCost = Double.infinity
+            var bestEOB = lastNZ
+            var e = lastNZ
+            while e >= 0 {
+                let rate = Double(acBitLength(zzCoeff, lastIndex: e, table: rdo.acTable))
+                let cost = dropDist + lambda * rate
+                if cost < bestCost { bestCost = cost; bestEOB = e }
+                if e >= 1 {
+                    let nat = zz[e]
+                    let q = quant[base + nat]
+                    if q != 0 {
+                        let recon = Double(q) * Double(rdo.quantTable[nat])
+                        let c = Double(dctBuf[base + nat])
+                        // ΔD from forcing this coefficient to zero.
+                        dropDist += c * c - (c - recon) * (c - recon)
+                    }
+                }
+                e -= 1
+            }
+            // Zero everything past the chosen EOB.
+            if bestEOB < lastNZ {
+                for z in (bestEOB + 1)...lastNZ { quant[base + zz[z]] = 0 }
+            }
+        }
+    }
+
+    /// Bits to Huffman-code AC coefficients `zz[1...lastIndex]` (zigzag order)
+    /// plus the EOB symbol, using `table`'s code lengths + magnitude bits.
+    /// Used as the rate model in EOB optimization.
+    private func acBitLength(_ zz: [Int32], lastIndex: Int, table: HuffmanTable) -> Int {
+        var bits = 0
+        var run = 0
+        var i = 1
+        while i <= lastIndex {
+            let v = zz[i]
+            if v == 0 {
+                run += 1
+            } else {
+                while run > 15 {
+                    bits += Int(table.encodingTable[0xF0].length)  // ZRL
+                    run -= 16
+                }
+                let size = HuffmanEncoder.category(for: v)
+                bits += Int(table.encodingTable[(run << 4) | size].length) + size
+                run = 0
+            }
+            i += 1
+        }
+        if lastIndex < 63 { bits += Int(table.encodingTable[0x00].length) }  // EOB
+        return bits
     }
 
     /// Extracts `blocksH × blocksV` 8×8 blocks from a plane into a per-block-contig

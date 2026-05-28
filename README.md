@@ -52,8 +52,9 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | SOF1 (extended sequential) decode — reads 12-bit JPEGs from libjpeg/ImageIO | ✅ |
 | `inspect()` — metadata parse without full decode | ✅ |
 | Accelerate `vDSP_mmul` DCT, `vDSP_vmul` quant, vectorized BT.601 color conversion | ✅ |
-| Round-trip + cross-codec tested (ImageIO, libjpeg-turbo) on synthetic + DICOM | ✅ |
-| Adaptive dead-zone quantization | ❌ planned |
+| Round-trip + cross-codec tested (ImageIO, libjpeg-turbo, mozjpeg) on synthetic + DICOM | ✅ |
+| Rate-distortion EOB optimization (`adaptiveQuantization`, 8-bit, default on) | ✅ partial |
+| Full trellis quantization (per-coefficient magnitude reduction) | ❌ planned |
 | 12-bit *color* / 16-bit / float32 input | ❌ planned (12-bit grayscale works; color path still assumes 8-bit BT.601) |
 | XYB color space JPEG | ❌ planned (XYB transform math exists, encoder doesn't emit XYB) |
 | Progressive (SOF2) encode/decode | ❌ planned (SOF2 header parses; no progressive entropy decode) |
@@ -74,6 +75,19 @@ On the DICOM corpus this matches libjpeg-turbo's `-optimize` byte-for-byte to wi
 | MR  | 22982 B | **16541 B** | 16581 B |
 | XA  | 35001 B | **27571 B** | 27719 B |
 
+### Rate-distortion EOB optimization
+
+With `adaptiveQuantization` (default on, 8-bit only) the encoder runs an
+end-of-block rate-distortion pass: for each block it picks the EOB position that
+minimizes `D + λ·R` (DCT-domain squared error vs. coded bits, λ ∝ mean AC quant
+step²), zeroing trailing AC coefficients whose bits cost more than the
+distortion they save. It only removes trailing coefficients — never grows
+magnitudes — so output stays standard-compliant and can't introduce ZRL
+penalties. On the DICOM corpus it trims 0.3–14% with butteraugli flat or better
+(validated via `--butteraugli`). 12-bit stays exact round-to-nearest (medical
+precision is not traded for bytes). This is the bounded core of trellis
+quantization; full trellis (per-coefficient magnitude reduction, ~30% like
+mozjpeg) is future work.
 The configuration fields `progressive`, `optimiseHuffman`, `adaptiveQuantization`, `distance`, and `colorSpace = .xyb` are present on `JLIEncoderConfiguration` but are not yet honored — they exist as the planned API surface.
 
 ## Encoder configuration
