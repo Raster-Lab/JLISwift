@@ -69,6 +69,30 @@ enum TestImages {
         for i in 0..<rgb.count { rgb[i] = next() }
         return TestImage(name: name, width: size, height: size, rgb: rgb)
     }
+
+    /// Synthetic 12-bit color images (0–4095 per channel). The DICOM corpus is
+    /// grayscale, so these are the only 12-bit color inputs for the cross-codec.
+    static func color12(size: Int) -> [Color16Image] {
+        var grad = [UInt16](repeating: 0, count: size * size * 3)
+        for y in 0..<size {
+            for x in 0..<size {
+                let i = (y * size + x) * 3
+                grad[i]     = UInt16(x * 4095 / max(1, size - 1))
+                grad[i + 1] = UInt16(y * 4095 / max(1, size - 1))
+                grad[i + 2] = UInt16(((x + y) % size) * 4095 / max(1, size - 1))
+            }
+        }
+        var state: UInt32 = 0x12345678
+        var noise = [UInt16](repeating: 0, count: size * size * 3)
+        for i in 0..<noise.count {
+            state = state &* 1664525 &+ 1013904223
+            noise[i] = UInt16(state >> 20) & 0x0FFF
+        }
+        return [
+            Color16Image(name: "color12-grad-\(size)", width: size, height: size, rgb: grad),
+            Color16Image(name: "color12-noise-\(size)", width: size, height: size, rgb: noise),
+        ]
+    }
 }
 
 /// Single bench result for one (codec, image, quality) triple.
@@ -320,6 +344,77 @@ extension Harness {
         let cmp = min(image.samples.count, decoded.gray.count)
         let psnr = Harness.psnr16(
             Array(image.samples.prefix(cmp)), Array(decoded.gray.prefix(cmp)), peak: gray16Peak
+        )
+        return CrossResult(
+            encoderName: encoder.name, decoderName: decoder.name,
+            image: image.name, quality: quality,
+            encodedBytes: jpeg.count, psnrDB: psnr, failure: nil
+        )
+    }
+}
+
+struct Color16Image {
+    let name: String
+    let width: Int
+    let height: Int
+    let rgb: [UInt16]   // interleaved, 0–4095
+}
+
+extension Harness {
+    /// Self round-trip for a 12-bit color codec: encode, decode, PSNR (peak 4095).
+    static func runColor16(codec: Color16Codec, image: Color16Image, quality: Int) throws -> Result {
+        let iters = codec.isExternal ? 1 : 5
+        var jpeg = [UInt8]()
+        let encMs = try timeMs(iterations: iters) {
+            jpeg = try codec.encodeColor16(
+                image.rgb, width: image.width, height: image.height, quality: quality
+            )
+        }
+        var decoded: (rgb: [UInt16], width: Int, height: Int) = ([], 0, 0)
+        let decMs = try timeMs(iterations: iters) {
+            decoded = try codec.decodeColor16(jpeg)
+        }
+        let cmp = min(image.rgb.count, decoded.rgb.count)
+        let psnr = Harness.psnr16(
+            Array(image.rgb.prefix(cmp)), Array(decoded.rgb.prefix(cmp)), peak: gray16Peak
+        )
+        let bpp = Double(jpeg.count * 8) / Double(image.width * image.height)
+        return Result(
+            codec: codec.name, image: image.name, quality: quality,
+            encodedBytes: jpeg.count, encodeMs: encMs, decodeMs: decMs,
+            psnrDB: psnr, bpp: bpp
+        )
+    }
+
+    /// Cross-codec: encode with one 12-bit color codec, decode with another.
+    static func runCrossColor16(
+        encoder: Color16Codec, decoder: Color16Codec, image: Color16Image, quality: Int
+    ) -> CrossResult {
+        let jpeg: [UInt8]
+        do {
+            jpeg = try encoder.encodeColor16(
+                image.rgb, width: image.width, height: image.height, quality: quality
+            )
+        } catch {
+            return CrossResult(
+                encoderName: encoder.name, decoderName: decoder.name,
+                image: image.name, quality: quality,
+                encodedBytes: 0, psnrDB: nil, failure: "encode: \(error)"
+            )
+        }
+        let decoded: (rgb: [UInt16], width: Int, height: Int)
+        do {
+            decoded = try decoder.decodeColor16(jpeg)
+        } catch {
+            return CrossResult(
+                encoderName: encoder.name, decoderName: decoder.name,
+                image: image.name, quality: quality,
+                encodedBytes: jpeg.count, psnrDB: nil, failure: "decode: \(error)"
+            )
+        }
+        let cmp = min(image.rgb.count, decoded.rgb.count)
+        let psnr = Harness.psnr16(
+            Array(image.rgb.prefix(cmp)), Array(decoded.rgb.prefix(cmp)), peak: gray16Peak
         )
         return CrossResult(
             encoderName: encoder.name, decoderName: decoder.name,

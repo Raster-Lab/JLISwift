@@ -305,6 +305,44 @@ if opts.dicom12 {
         print("--- 12-bit cross-codec ---")
         printCrossTable(cross12)
     }
+
+    // 12-bit color — synthetic only (no 12-bit color DICOM; clinical data is gray).
+    print("")
+    print("=== 12-bit color (synthetic, native precision) ===")
+    let lt12c = ReferenceCodecs.libjpegTurbo12Color()
+    let color16Codecs: [Color16Codec] = lt12c.enabled ? [jli444, lt12c] : [jli444]
+    print("active 12-bit color codecs: \(color16Codecs.map(\.name).joined(separator: ", "))")
+    if !lt12c.enabled {
+        print("(libjpeg-turbo-12 unavailable — install jpeg-turbo for 12-bit color cross-codec)")
+    }
+    print("")
+    var selfC12 = [Result]()
+    var crossC12 = [CrossResult]()
+    for img in TestImages.color12(size: 64) {
+        for q in opts.dicomQualities {
+            for codec in color16Codecs {
+                do {
+                    let r = try Harness.runColor16(codec: codec, image: img, quality: q)
+                    selfC12.append(r); recordSelf(r, kind: "self12c")
+                } catch {
+                    print("FAIL self12c \(codec.name) / \(img.name) / q=\(q): \(error)")
+                }
+            }
+            if lt12c.enabled {
+                let a = Harness.runCrossColor16(encoder: jli444, decoder: lt12c, image: img, quality: q)
+                crossC12.append(a); recordCross(a, kind: "cross12c")
+                let b = Harness.runCrossColor16(encoder: lt12c, decoder: jli444, image: img, quality: q)
+                crossC12.append(b); recordCross(b, kind: "cross12c")
+            }
+        }
+    }
+    print("--- 12-bit color self-codec (PSNR peak 4095) ---")
+    printTable(selfC12)
+    if !crossC12.isEmpty {
+        print("")
+        print("--- 12-bit color cross-codec ---")
+        printCrossTable(crossC12)
+    }
 }
 
 // MARK: - Regression

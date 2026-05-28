@@ -159,3 +159,74 @@ enum PGM16 {
         return (gray, width, height)
     }
 }
+
+/// 16-bit color PPM (P6) — the RGB counterpart of ``PGM16``. Per the netpbm
+/// spec, samples with maxval > 255 are stored as 2 bytes **big-endian**. Used to
+/// pipe 12-bit color through `cjpeg -precision 12` / `djpeg`, the cross-codec
+/// reference for JLISwift's 12-bit color output.
+enum PPM16 {
+
+    /// Encodes interleaved 16-bit RGB samples (`width*height*3`) into a P6 PPM
+    /// with `maxVal` (e.g. 4095 for 12-bit), big-endian sample bytes.
+    static func encode(rgb: [UInt16], width: Int, height: Int, maxVal: Int = 4095) -> [UInt8] {
+        precondition(rgb.count == width * height * 3, "rgb buffer size mismatch")
+        let header = "P6\n\(width) \(height)\n\(maxVal)\n"
+        var out = [UInt8](header.utf8)
+        out.reserveCapacity(out.count + rgb.count * 2)
+        for s in rgb {
+            out.append(UInt8(s >> 8))     // big-endian high byte
+            out.append(UInt8(s & 0xFF))
+        }
+        return out
+    }
+
+    /// Decodes a P6 PPM. Supports 8-bit (maxval ≤ 255, 1 byte/sample) and 16-bit
+    /// (maxval > 255, 2 bytes/sample big-endian). Returns interleaved RGB.
+    static func decode(_ data: [UInt8]) throws -> (rgb: [UInt16], width: Int, height: Int) {
+        var cursor = 0
+        func nextToken() throws -> String {
+            while cursor < data.count {
+                let c = data[cursor]
+                if c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D { cursor += 1 }
+                else if c == 0x23 { while cursor < data.count, data[cursor] != 0x0A { cursor += 1 } }
+                else { break }
+            }
+            let start = cursor
+            while cursor < data.count {
+                let c = data[cursor]
+                if c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D { break }
+                cursor += 1
+            }
+            guard start < cursor else { throw PPMError.malformed("unexpected end of header") }
+            return String(bytes: data[start..<cursor], encoding: .ascii) ?? ""
+        }
+
+        guard try nextToken() == "P6" else {
+            throw PPMError.malformed("expected P6 color PPM")
+        }
+        guard let width = Int(try nextToken()), width > 0,
+              let height = Int(try nextToken()), height > 0,
+              let maxVal = Int(try nextToken()), maxVal > 0 else {
+            throw PPMError.malformed("invalid PPM header")
+        }
+        guard cursor < data.count else { throw PPMError.malformed("missing pixel data") }
+        cursor += 1  // single whitespace separator before binary data
+
+        let count = width * height * 3
+        var rgb = [UInt16](repeating: 0, count: count)
+        if maxVal > 255 {
+            guard data.count - cursor >= count * 2 else {
+                throw PPMError.malformed("truncated 16-bit pixel data")
+            }
+            for i in 0..<count {
+                rgb[i] = (UInt16(data[cursor + i * 2]) << 8) | UInt16(data[cursor + i * 2 + 1])
+            }
+        } else {
+            guard data.count - cursor >= count else {
+                throw PPMError.malformed("truncated 8-bit pixel data")
+            }
+            for i in 0..<count { rgb[i] = UInt16(data[cursor + i]) }
+        }
+        return (rgb, width, height)
+    }
+}

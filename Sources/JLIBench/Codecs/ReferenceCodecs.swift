@@ -132,6 +132,33 @@ struct Gray16CLICodec: Gray16Codec {
     }
 }
 
+/// 12-bit color shell-out codec. Pipes 16-bit PPM through `cjpeg -precision 12`
+/// and `djpeg`. Forced to 4:4:4 (`-sample 1x1`) so cross-codec PSNR isn't muddied
+/// by cjpeg's default 2×2 chroma subsampling — the cross-codec reference for
+/// JLISwift's 12-bit color output.
+struct Color16CLICodec: Color16Codec {
+    let name: String
+    let encoderPath: String?
+    let decoderPath: String?
+    let isExternal = true
+    var enabled: Bool { encoderPath != nil && decoderPath != nil }
+
+    func encodeColor16(_ rgb: [UInt16], width: Int, height: Int, quality: Int) throws -> [UInt8] {
+        guard let path = encoderPath else { throw CodecError.unavailable(name) }
+        let ppm = PPM16.encode(rgb: rgb, width: width, height: height, maxVal: 4095)
+        return try CLIProcess.run(
+            binary: path,
+            args: ["-precision", "12", "-quality", "\(quality)", "-sample", "1x1"], stdin: ppm
+        )
+    }
+
+    func decodeColor16(_ jpeg: [UInt8]) throws -> (rgb: [UInt16], width: Int, height: Int) {
+        guard let path = decoderPath else { throw CodecError.unavailable(name) }
+        let ppm = try CLIProcess.run(binary: path, args: [], stdin: jpeg)
+        return try PPM16.decode(ppm)
+    }
+}
+
 enum ReferenceCodecs {
 
     /// libjpeg-turbo's `cjpeg`/`djpeg`. Apple's ImageIO uses libjpeg-turbo too
@@ -166,6 +193,21 @@ enum ReferenceCodecs {
             "/usr/local/opt/jpeg-turbo/bin/djpeg",
         ])
         return Gray16CLICodec(name: "libjpeg-turbo-12", encoderPath: enc, decoderPath: dec)
+    }
+
+    /// libjpeg-turbo in 12-bit color mode (`cjpeg -precision 12`). The cross-codec
+    /// reference for JLISwift's 12-bit color output.
+    static func libjpegTurbo12Color() -> Color16CLICodec {
+        let enc = firstExisting([
+            "/opt/homebrew/opt/jpeg-turbo/bin/cjpeg",
+            "/usr/local/opt/jpeg-turbo/bin/cjpeg",
+            ProcessInfo.processInfo.environment["JLIBENCH_LIBJPEG_TURBO_BIN"] ?? "",
+        ])
+        let dec = firstExisting([
+            "/opt/homebrew/opt/jpeg-turbo/bin/djpeg",
+            "/usr/local/opt/jpeg-turbo/bin/djpeg",
+        ])
+        return Color16CLICodec(name: "libjpeg-turbo-12c", encoderPath: enc, decoderPath: dec)
     }
 
     /// Mozilla's mozjpeg encoder — drop-in `cjpeg`-API replacement with

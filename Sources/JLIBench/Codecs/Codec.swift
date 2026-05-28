@@ -34,12 +34,26 @@ extension Gray16Codec {
     var isExternal: Bool { false }
 }
 
-struct JLISwiftCodec: Codec, Gray16Codec {
+/// A codec that round-trips 12-bit color (interleaved RGB samples 0–4095). The
+/// color counterpart of ``Gray16Codec`` — separate because not every codec
+/// supports 12-bit JPEG (ImageIO's encoder is 8-bit only).
+protocol Color16Codec: Sendable {
+    var name: String { get }
+    var isExternal: Bool { get }
+    func encodeColor16(_ rgb: [UInt16], width: Int, height: Int, quality: Int) throws -> [UInt8]
+    func decodeColor16(_ jpeg: [UInt8]) throws -> (rgb: [UInt16], width: Int, height: Int)
+}
+
+extension Color16Codec {
+    var isExternal: Bool { false }
+}
+
+struct JLISwiftCodec: Codec, Gray16Codec, Color16Codec {
     let name: String
     let subsampling: JLIChromaSubsampling
     let progressive: Bool
     let progressiveMode: JLIProgressiveMode
-    // Explicit (both Codec and Gray16Codec supply a default — disambiguate).
+    // Explicit (Codec, Gray16Codec, and Color16Codec all supply a default).
     let isExternal = false
 
     init(subsampling: JLIChromaSubsampling, progressive: Bool = false,
@@ -114,5 +128,38 @@ struct JLISwiftCodec: Codec, Gray16Codec {
             for i in 0..<gray.count { gray[i] = UInt16(img.data[i]) }
         }
         return (gray, img.width, img.height)
+    }
+
+    // MARK: - Color16Codec (12-bit color)
+
+    func encodeColor16(_ rgb: [UInt16], width: Int, height: Int, quality: Int) throws -> [UInt8] {
+        // Pack interleaved RGB to little-endian uint16 bytes — JLIImage's layout.
+        var bytes = [UInt8](repeating: 0, count: rgb.count * 2)
+        for i in 0..<rgb.count {
+            bytes[i * 2] = UInt8(rgb[i] & 0xFF)
+            bytes[i * 2 + 1] = UInt8(rgb[i] >> 8)
+        }
+        let image = try JLIImage(
+            width: width, height: height,
+            pixelFormat: .uint16, colorModel: .rgb, data: bytes
+        )
+        var config = JLIEncoderConfiguration.default
+        config.quality = Double(quality)
+        config.chromaSubsampling = subsampling
+        return try JLIEncoder().encode(image, configuration: config)
+    }
+
+    func decodeColor16(_ jpeg: [UInt8]) throws -> (rgb: [UInt16], width: Int, height: Int) {
+        let img = try JLIDecoder().decode(from: jpeg)
+        var rgb = [UInt16](repeating: 0, count: img.width * img.height * 3)
+        // Decoder emits `.uint16` little-endian for 12-bit color.
+        if img.pixelFormat == .uint16 {
+            for i in 0..<rgb.count {
+                rgb[i] = UInt16(img.data[i * 2]) | (UInt16(img.data[i * 2 + 1]) << 8)
+            }
+        } else {
+            for i in 0..<rgb.count { rgb[i] = UInt16(img.data[i]) }
+        }
+        return (rgb, img.width, img.height)
     }
 }
