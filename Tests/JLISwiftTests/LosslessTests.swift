@@ -31,4 +31,31 @@ struct LosslessTests {
         #expect(img.width == Self.w && img.height == Self.h)
         #expect(img.data == Self.src, "predictor-7 lossless decode not bit-exact")
     }
+
+    @Test("Lossless encode round-trips bit-exact for every predictor (8- and 12-bit)")
+    func losslessEncodeRoundTrip() throws {
+        let w = 24, h = 20
+        var g8 = [UInt8](repeating: 0, count: w * h)
+        for i in 0..<g8.count { g8[i] = UInt8((i * 13 + (i / w) * 7) & 0xFF) }
+        var g12 = [UInt8](repeating: 0, count: w * h * 2)
+        for i in 0..<(w * h) {
+            let v = UInt16((i * 61) & 0x0FFF)
+            g12[i * 2] = UInt8(v & 0xFF); g12[i * 2 + 1] = UInt8(v >> 8)
+        }
+
+        for predictor in 1...7 {
+            var cfg = JLIEncoderConfiguration.default
+            cfg.lossless = true; cfg.losslessPredictor = predictor; cfg.chromaSubsampling = .yuv400
+
+            let img8 = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .grayscale, data: g8)
+            let dec8 = try JLIDecoder().decode(from: try JLIEncoder().encode(img8, configuration: cfg))
+            #expect(dec8.width == w && dec8.height == h && dec8.pixelFormat == .uint8)
+            #expect(dec8.data == g8, "8-bit lossless predictor \(predictor) not bit-exact")
+
+            let img12 = try JLIImage(width: w, height: h, pixelFormat: .uint16, colorModel: .grayscale, data: g12)
+            let dec12 = try JLIDecoder().decode(from: try JLIEncoder().encode(img12, configuration: cfg))
+            #expect(dec12.pixelFormat == .uint16)
+            #expect(dec12.data == g12, "12-bit lossless predictor \(predictor) not bit-exact")
+        }
+    }
 }

@@ -83,6 +83,15 @@ public struct JLIEncoderConfiguration: Sendable {
     /// Applies to the baseline / extended-sequential path (not progressive).
     public var restartInterval: Int
 
+    /// Produce a lossless (SOF3) JPEG — exact reconstruction via spatial
+    /// prediction, no DCT/quantization. Larger files, but bit-for-bit lossless
+    /// (e.g. medical archival). Grayscale only for now; overrides `progressive`.
+    public var lossless: Bool
+
+    /// Lossless predictor selector (1–7, ITU-T T.81 Table H.1; default 1 = left).
+    /// Ignored unless `lossless` is set.
+    public var losslessPredictor: Int
+
     /// Whether to use optimised Huffman coding.
     public var optimiseHuffman: Bool
 
@@ -105,6 +114,8 @@ public struct JLIEncoderConfiguration: Sendable {
         progressive: false,
         progressiveMode: .spectralSelection,
         restartInterval: 0,
+        lossless: false,
+        losslessPredictor: 1,
         optimiseHuffman: true,
         adaptiveQuantization: true
     )
@@ -127,6 +138,8 @@ public struct JLIEncoderConfiguration: Sendable {
         progressive: Bool = true,
         progressiveMode: JLIProgressiveMode = .spectralSelection,
         restartInterval: Int = 0,
+        lossless: Bool = false,
+        losslessPredictor: Int = 1,
         optimiseHuffman: Bool = true,
         adaptiveQuantization: Bool = true
     ) {
@@ -137,6 +150,8 @@ public struct JLIEncoderConfiguration: Sendable {
         self.progressive = progressive
         self.progressiveMode = progressiveMode
         self.restartInterval = restartInterval
+        self.lossless = lossless
+        self.losslessPredictor = losslessPredictor
         self.optimiseHuffman = optimiseHuffman
         self.adaptiveQuantization = adaptiveQuantization
     }

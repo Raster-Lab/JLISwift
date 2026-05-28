@@ -123,12 +123,15 @@ struct MarkerWriter {
         precision: Int,
         width: Int,
         height: Int,
-        components: [(id: UInt8, hSampling: Int, vSampling: Int, quantTableId: Int)]
+        components: [(id: UInt8, hSampling: Int, vSampling: Int, quantTableId: Int)],
+        lossless: Bool = false
     ) {
         data.append(JPEGMarker.prefix)
-        // Baseline SOF0 is 8-bit only; 12-bit requires Extended Sequential (SOF1).
+        // Baseline SOF0 is 8-bit only; 12-bit requires Extended Sequential (SOF1);
+        // progressive is SOF2; lossless (predictive) is SOF3.
         let sofMarker: UInt8
-        if progressive { sofMarker = JPEGMarker.sof2 }
+        if lossless { sofMarker = JPEGMarker.sof3 }
+        else if progressive { sofMarker = JPEGMarker.sof2 }
         else if precision > 8 { sofMarker = JPEGMarker.sof1 }
         else { sofMarker = JPEGMarker.sof0 }
         data.append(sofMarker)

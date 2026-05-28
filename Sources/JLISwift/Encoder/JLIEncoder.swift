@@ -86,6 +86,12 @@ public struct JLIEncoder: Sendable {
         let isGrayscale = image.colorModel == .grayscale
             || configuration.chromaSubsampling == .yuv400
 
+        // Lossless (SOF3) is a predictive mode — fully separate from the DCT path.
+        if configuration.lossless {
+            return try encodeLossless(image, configuration: configuration,
+                                      precision: precision, isGrayscale: isGrayscale)
+        }
+
         // 12-bit color is supported for RGB/RGBA input. Pre-converted 12-bit
         // YCbCr input isn't — the direct-extract path below assumes 8-bit samples.
         if precision > 8 && !isGrayscale && image.colorModel == .yCbCr {
@@ -462,6 +468,100 @@ public struct JLIEncoder: Sendable {
         mw.writeEntropyData(bitWriter.data)
         mw.writeEOI()
 
+        return mw.data
+    }
+
+    // MARK: - Lossless (SOF3) encode
+
+    /// Encodes a lossless (SOF3) JPEG by spatial prediction (ITU-T T.81 Annex H):
+    /// each sample's difference from a neighbour-based predictor (selector 1–7) is
+    /// Huffman-coded with the DC mechanism. Bit-for-bit lossless. Grayscale only.
+    private func encodeLossless(
+        _ image: JLIImage, configuration: JLIEncoderConfiguration,
+        precision: Int, isGrayscale: Bool
+    ) throws -> [UInt8] {
+        guard isGrayscale else {
+            throw JLIError.unsupportedColorSpaceConversion(
+                from: "\(image.colorModel)", to: "lossless JPEG (grayscale only)")
+        }
+        let predictor = configuration.losslessPredictor
+        guard (1...7).contains(predictor) else {
+            throw JLIError.unsupportedJPEGFeature("lossless predictor \(predictor) (1–7)")
+        }
+        let w = image.width, h = image.height
+
+        // Read samples (8-bit direct, 12-bit little-endian uint16).
+        var samples = [Int32](repeating: 0, count: w * h)
+        if precision == 8 {
+            for i in 0..<(w * h) { samples[i] = Int32(image.data[i]) }
+        } else {
+            for i in 0..<(w * h) {
+                samples[i] = Int32(UInt16(image.data[i * 2]) | (UInt16(image.data[i * 2 + 1]) << 8))
+            }
+        }
+
+        let half = Int32(1 << (precision - 1))
+        func predict(_ x: Int, _ y: Int) -> Int32 {
+            if x == 0 { return y == 0 ? half : samples[(y - 1) * w] }          // Rb / initial
+            if y == 0 { return samples[y * w + x - 1] }                        // Ra
+            let ra = samples[y * w + x - 1]
+            let rb = samples[(y - 1) * w + x]
+            let rc = samples[(y - 1) * w + x - 1]
+            switch predictor {
+            case 1: return ra
+            case 2: return rb
+            case 3: return rc
+            case 4: return ra + rb - rc
+            case 5: return ra + ((rb - rc) >> 1)
+            case 6: return rb + ((ra - rc) >> 1)
+            default: return (ra + rb) >> 1                                     // 7
+            }
+        }
+        // Difference modulo 2^16, mapped to signed 16-bit (T.81). Category 16 is
+        // the special case for −32768 (no additional bits).
+        func diffOf(_ x: Int, _ y: Int) -> Int32 {
+            var d = (samples[y * w + x] - predict(x, y)) & 0xFFFF
+            if d >= 32768 { d -= 65536 }
+            return d
+        }
+
+        // Counting pass → optimal DC Huffman table over difference categories.
+        var dcFreq = [Int](repeating: 0, count: 256)
+        for y in 0..<h {
+            for x in 0..<w {
+                let d = diffOf(x, y)
+                dcFreq[d == -32768 ? 16 : HuffmanEncoder.category(for: d)] += 1
+            }
+        }
+        let table = HuffmanTableBuilder.build(
+            frequencies: dcFreq, fallback: StandardHuffmanTables.dcLuminance)
+
+        // Emit pass.
+        var mw = MarkerWriter()
+        mw.writeSOI()
+        mw.writeAPP0()
+        mw.writeSOF(progressive: false, precision: precision, width: w, height: h,
+                    components: [(1, 1, 1, 0)], lossless: true)
+        mw.writeDHT(tables: [(0, 0, table.bits, table.values)])
+        mw.writeSOS(components: [(selector: 1, dcTableId: 0, acTableId: 0)],
+                    spectralStart: predictor, spectralEnd: 0,
+                    successiveApproxHigh: 0, successiveApproxLow: 0)
+
+        var bw = BitWriter(estimatedMaxSize: w * h * 2 + 1024)
+        for y in 0..<h {
+            for x in 0..<w {
+                let d = diffOf(x, y)
+                let cat = d == -32768 ? 16 : HuffmanEncoder.category(for: d)
+                let e = table.encodingTable[cat]
+                bw.writeBits(UInt32(e.code), count: Int(e.length))
+                if cat > 0 && cat < 16 {
+                    bw.writeBits(HuffmanEncoder.additionalBits(for: d, category: cat), count: cat)
+                }
+            }
+        }
+        bw.flush()
+        mw.writeEntropyData(bw.data)
+        mw.writeEOI()
         return mw.data
     }
 

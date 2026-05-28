@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-28 (lossless SOF3 grayscale decode)._
+_Last updated: 2026-05-28 (lossless SOF3 grayscale encode + decode)._
 
 ## Completed
 
@@ -33,7 +33,7 @@ _Last updated: 2026-05-28 (lossless SOF3 grayscale decode)._
 ### Large efforts (high value, but multi-stage)
 - **Lossless JPEG (SOF3)** · true lossless for medical archival (often a hard requirement) — a separate predictive coding mode (no DCT/quant)
   - [x] grayscale **decode** (predictors 1–7) — bit-exact vs libjpeg-turbo lossless fixtures
-  - [ ] grayscale **encode** (predictor + lossless Huffman) — round-trip + djpeg cross-validate
+  - [x] grayscale **encode** (predictors 1–7, 8/12-bit) — round-trip bit-exact + djpeg decodes ours bit-exact
   - [ ] color (RGB/YCbCr, no subsampling) decode + encode
 - [ ] **jpegli-style quantizer** · quality / jpegli-parity · large — jpegli computes tables from a perceptual model per distance (not a matrix swap); butteraugli-gated, uncertain payoff without XYB
 
