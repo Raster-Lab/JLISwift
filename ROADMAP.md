@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decode via exact low-freq box-average)._
+_Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decode; multi-threaded trellis encode)._
 
 ## Completed
 
@@ -45,7 +45,7 @@ _Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decod
 - [x] 16-bit **input** (via lossless `losslessPrecision`) · float32 input still TODO (DCT modes stay 8/12-bit)
 - [ ] EXIF / ICC **metadata passthrough** · preserve APP1/APP2 across decode→encode · API addition; niche for medical (DICOM holds metadata)
 - [ ] Progressive **+ restart markers** · completeness (restart is baseline-only) · moderate, niche
-- [ ] **Multi-threaded encode** of large plates · parallelize trellis / Huffman-per-restart-interval · concurrency risk; must stay bit-identical
+- [x] **Multi-threaded encode** · trellis quantization (the largest parallelizable stage, ~22% of a big encode) is partitioned across cores via `concurrentPerform` over disjoint block ranges, each worker with private scratch — **byte-identical** to serial (verified by FNV checksum), ~15% faster on 8 cores for a 2048² plate. (Huffman-per-restart-interval emit not parallelized — separate, smaller win.)
 
 ### Deferred (high risk / low reward / unvalidatable)
 - [ ] XYB color · no jpegli reference available to cross-validate against — high risk of subtly-wrong perceptual color

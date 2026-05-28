@@ -2,6 +2,7 @@
 // Copyright 2024 Raster Lab. All rights reserved.
 
 import Accelerate
+import Foundation
 
 /// The jpegli-compatible JPEG encoder.
 ///
@@ -39,6 +40,13 @@ public struct JLIEncoder: Sendable {
     /// positions ≥ this — reducing the lowest AC frequencies costs visible
     /// quality (butteraugli) for negligible rate; HF reduction is near-free.
     static let trellisReduceMinZigzag = 6
+
+    /// Trellis blocks are partitioned across CPU cores only when each worker gets
+    /// at least this many — below it, thread-dispatch overhead outweighs the
+    /// per-block DP savings, so the pass runs serially. Each worker owns its
+    /// scratch and writes a disjoint block range, so output is byte-identical
+    /// regardless of how many threads run.
+    static let trellisMinBlocksPerChunk = 2048
 
     /// Encodes an image to JPEG data using the jpegli algorithm.
     ///
@@ -649,7 +657,7 @@ public struct JLIEncoder: Sendable {
     /// the forward quant table (natural order); `acTable` provides the bit-length
     /// rate model; `lambda` trades distortion (DCT coeff², = pixel² by Parseval)
     /// against rate (bits).
-    struct RDOContext {
+    struct RDOContext: Sendable {
         let quantTable: [Int]
         let acTable: HuffmanTable
         let lambda: Double
@@ -672,6 +680,47 @@ public struct JLIEncoder: Sendable {
     /// AC count m; high-entropy blocks (m large) skip the DP.
     private func applyTrellisQuantization(
         dctBuf: [Float], quant: inout [Int32], blockCount: Int, rdo: RDOContext
+    ) {
+        // Partition blocks across cores when there's enough work; each worker owns
+        // its scratch and writes only its disjoint quant[base...] slice, so the
+        // result is byte-identical to a serial run.
+        let chunks = min(ProcessInfo.processInfo.activeProcessorCount,
+                         max(1, blockCount / JLIEncoder.trellisMinBlocksPerChunk))
+        dctBuf.withUnsafeBufferPointer { dbuf in
+            quant.withUnsafeMutableBufferPointer { qbuf in
+                let dct = dbuf.baseAddress!
+                let qnt = qbuf.baseAddress!
+                if chunks <= 1 {
+                    JLIEncoder.trellisBlocks(0..<blockCount, dct: dct, quant: qnt, rdo: rdo)
+                    return
+                }
+                let span = (blockCount + chunks - 1) / chunks
+                let ptrs = TrellisPtrs(dct: dct, quant: qnt)
+                DispatchQueue.concurrentPerform(iterations: chunks) { c in
+                    let lo = c * span, hi = min(lo + span, blockCount)
+                    if lo < hi {
+                        JLIEncoder.trellisBlocks(lo..<hi, dct: ptrs.dct, quant: ptrs.quant, rdo: rdo)
+                    }
+                }
+            }
+        }
+    }
+
+    /// `@unchecked Sendable` carrier for the two batched buffers so disjoint block
+    /// ranges can be trellis-quantized on separate cores: each ``trellisBlocks``
+    /// call reads `dct` and writes only the `quant[base...]` slice of its range.
+    private struct TrellisPtrs: @unchecked Sendable {
+        let dct: UnsafePointer<Float>
+        let quant: UnsafeMutablePointer<Int32>
+    }
+
+    /// Trellis-quantize the blocks in `blocks`. `static` with fully self-contained
+    /// per-call scratch so it is safe to run concurrently over disjoint ranges of
+    /// the same `dct`/`quant` buffers. See ``applyTrellisQuantization`` for the
+    /// rate-distortion model.
+    private static func trellisBlocks(
+        _ blocks: Range<Int>, dct: UnsafePointer<Float>,
+        quant: UnsafeMutablePointer<Int32>, rdo: RDOContext
     ) {
         let zz = Quantization.zigzagOrder
         let lambda = rdo.lambda
@@ -701,14 +750,14 @@ public struct JLIEncoder: Sendable {
         var prevState = [Int](repeating: -1, count: 128)     // previous (candidate*2+variant), or -1
         var chosen = [Int](repeating: -1, count: 64)         // backtracked variant per candidate, -1 = dropped
 
-        for b in 0..<blockCount {
+        for b in blocks {
             let base = b * 64
             var m = 0
             for z in 1..<64 {
                 let q = quant[base + zz[z]]
                 if q == 0 { continue }
                 let nat = zz[z]
-                let c = Double(dctBuf[base + nat])
+                let c = Double(dct[base + nat])
                 let qf = Double(rdo.quantTable[nat])
                 nz[m] = z
                 dropDist[m] = c * c
