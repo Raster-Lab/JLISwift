@@ -89,3 +89,73 @@ enum PPMError: Error, CustomStringConvertible {
         }
     }
 }
+
+/// 16-bit grayscale PGM (P5). Per the netpbm spec, samples with maxval > 255
+/// are stored as 2 bytes **big-endian**. Used to pipe 12-bit grayscale through
+/// `cjpeg -precision 12` / `djpeg`, which read and write exactly this format.
+enum PGM16 {
+
+    /// Encodes 16-bit grayscale samples into a P5 PGM with `maxVal` (e.g. 4095
+    /// for 12-bit), big-endian sample bytes.
+    static func encode(gray: [UInt16], width: Int, height: Int, maxVal: Int = 4095) -> [UInt8] {
+        precondition(gray.count == width * height, "gray buffer size mismatch")
+        let header = "P5\n\(width) \(height)\n\(maxVal)\n"
+        var out = [UInt8](header.utf8)
+        out.reserveCapacity(out.count + gray.count * 2)
+        for s in gray {
+            out.append(UInt8(s >> 8))     // big-endian high byte
+            out.append(UInt8(s & 0xFF))
+        }
+        return out
+    }
+
+    /// Decodes a P5 PGM. Supports both 8-bit (maxval ≤ 255, 1 byte/sample) and
+    /// 16-bit (maxval > 255, 2 bytes/sample big-endian).
+    static func decode(_ data: [UInt8]) throws -> (gray: [UInt16], width: Int, height: Int) {
+        var cursor = 0
+        func nextToken() throws -> String {
+            while cursor < data.count {
+                let c = data[cursor]
+                if c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D { cursor += 1 }
+                else if c == 0x23 { while cursor < data.count, data[cursor] != 0x0A { cursor += 1 } }
+                else { break }
+            }
+            let start = cursor
+            while cursor < data.count {
+                let c = data[cursor]
+                if c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D { break }
+                cursor += 1
+            }
+            guard start < cursor else { throw PPMError.malformed("unexpected end of header") }
+            return String(bytes: data[start..<cursor], encoding: .ascii) ?? ""
+        }
+
+        guard try nextToken() == "P5" else {
+            throw PPMError.malformed("expected P5 grayscale PGM")
+        }
+        guard let width = Int(try nextToken()), width > 0,
+              let height = Int(try nextToken()), height > 0,
+              let maxVal = Int(try nextToken()), maxVal > 0 else {
+            throw PPMError.malformed("invalid PGM header")
+        }
+        guard cursor < data.count else { throw PPMError.malformed("missing pixel data") }
+        cursor += 1  // single whitespace separator before binary data
+
+        let count = width * height
+        var gray = [UInt16](repeating: 0, count: count)
+        if maxVal > 255 {
+            guard data.count - cursor >= count * 2 else {
+                throw PPMError.malformed("truncated 16-bit pixel data")
+            }
+            for i in 0..<count {
+                gray[i] = (UInt16(data[cursor + i * 2]) << 8) | UInt16(data[cursor + i * 2 + 1])
+            }
+        } else {
+            guard data.count - cursor >= count else {
+                throw PPMError.malformed("truncated 8-bit pixel data")
+            }
+            for i in 0..<count { gray[i] = UInt16(data[cursor + i]) }
+        }
+        return (gray, width, height)
+    }
+}

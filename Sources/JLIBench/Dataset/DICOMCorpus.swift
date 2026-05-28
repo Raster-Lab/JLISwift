@@ -13,8 +13,10 @@ struct CorpusImage {
     let modality: String
     let width: Int
     let height: Int
-    /// Interleaved RGB, grayscale-replicated for monochrome modalities.
+    /// Interleaved RGB, grayscale-replicated for monochrome modalities (8-bit bench).
     let rgb: [UInt8]
+    /// 12-bit grayscale samples (0–4095), same window as `rgb` (high-precision bench).
+    let gray12: [UInt16]
 }
 
 /// Samples and caches a manageable subset of the DICOM corpus.
@@ -111,10 +113,10 @@ enum DICOMCorpus {
         do {
             let data = [UInt8](try Data(contentsOf: URL(fileURLWithPath: path)))
             let dicom = try DICOMReader.read(data)
-            let rgb = dicom.toRGB8()
             return CorpusImage(
                 id: id, modality: modality,
-                width: dicom.width, height: dicom.height, rgb: rgb
+                width: dicom.width, height: dicom.height,
+                rgb: dicom.toRGB8(), gray12: dicom.toGray12()
             )
         } catch {
             // Quietly skip — the bench reports counts at the end.
@@ -125,24 +127,27 @@ enum DICOMCorpus {
     // MARK: - Cache format
     //
     // Trivial little-endian binary:
-    //   [4 bytes width][4 bytes height][rgb bytes]
-    // ID and modality are encoded in the file path under cacheDir.
+    //   [4 B width][4 B height][w*h*3 B rgb][w*h*2 B gray12 (LE)]
+    // ID and modality are encoded in the file path under cacheDir. Caches from
+    // before the gray12 plane was added fail the size check and get re-parsed.
 
     private static func cachePath(id: String, cacheDir: String) -> String {
         let safe = id.replacingOccurrences(of: "/", with: "_")
-        return "\(cacheDir)/\(safe).rgb8"
+        return "\(cacheDir)/\(safe).v2"
     }
 
     private static func saveCached(_ img: CorpusImage, cacheDir: String) {
-        var header = [UInt8]()
+        var out = [UInt8]()
+        out.reserveCapacity(8 + img.rgb.count + img.gray12.count * 2)
         for shift in stride(from: 0, through: 24, by: 8) {
-            header.append(UInt8(truncatingIfNeeded: img.width >> shift))
+            out.append(UInt8(truncatingIfNeeded: img.width >> shift))
         }
         for shift in stride(from: 0, through: 24, by: 8) {
-            header.append(UInt8(truncatingIfNeeded: img.height >> shift))
+            out.append(UInt8(truncatingIfNeeded: img.height >> shift))
         }
-        let path = cachePath(id: img.id, cacheDir: cacheDir)
-        try? Data(header + img.rgb).write(to: URL(fileURLWithPath: path))
+        out.append(contentsOf: img.rgb)
+        for s in img.gray12 { out.append(UInt8(s & 0xFF)); out.append(UInt8(s >> 8)) }
+        try? Data(out).write(to: URL(fileURLWithPath: cachePath(id: img.id, cacheDir: cacheDir)))
     }
 
     private static func loadCached(id: String, cacheDir: String) -> CorpusImage? {
@@ -153,12 +158,16 @@ enum DICOMCorpus {
         var w = 0, h = 0
         for i in 0..<4 { w |= Int(bytes[i]) << (i * 8) }
         for i in 0..<4 { h |= Int(bytes[4 + i]) << (i * 8) }
-        let pixelCount = w * h * 3
-        guard bytes.count == 8 + pixelCount else { return nil }
-        let rgb = Array(bytes[8..<bytes.count])
-
-        // Recover modality from the id prefix (first path component).
+        let rgbCount = w * h * 3
+        let grayBytes = w * h * 2
+        guard bytes.count == 8 + rgbCount + grayBytes else { return nil }
+        let rgb = Array(bytes[8..<(8 + rgbCount)])
+        var gray = [UInt16](repeating: 0, count: w * h)
+        let base = 8 + rgbCount
+        for i in 0..<gray.count {
+            gray[i] = UInt16(bytes[base + i * 2]) | (UInt16(bytes[base + i * 2 + 1]) << 8)
+        }
         let modality = id.split(separator: "/").first.map(String.init) ?? "unknown"
-        return CorpusImage(id: id, modality: modality, width: w, height: h, rgb: rgb)
+        return CorpusImage(id: id, modality: modality, width: w, height: h, rgb: rgb, gray12: gray)
     }
 }

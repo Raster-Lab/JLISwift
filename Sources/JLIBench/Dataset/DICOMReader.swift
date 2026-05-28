@@ -72,6 +72,25 @@ struct DICOMImage {
         return rgb
     }
 
+    /// Renders the image as 12-bit grayscale (samples 0–4095) for the
+    /// high-precision bench. Uses the same window/level as ``toRGB8()`` so the
+    /// 8-bit and 12-bit views show the same clinical content — just at 16× the
+    /// tonal resolution. `MONOCHROME1` is inverted as in the 8-bit path.
+    func toGray12() -> [UInt16] {
+        let intensities = decodeIntensities()
+        let (low, high) = windowRange(intensities: intensities)
+        let span = max(1e-9, high - low)
+        let invert = (photometric == "MONOCHROME1")
+        var gray = [UInt16](repeating: 0, count: width * height)
+        for i in 0..<min(gray.count, intensities.count) {
+            var v = (intensities[i] - low) / span
+            if v < 0 { v = 0 } else if v > 1 { v = 1 }
+            if invert { v = 1 - v }
+            gray[i] = UInt16(v * 4095.0 + 0.5)
+        }
+        return gray
+    }
+
     /// Native intensities as Double, honoring `bitsAllocated` + `pixelRepresentation`.
     private func decodeIntensities() -> [Double] {
         let pixelCount = width * height

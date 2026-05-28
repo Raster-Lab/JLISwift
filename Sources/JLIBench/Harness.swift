@@ -113,6 +113,20 @@ enum Harness {
         return 10.0 * log10((255.0 * 255.0) / mse)
     }
 
+    /// PSNR between two 16-bit sample arrays against a given peak value
+    /// (4095 for 12-bit data). `.infinity` for an exact match.
+    static func psnr16(_ a: [UInt16], _ b: [UInt16], peak: Double) -> Double {
+        precondition(a.count == b.count, "PSNR inputs must be same length")
+        var sse: Double = 0
+        for i in 0..<a.count {
+            let d = Double(a[i]) - Double(b[i])
+            sse += d * d
+        }
+        if sse == 0 { return .infinity }
+        let mse = sse / Double(a.count)
+        return 10.0 * log10((peak * peak) / mse)
+    }
+
     static func run(codec: Codec, image: TestImage, quality: Int) throws -> Result {
         // Shell-out codecs are overhead-dominated; one sample is enough.
         let iters = codec.isExternal ? 1 : 5
@@ -223,6 +237,82 @@ func printCrossTable(_ results: [CrossResult]) {
             (psnrStr as NSString).utf8String!,
             (status as NSString).utf8String!
         ))
+    }
+}
+
+// MARK: - 12-bit grayscale runners
+
+/// A 12-bit grayscale image (samples 0–4095) for the high-precision DICOM bench.
+struct Gray16Image {
+    let name: String
+    let width: Int
+    let height: Int
+    let samples: [UInt16]
+}
+
+extension Harness {
+    static let gray16Peak = 4095.0  // 12-bit
+
+    /// Self round-trip for a 12-bit grayscale codec: encode, decode, PSNR.
+    static func runGray16(codec: Gray16Codec, image: Gray16Image, quality: Int) throws -> Result {
+        let iters = codec.isExternal ? 1 : 5
+        var jpeg = [UInt8]()
+        let encMs = try timeMs(iterations: iters) {
+            jpeg = try codec.encodeGray16(
+                image.samples, width: image.width, height: image.height, quality: quality
+            )
+        }
+        var decoded: (gray: [UInt16], width: Int, height: Int) = ([], 0, 0)
+        let decMs = try timeMs(iterations: iters) {
+            decoded = try codec.decodeGray16(jpeg)
+        }
+        let cmp = min(image.samples.count, decoded.gray.count)
+        let psnr = Harness.psnr16(
+            Array(image.samples.prefix(cmp)), Array(decoded.gray.prefix(cmp)), peak: gray16Peak
+        )
+        let bpp = Double(jpeg.count * 8) / Double(image.width * image.height)
+        return Result(
+            codec: codec.name, image: image.name, quality: quality,
+            encodedBytes: jpeg.count, encodeMs: encMs, decodeMs: decMs,
+            psnrDB: psnr, bpp: bpp
+        )
+    }
+
+    /// Cross-codec: encode with one 12-bit codec, decode with another.
+    static func runCrossGray16(
+        encoder: Gray16Codec, decoder: Gray16Codec, image: Gray16Image, quality: Int
+    ) -> CrossResult {
+        let jpeg: [UInt8]
+        do {
+            jpeg = try encoder.encodeGray16(
+                image.samples, width: image.width, height: image.height, quality: quality
+            )
+        } catch {
+            return CrossResult(
+                encoderName: encoder.name, decoderName: decoder.name,
+                image: image.name, quality: quality,
+                encodedBytes: 0, psnrDB: nil, failure: "encode: \(error)"
+            )
+        }
+        let decoded: (gray: [UInt16], width: Int, height: Int)
+        do {
+            decoded = try decoder.decodeGray16(jpeg)
+        } catch {
+            return CrossResult(
+                encoderName: encoder.name, decoderName: decoder.name,
+                image: image.name, quality: quality,
+                encodedBytes: jpeg.count, psnrDB: nil, failure: "decode: \(error)"
+            )
+        }
+        let cmp = min(image.samples.count, decoded.gray.count)
+        let psnr = Harness.psnr16(
+            Array(image.samples.prefix(cmp)), Array(decoded.gray.prefix(cmp)), peak: gray16Peak
+        )
+        return CrossResult(
+            encoderName: encoder.name, decoderName: decoder.name,
+            image: image.name, quality: quality,
+            encodedBytes: jpeg.count, psnrDB: psnr, failure: nil
+        )
     }
 }
 

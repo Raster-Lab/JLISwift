@@ -29,19 +29,21 @@ struct CLICodec: Codec {
     func encode(rgb: [UInt8], width: Int, height: Int, quality: Int) throws -> [UInt8] {
         guard let path = encoderPath else { throw CodecError.unavailable(name) }
         let ppm = PPM.encode(rgb: rgb, width: width, height: height)
-        return try runPipe(binary: path, args: encoderArgs(quality), stdin: ppm)
+        return try CLIProcess.run(binary: path, args: encoderArgs(quality), stdin: ppm)
     }
 
     func decode(jpeg: [UInt8]) throws -> (rgb: [UInt8], width: Int, height: Int) {
         guard let path = decoderPath else { throw CodecError.unavailable(name) }
         // `djpeg` (libjpeg-turbo/mozjpeg) writes PPM to stdout by default.
-        let ppm = try runPipe(binary: path, args: [], stdin: jpeg)
+        let ppm = try CLIProcess.run(binary: path, args: [], stdin: jpeg)
         return try PPM.decode(ppm)
     }
+}
 
-    /// Runs `binary args…`, feeding `stdin` bytes and capturing stdout bytes.
-    /// Throws if the process exits non-zero, including stderr in the message.
-    private func runPipe(binary: String, args: [String], stdin: [UInt8]) throws -> [UInt8] {
+/// Runs an external binary, feeding `stdin` bytes and capturing stdout bytes.
+enum CLIProcess {
+    /// Throws `CodecError.processFailed` (with stderr) on non-zero exit.
+    static func run(binary: String, args: [String], stdin: [UInt8]) throws -> [UInt8] {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: binary)
         proc.arguments = args
@@ -103,6 +105,33 @@ private func firstExisting(_ candidates: [String]) -> String? {
     return nil
 }
 
+/// 12-bit grayscale shell-out codec. Pipes 16-bit PGM through
+/// `cjpeg -precision 12` and `djpeg`, both of which natively read/write the
+/// netpbm 16-bit (big-endian) format. libjpeg-turbo 3.x is the only widely
+/// installed encoder with a 12-bit path, so this is the cross-codec reference
+/// for JLISwift's 12-bit output.
+struct Gray16CLICodec: Gray16Codec {
+    let name: String
+    let encoderPath: String?
+    let decoderPath: String?
+    let isExternal = true
+    var enabled: Bool { encoderPath != nil && decoderPath != nil }
+
+    func encodeGray16(_ samples: [UInt16], width: Int, height: Int, quality: Int) throws -> [UInt8] {
+        guard let path = encoderPath else { throw CodecError.unavailable(name) }
+        let pgm = PGM16.encode(gray: samples, width: width, height: height, maxVal: 4095)
+        return try CLIProcess.run(
+            binary: path, args: ["-precision", "12", "-quality", "\(quality)"], stdin: pgm
+        )
+    }
+
+    func decodeGray16(_ jpeg: [UInt8]) throws -> (gray: [UInt16], width: Int, height: Int) {
+        guard let path = decoderPath else { throw CodecError.unavailable(name) }
+        let pgm = try CLIProcess.run(binary: path, args: [], stdin: jpeg)
+        return try PGM16.decode(pgm)
+    }
+}
+
 enum ReferenceCodecs {
 
     /// libjpeg-turbo's `cjpeg`/`djpeg`. Apple's ImageIO uses libjpeg-turbo too
@@ -122,6 +151,21 @@ enum ReferenceCodecs {
             name: "libjpeg-turbo", encoderPath: enc, decoderPath: dec,
             encoderArgs: { q in ["-quality", "\(q)", "-optimize"] }
         )
+    }
+
+    /// libjpeg-turbo in 12-bit mode (`cjpeg -precision 12`). The cross-codec
+    /// reference for JLISwift's 12-bit grayscale output.
+    static func libjpegTurbo12() -> Gray16CLICodec {
+        let enc = firstExisting([
+            "/opt/homebrew/opt/jpeg-turbo/bin/cjpeg",
+            "/usr/local/opt/jpeg-turbo/bin/cjpeg",
+            ProcessInfo.processInfo.environment["JLIBENCH_LIBJPEG_TURBO_BIN"] ?? "",
+        ])
+        let dec = firstExisting([
+            "/opt/homebrew/opt/jpeg-turbo/bin/djpeg",
+            "/usr/local/opt/jpeg-turbo/bin/djpeg",
+        ])
+        return Gray16CLICodec(name: "libjpeg-turbo-12", encoderPath: enc, decoderPath: dec)
     }
 
     /// Mozilla's mozjpeg encoder — drop-in `cjpeg`-API replacement with

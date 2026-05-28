@@ -47,7 +47,8 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | Restart marker (DRI / RST) decode — interop with ImageIO/libjpeg output | ✅ |
 | Quality-scaled standard quantization tables (IJG formula) | ✅ |
 | RGB / RGBA / grayscale / pre-converted YCbCr input (8-bit) | ✅ |
-| **12-bit grayscale** encode + decode (`.uint16` input → precision-12 JPEG) | ✅ |
+| **12-bit grayscale** encode + decode (`.uint16` → SOF1 precision-12 JPEG) | ✅ |
+| SOF1 (extended sequential) decode — reads 12-bit JPEGs from libjpeg/ImageIO | ✅ |
 | `inspect()` — metadata parse without full decode | ✅ |
 | Accelerate `vDSP_mmul` DCT, `vDSP_vmul` quant, vectorized BT.601 color conversion | ✅ |
 | Round-trip + cross-codec tested (ImageIO, libjpeg-turbo) on synthetic + DICOM | ✅ |
@@ -184,6 +185,15 @@ RLE) are silently skipped — only uncompressed Little Endian VR (Implicit
 and Explicit, the typical CT/MR/DX/MG output) is decoded today. Converted
 images are cached at `~/.cache/jlibench/corpus/`; `--rebuild-cache` clears
 it.
+
+`--dicom12` runs the corpus at **native 12-bit precision** instead of
+window/leveling to 8-bit: each image is rendered to 12-bit grayscale
+(0–4095) and round-tripped through JLISwift and libjpeg-turbo's 12-bit
+mode (`cjpeg -precision 12`), with PSNR measured against the 4095 peak.
+This is the medically-relevant path — it preserves the tonal resolution
+8-bit discards. On the corpus JLISwift matches libjpeg-turbo-12 within
+~0.1% bytes at 67–83 dB PSNR (vs 44–59 dB for the 8-bit path), and
+JLISwift ↔ libjpeg-turbo-12 cross-decode passes both directions.
 
 ## Roadmap
 

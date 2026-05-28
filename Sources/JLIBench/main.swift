@@ -17,6 +17,8 @@ struct BenchOptions {
     var rebuildCache: Bool = false
     var regression: Regression = .none
     var maxPixels: Int = 4_000_000  // skip huge plates (e.g. 5k×5k DX) to keep runtime bounded
+    /// Run the 12-bit grayscale DICOM bench (native clinical precision).
+    var dicom12: Bool = false
 }
 
 func parseArgs(_ argv: [String]) -> BenchOptions {
@@ -27,6 +29,7 @@ func parseArgs(_ argv: [String]) -> BenchOptions {
         switch a {
         case "--dicom":             opts.mode = .both
         case "--dicom-only":        opts.mode = .dicomOnly
+        case "--dicom12":           opts.dicom12 = true
         case "--rebuild-cache":     opts.rebuildCache = true
         case "--dicom-root":
             i += 1; opts.dicomRoot = argv[i]
@@ -62,6 +65,7 @@ func printHelp() {
       --dicom-root <path>    DICOM corpus root (default: Sources/LocalDatasets/medical-dicom-organized)
       --per-modality <N>     DICOM images per modality (default: 3)
       --max-pixels <N>       Skip DICOMs above this pixel count (default: 4000000)
+      --dicom12              Run the 12-bit grayscale DICOM bench (native precision)
       --rebuild-cache        Clear ~/.cache/jlibench/corpus before running
 
     Regression flags:
@@ -120,29 +124,21 @@ print("")
 var baselineRows = [BaselineRow]()
 
 @MainActor @inline(__always)
-func recordSelf(_ r: Result) {
+func recordSelf(_ r: Result, kind: String = "self") {
     baselineRows.append(BaselineRow(
-        kind: "self", codec: r.codec, image: r.image, quality: r.quality,
+        kind: kind, codec: r.codec, image: r.image, quality: r.quality,
         bytes: r.encodedBytes, psnrDB: r.psnrDB
     ))
 }
 
 @MainActor @inline(__always)
-func recordCross(_ r: CrossResult) {
-    guard let psnr = r.psnrDB else {
-        // Decode failure — encode an explicit -inf so a baseline can pin
-        // "this pair fails" and the regression check flags it if it changes.
-        baselineRows.append(BaselineRow(
-            kind: "cross", codec: "\(r.encoderName)->\(r.decoderName)",
-            image: r.image, quality: r.quality,
-            bytes: r.encodedBytes, psnrDB: -Double.infinity
-        ))
-        return
-    }
+func recordCross(_ r: CrossResult, kind: String = "cross") {
+    // Decode failure → -inf so a baseline can pin "this pair fails today" and
+    // the regression check fires the moment it changes.
     baselineRows.append(BaselineRow(
-        kind: "cross", codec: "\(r.encoderName)->\(r.decoderName)",
+        kind: kind, codec: "\(r.encoderName)->\(r.decoderName)",
         image: r.image, quality: r.quality,
-        bytes: r.encodedBytes, psnrDB: psnr
+        bytes: r.encodedBytes, psnrDB: r.psnrDB ?? -Double.infinity
     ))
 }
 
@@ -250,6 +246,54 @@ if opts.mode != .syntheticOnly {
         print("")
         print("--- DICOM cross-codec ---")
         printCrossTable(dicomCross)
+    }
+}
+
+// MARK: - 12-bit grayscale DICOM bench
+
+if opts.dicom12 {
+    print("")
+    print("=== DICOM corpus 12-bit grayscale (native precision) ===")
+    print("")
+    let lt12 = ReferenceCodecs.libjpegTurbo12()
+    // JLISwift grayscale ignores subsampling, so one instance represents it.
+    let gray16Codecs: [Gray16Codec] = lt12.enabled ? [jli444, lt12] : [jli444]
+    print("active 12-bit codecs: \(gray16Codecs.map(\.name).joined(separator: ", "))")
+    if !lt12.enabled {
+        print("(libjpeg-turbo-12 unavailable — install jpeg-turbo for 12-bit cross-codec)")
+    }
+    print("")
+
+    let corpus = DICOMCorpus.load(rootDir: opts.dicomRoot, perModality: opts.perModality)
+    var self12 = [Result]()
+    var cross12 = [CrossResult]()
+    for img in corpus {
+        if img.width * img.height > opts.maxPixels { continue }
+        let g16 = Gray16Image(name: img.id, width: img.width, height: img.height, samples: img.gray12)
+        for q in opts.dicomQualities {
+            for codec in gray16Codecs {
+                do {
+                    let r = try Harness.runGray16(codec: codec, image: g16, quality: q)
+                    self12.append(r); recordSelf(r, kind: "self12")
+                } catch {
+                    print("FAIL self12 \(codec.name) / \(img.id) / q=\(q): \(error)")
+                }
+            }
+            // Cross JLISwift ↔ libjpeg-turbo-12 (only if the reference is present).
+            if lt12.enabled {
+                let a = Harness.runCrossGray16(encoder: jli444, decoder: lt12, image: g16, quality: q)
+                cross12.append(a); recordCross(a, kind: "cross12")
+                let b = Harness.runCrossGray16(encoder: lt12, decoder: jli444, image: g16, quality: q)
+                cross12.append(b); recordCross(b, kind: "cross12")
+            }
+        }
+    }
+    print("--- 12-bit self-codec (PSNR peak 4095) ---")
+    printTable(self12)
+    if !cross12.isEmpty {
+        print("")
+        print("--- 12-bit cross-codec ---")
+        printCrossTable(cross12)
     }
 }
 
