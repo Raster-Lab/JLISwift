@@ -88,8 +88,19 @@ public struct JLIEncoder: Sendable {
 
         // Lossless (SOF3) is a predictive mode — fully separate from the DCT path.
         if configuration.lossless {
+            // Lossless supports up to 16-bit; precision 0 = derive from pixel format.
+            let llPrecision = configuration.losslessPrecision > 0
+                ? configuration.losslessPrecision : precision
+            guard (2...16).contains(llPrecision) else {
+                throw JLIError.unsupportedJPEGFeature("lossless precision \(llPrecision) (2–16)")
+            }
+            guard llPrecision <= 8 || image.pixelFormat == .uint16 else {
+                throw JLIError.unsupportedColorSpaceConversion(
+                    from: "\(image.pixelFormat) at \(llPrecision)-bit",
+                    to: ">8-bit lossless (requires .uint16 input)")
+            }
             return try encodeLossless(image, configuration: configuration,
-                                      precision: precision, isGrayscale: isGrayscale)
+                                      precision: llPrecision, isGrayscale: isGrayscale)
         }
 
         // 12-bit color is supported for RGB/RGBA input. Pre-converted 12-bit

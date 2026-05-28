@@ -92,6 +92,12 @@ public struct JLIEncoderConfiguration: Sendable {
     /// Ignored unless `lossless` is set.
     public var losslessPredictor: Int
 
+    /// Sample precision for lossless encoding (2–16), or `0` to derive it from the
+    /// pixel format (8-bit for `.uint8`, 12-bit for `.uint16`). Set to 16 for
+    /// full 16-bit lossless (e.g. 16-bit medical sources); requires `.uint16`
+    /// input. Ignored unless `lossless` is set; DCT modes always use 8/12-bit.
+    public var losslessPrecision: Int
+
     /// Whether to use optimised Huffman coding.
     public var optimiseHuffman: Bool
 
@@ -116,6 +122,7 @@ public struct JLIEncoderConfiguration: Sendable {
         restartInterval: 0,
         lossless: false,
         losslessPredictor: 1,
+        losslessPrecision: 0,
         optimiseHuffman: true,
         adaptiveQuantization: true
     )
@@ -140,6 +147,7 @@ public struct JLIEncoderConfiguration: Sendable {
         restartInterval: Int = 0,
         lossless: Bool = false,
         losslessPredictor: Int = 1,
+        losslessPrecision: Int = 0,
         optimiseHuffman: Bool = true,
         adaptiveQuantization: Bool = true
     ) {
@@ -152,6 +160,7 @@ public struct JLIEncoderConfiguration: Sendable {
         self.restartInterval = restartInterval
         self.lossless = lossless
         self.losslessPredictor = losslessPredictor
+        self.losslessPrecision = losslessPrecision
         self.optimiseHuffman = optimiseHuffman
         self.adaptiveQuantization = adaptiveQuantization
     }

@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-28 (lossless SOF3 complete — grayscale + color, encode + decode)._
+_Last updated: 2026-05-28 (lossless SOF3 complete incl. 16-bit precision)._
 
 ## Completed
 
@@ -32,7 +32,8 @@ _Last updated: 2026-05-28 (lossless SOF3 complete — grayscale + color, encode 
 
 ### Completed large efforts
 - [x] **Lossless JPEG (SOF3)** — true lossless (predictive, no DCT/quant), the medical-archival item
-  - grayscale + RGB color (stored direct, Adobe APP14 transform=0), 8/12-bit, predictors 1–7
+  - grayscale + RGB color (stored direct, Adobe APP14 transform=0), predictors 1–7
+  - **8 / 12 / 16-bit precision** (`losslessPrecision`; 16-bit for 16-bit medical sources)
   - bit-exact, cross-validated vs libjpeg-turbo both directions (we read theirs; djpeg reads ours)
 
 ### Large efforts (high value, but multi-stage)
@@ -40,7 +41,7 @@ _Last updated: 2026-05-28 (lossless SOF3 complete — grayscale + color, encode 
 
 ### Marginal / niche (safe, bounded, lower value)
 - [ ] **1/2 & 1/4 scaled decode** · either fiddly (partial 2×2/4×4 IDCT, real speedup; validate vs `djpeg -scale`) or trivial-but-no-IDCT-speedup (full IDCT + box-downsample) · 1/8 already covers thumbnails
-- [ ] 16-bit / float32 **input** · accept wider source buffers (down-convert) · safe, low value (callers can pre-scale)
+- [x] 16-bit **input** (via lossless `losslessPrecision`) · float32 input still TODO (DCT modes stay 8/12-bit)
 - [ ] EXIF / ICC **metadata passthrough** · preserve APP1/APP2 across decode→encode · API addition; niche for medical (DICOM holds metadata)
 - [ ] Progressive **+ restart markers** · completeness (restart is baseline-only) · moderate, niche
 - [ ] **Multi-threaded encode** of large plates · parallelize trellis / Huffman-per-restart-interval · concurrency risk; must stay bit-identical
