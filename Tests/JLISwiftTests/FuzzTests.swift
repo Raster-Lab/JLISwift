@@ -61,10 +61,32 @@ struct FuzzTests {
         return try JLIEncoder().encode(img, configuration: cfg)
     }
 
+    /// A valid JPEG carrying a multi-segment ICC profile (>65519 → 2 APP2
+    /// segments) and an Exif (APP1) block — exercises the metadata parser, which
+    /// reads attacker-controlled segment lengths, sequence numbers, and counts.
+    static func validJPEGWithMetadata() throws -> [UInt8] {
+        let w = 24, h = 16
+        let rgb = (0..<(w * h * 3)).map { UInt8(($0 &* 7) & 0xFF) }
+        let icc = (0..<100_000).map { UInt8(($0 &* 251 &+ 13) & 0xFF) }   // 2 segments
+        let exif = (0..<200).map { UInt8($0 & 0xFF) }
+        let img = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb,
+                               data: rgb, iccProfile: icc, exif: exif)
+        return try JLIEncoder().encode(img, configuration: .default)
+    }
+
     /// Feed bytes to both entry points; thrown errors are fine, a trap is not.
     private func probe(_ data: [UInt8]) {
         _ = try? JLIDecoder().inspect(data: data)
         _ = try? JLIDecoder().decode(from: data)
+    }
+
+    /// Decode at every supported reduced scale — the box-average (2/4) and DC-only
+    /// (8) paths must also throw, never trap, on malformed input.
+    private func probeScaled(_ data: [UInt8]) {
+        for s in [2, 4, 8] {
+            var cfg = JLIDecoderConfiguration.default; cfg.scale = s
+            _ = try? JLIDecoder().decode(from: data, configuration: cfg)
+        }
     }
 
     @Test("Truncation at every prefix length never crashes")
@@ -141,6 +163,46 @@ struct FuzzTests {
                 m[pos + 2] = hi
                 m[pos + 3] = lo
                 probe(m)
+            }
+        }
+    }
+
+    @Test("Malformed ICC/Exif metadata segments never crash")
+    func metadataMutations() throws {
+        let valid = try Self.validJPEGWithMetadata()
+        // Truncation through the (large) ICC segments stresses readSegmentBytes
+        // bounds and the chunk reassembler; sample lengths to keep it bounded.
+        for len in stride(from: 0, through: valid.count, by: 7) {
+            probe(Array(valid[0..<len]))
+        }
+        // Mutate only the marker/length/seq/count region near each APP segment
+        // header — the attacker-controlled fields — to dodge megabytes of work.
+        var i = 0
+        while i + 1 < min(valid.count, 4096) {
+            if valid[i] == 0xFF, valid[i + 1] == 0xE1 || valid[i + 1] == 0xE2 {
+                for off in 0..<min(20, valid.count - i) {
+                    for v: UInt8 in [0x00, 0xFF, 0x01, 0x80] {
+                        var m = valid; m[i + off] = v
+                        probe(m)
+                    }
+                }
+            }
+            i += 1
+        }
+    }
+
+    @Test("Scaled decode (1/2, 1/4, 1/8) never crashes on malformed input")
+    func scaledDecodeFuzz() throws {
+        let corpus = [try Self.validJPEG(), try Self.validGrayJPEG(bits: 8),
+                      try Self.validGrayJPEG(bits: 12)]
+        for valid in corpus {
+            for len in stride(from: 0, through: valid.count, by: 3) {
+                probeScaled(Array(valid[0..<len]))
+            }
+            var rng = SeededRNG(seed: 0xF00D_5CA1_ED00_1234)
+            for pos in stride(from: 0, to: valid.count, by: 5) {
+                var m = valid; m[pos] = UInt8.random(in: 0...255, using: &rng)
+                probeScaled(m)
             }
         }
     }
