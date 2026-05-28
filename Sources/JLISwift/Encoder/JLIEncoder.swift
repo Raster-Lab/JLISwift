@@ -30,6 +30,11 @@ public struct JLIEncoder: Sendable {
     /// without raising butteraugli at either end of the quality range.
     static let rdoLambdaK = 0.004
 
+    /// Blocks with more than this many nonzero AC coefficients skip the O(m²)
+    /// trellis DP (they're high-entropy — little to gain from dropping, and the
+    /// runtime cost is steep). Bounds worst-case encode time on noisy content.
+    static let trellisMaxNonzeros = 32
+
     /// Encodes an image to JPEG data using the jpegli algorithm.
     ///
     /// - Parameters:
@@ -434,7 +439,7 @@ public struct JLIEncoder: Sendable {
             dctBuf, invTable: invQuant, into: &quant, blockCount: n
         )
         if let rdo = rdo {
-            applyEOBOptimization(dctBuf: dctBuf, quant: &quant, blockCount: n, rdo: rdo)
+            applyTrellisQuantization(dctBuf: dctBuf, quant: &quant, blockCount: n, rdo: rdo)
         }
         return quant
     }
@@ -449,84 +454,104 @@ public struct JLIEncoder: Sendable {
         let lambda: Double
     }
 
-    /// EOB-optimization pass: for each block, choose the end-of-block position
-    /// that minimizes D + λ·R, zeroing trailing AC coefficients whose coded bits
-    /// cost more than the distortion they save. Only *removes* trailing
-    /// coefficients (never grows magnitudes or touches kept coefficients), so it
-    /// strictly reduces rate with bounded, controlled distortion — and can't
-    /// introduce ZRL penalties. This is the bounded core of trellis quantization;
-    /// mozjpeg's full trellis also reconsiders per-coefficient magnitudes.
-    private func applyEOBOptimization(
+    /// Trellis quantization (keep/drop): for each block, a Viterbi DP chooses
+    /// which nonzero AC coefficients to keep vs. force to zero, minimizing
+    /// D + λ·R — DCT-domain squared error (= pixel² by Parseval) against the
+    /// run-length-coded bits. Unlike a trailing-only EOB pass it can drop
+    /// *interior* coefficients (an isolated nonzero that costs a ZRL + symbol
+    /// but barely reduces distortion), merging the surrounding zero runs. The
+    /// EOB choice falls out as "which kept coefficient is last."
+    ///
+    /// Only ever zeros coefficients (never grows magnitudes or alters kept
+    /// values), so the kept coefficients' distortion is constant and drops out
+    /// of the objective — we minimize Σ(drop distortion) + λ·R. Output stays
+    /// standard baseline JPEG. Magnitude reduction (q→q−1) is a further trellis
+    /// refinement left for later.
+    ///
+    /// O(m²) per block in the number of nonzero AC coefficients m. High-entropy
+    /// blocks (m large) are capped to the cheaper EOB-only pass.
+    private func applyTrellisQuantization(
         dctBuf: [Float], quant: inout [Int32], blockCount: Int, rdo: RDOContext
     ) {
         let zz = Quantization.zigzagOrder
         let lambda = rdo.lambda
-        var zzCoeff = [Int32](repeating: 0, count: 64)  // quant in zigzag order
+        let eobLen = Int(rdo.acTable.encodingTable[0x00].length)
+        let zrlLen = Int(rdo.acTable.encodingTable[0xF0].length)
+
+        // Bits to emit a nonzero of category `size` after `run` preceding zeros.
+        func symbolBits(run: Int, size: Int) -> Int {
+            var bits = 0
+            var r = run
+            while r > 15 { bits += zrlLen; r -= 16 }
+            bits += Int(rdo.acTable.encodingTable[(r << 4) | size].length) + size
+            return bits
+        }
+
+        // Reused per-block scratch.
+        var nz = [Int](repeating: 0, count: 64)        // zigzag positions of nonzeros
+        var dropDist = [Double](repeating: 0, count: 64)
+        var sizeOf = [Int](repeating: 0, count: 64)
+        var cumDrop = [Double](repeating: 0, count: 65)
+        var dp = [Double](repeating: 0, count: 64)
+        var prev = [Int](repeating: -1, count: 64)
+        var keep = [Bool](repeating: false, count: 64)
 
         for b in 0..<blockCount {
             let base = b * 64
-            // Gather zigzag-ordered quantized AC coefficients and find last nonzero.
-            var lastNZ = 0
+            var m = 0
             for z in 1..<64 {
-                let v = quant[base + zz[z]]
-                zzCoeff[z] = v
-                if v != 0 { lastNZ = z }
-            }
-            if lastNZ == 0 { continue }  // all-AC-zero: nothing to truncate
-
-            // Walk candidate EOBs from lastNZ down to 0, accumulating the
-            // distortion added by dropping each trailing nonzero.
-            var dropDist = 0.0
-            var bestCost = Double.infinity
-            var bestEOB = lastNZ
-            var e = lastNZ
-            while e >= 0 {
-                let rate = Double(acBitLength(zzCoeff, lastIndex: e, table: rdo.acTable))
-                let cost = dropDist + lambda * rate
-                if cost < bestCost { bestCost = cost; bestEOB = e }
-                if e >= 1 {
-                    let nat = zz[e]
-                    let q = quant[base + nat]
-                    if q != 0 {
-                        let recon = Double(q) * Double(rdo.quantTable[nat])
-                        let c = Double(dctBuf[base + nat])
-                        // ΔD from forcing this coefficient to zero.
-                        dropDist += c * c - (c - recon) * (c - recon)
-                    }
+                let q = quant[base + zz[z]]
+                if q != 0 {
+                    let nat = zz[z]
+                    let recon = Double(q) * Double(rdo.quantTable[nat])
+                    let c = Double(dctBuf[base + nat])
+                    nz[m] = z
+                    dropDist[m] = c * c - (c - recon) * (c - recon)
+                    sizeOf[m] = HuffmanEncoder.category(for: q)
+                    m += 1
                 }
-                e -= 1
             }
-            // Zero everything past the chosen EOB.
-            if bestEOB < lastNZ {
-                for z in (bestEOB + 1)...lastNZ { quant[base + zz[z]] = 0 }
-            }
-        }
-    }
+            // High-entropy blocks (many nonzeros) have little to gain from
+            // dropping — the coefficients are mostly real signal — and the DP is
+            // O(m²). Skip them: they keep plain round-to-nearest.
+            if m == 0 || m > JLIEncoder.trellisMaxNonzeros { continue }
 
-    /// Bits to Huffman-code AC coefficients `zz[1...lastIndex]` (zigzag order)
-    /// plus the EOB symbol, using `table`'s code lengths + magnitude bits.
-    /// Used as the rate model in EOB optimization.
-    private func acBitLength(_ zz: [Int32], lastIndex: Int, table: HuffmanTable) -> Int {
-        var bits = 0
-        var run = 0
-        var i = 1
-        while i <= lastIndex {
-            let v = zz[i]
-            if v == 0 {
-                run += 1
-            } else {
-                while run > 15 {
-                    bits += Int(table.encodingTable[0xF0].length)  // ZRL
-                    run -= 16
+            cumDrop[0] = 0
+            for k in 0..<m { cumDrop[k + 1] = cumDrop[k] + dropDist[k] }
+
+            // dp[i] = min (Σ drop-dist + λ·rate) with nz[i] kept as last-so-far.
+            for i in 0..<m {
+                // j = -1 (no prior kept): drop nz[0..<i], run = nz[i]-1.
+                var best = cumDrop[i] + lambda * Double(symbolBits(run: nz[i] - 1, size: sizeOf[i]))
+                var bestPrev = -1
+                for j in 0..<i {
+                    let between = cumDrop[i] - cumDrop[j + 1]   // dropped nonzeros (j, i)
+                    let run = nz[i] - nz[j] - 1
+                    let cost = dp[j] + between
+                        + lambda * Double(symbolBits(run: run, size: sizeOf[i]))
+                    if cost < best { best = cost; bestPrev = j }
                 }
-                let size = HuffmanEncoder.category(for: v)
-                bits += Int(table.encodingTable[(run << 4) | size].length) + size
-                run = 0
+                dp[i] = best
+                prev[i] = bestPrev
             }
-            i += 1
+
+            // Pick last-kept coefficient (+ EOB unless it's at position 63), or
+            // keep nothing (drop all AC, emit only EOB).
+            var bestCost = cumDrop[m] + lambda * Double(eobLen)
+            var bestLast = -1
+            for i in 0..<m {
+                let afterDrop = cumDrop[m] - cumDrop[i + 1]
+                let eobCost = nz[i] < 63 ? lambda * Double(eobLen) : 0.0
+                let cost = dp[i] + afterDrop + eobCost
+                if cost < bestCost { bestCost = cost; bestLast = i }
+            }
+
+            // Backtrack the kept set; zero everything else.
+            for k in 0..<m { keep[k] = false }
+            var cur = bestLast
+            while cur >= 0 { keep[cur] = true; cur = prev[cur] }
+            for k in 0..<m where !keep[k] { quant[base + zz[nz[k]]] = 0 }
         }
-        if lastIndex < 63 { bits += Int(table.encodingTable[0x00].length) }  // EOB
-        return bits
     }
 
     /// Extracts `blocksH × blocksV` 8×8 blocks from a plane into a per-block-contig

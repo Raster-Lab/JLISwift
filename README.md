@@ -53,8 +53,8 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | `inspect()` — metadata parse without full decode | ✅ |
 | Accelerate `vDSP_mmul` DCT, `vDSP_vmul` quant, vectorized BT.601 color conversion | ✅ |
 | Round-trip + cross-codec tested (ImageIO, libjpeg-turbo, mozjpeg) on synthetic + DICOM | ✅ |
-| Rate-distortion EOB optimization (`adaptiveQuantization`, 8-bit, default on) | ✅ partial |
-| Full trellis quantization (per-coefficient magnitude reduction) | ❌ planned |
+| Trellis quantization — keep/drop (`adaptiveQuantization`, 8-bit, default on) | ✅ partial |
+| Trellis magnitude reduction (q→q−1 candidates) | ❌ planned |
 | 12-bit *color* / 16-bit / float32 input | ❌ planned (12-bit grayscale works; color path still assumes 8-bit BT.601) |
 | XYB color space JPEG | ❌ planned (XYB transform math exists, encoder doesn't emit XYB) |
 | Progressive (SOF2) encode/decode | ❌ planned (SOF2 header parses; no progressive entropy decode) |
@@ -75,19 +75,24 @@ On the DICOM corpus this matches libjpeg-turbo's `-optimize` byte-for-byte to wi
 | MR  | 22982 B | **16541 B** | 16581 B |
 | XA  | 35001 B | **27571 B** | 27719 B |
 
-### Rate-distortion EOB optimization
+### Trellis quantization (keep/drop)
 
-With `adaptiveQuantization` (default on, 8-bit only) the encoder runs an
-end-of-block rate-distortion pass: for each block it picks the EOB position that
-minimizes `D + λ·R` (DCT-domain squared error vs. coded bits, λ ∝ mean AC quant
-step²), zeroing trailing AC coefficients whose bits cost more than the
-distortion they save. It only removes trailing coefficients — never grows
-magnitudes — so output stays standard-compliant and can't introduce ZRL
-penalties. On the DICOM corpus it trims 0.3–14% with butteraugli flat or better
+With `adaptiveQuantization` (default on, 8-bit only) the encoder runs a Viterbi
+rate-distortion pass per block: it chooses which nonzero AC coefficients to keep
+vs. force to zero to minimize `D + λ·R` — DCT-domain squared error (= pixel² by
+Parseval) against run-length-coded bits, with λ ∝ mean AC quant step² so
+truncation stays gentle at high quality. It can drop *interior* coefficients
+(an isolated nonzero that costs a ZRL + symbol but barely reduces distortion),
+merging the surrounding runs; the EOB position falls out as "which kept
+coefficient is last." Only coefficients are zeroed (magnitudes never grow), so
+output stays standard baseline JPEG. The rate model uses the fixed Annex K table
+lengths, sidestepping the chicken-and-egg with optimized Huffman.
+
+On the DICOM corpus it trims 0.3–14.5% with butteraugli flat or better
 (validated via `--butteraugli`). 12-bit stays exact round-to-nearest (medical
-precision is not traded for bytes). This is the bounded core of trellis
-quantization; full trellis (per-coefficient magnitude reduction, ~30% like
-mozjpeg) is future work.
+precision is not traded for bytes). High-entropy blocks (>32 nonzero AC coeffs)
+skip the O(m²) DP. Per-coefficient magnitude reduction (q→q−1) — the rest of
+mozjpeg's ~30% — plugs into the same DP and is future work.
 The configuration fields `progressive`, `optimiseHuffman`, `adaptiveQuantization`, `distance`, and `colorSpace = .xyb` are present on `JLIEncoderConfiguration` but are not yet honored — they exist as the planned API surface.
 
 ## Encoder configuration
