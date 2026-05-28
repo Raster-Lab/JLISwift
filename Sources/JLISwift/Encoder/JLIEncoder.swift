@@ -497,6 +497,10 @@ public struct JLIEncoder: Sendable {
         guard (1...7).contains(predictor) else {
             throw JLIError.unsupportedJPEGFeature("lossless predictor \(predictor) (1–7)")
         }
+        let pt = configuration.losslessPointTransform           // 0 = true lossless
+        guard (0..<precision).contains(pt) else {
+            throw JLIError.unsupportedJPEGFeature("lossless point transform \(pt) (0–\(precision - 1))")
+        }
         if !isGrayscale {
             guard image.colorModel == .rgb || image.colorModel == .rgba else {
                 throw JLIError.unsupportedColorSpaceConversion(
@@ -508,17 +512,21 @@ public struct JLIEncoder: Sendable {
         let srcCC = image.colorModel.componentCount     // 1 / 3 / 4 (alpha ignored)
         let bps = precision == 8 ? 1 : 2
 
-        // De-interleave source into per-component planes (Int32 samples).
+        // De-interleave source into per-component planes (Int32 samples). For
+        // near-lossless (pt > 0) the point transform discards the low `pt` bits up
+        // front; prediction, differencing and reconstruction then all operate in
+        // this shifted domain, and the decoder shifts back by `pt` on output.
         var planes = [[Int32]](repeating: [Int32](repeating: 0, count: w * h), count: nc)
         for i in 0..<(w * h) {
             for c in 0..<nc {
                 let s = (i * srcCC + c) * bps
-                planes[c][i] = bps == 1 ? Int32(image.data[s])
+                let sample = bps == 1 ? Int32(image.data[s])
                     : Int32(UInt16(image.data[s]) | (UInt16(image.data[s + 1]) << 8))
+                planes[c][i] = sample >> pt
             }
         }
 
-        let half = Int32(1 << (precision - 1))
+        let half = Int32(1 << (precision - 1 - pt))
         func predict(_ p: [Int32], _ x: Int, _ y: Int) -> Int32 {
             let row = y * w
             if x == 0 { return y == 0 ? half : p[row - w] }                   // Rb / initial
@@ -566,7 +574,7 @@ public struct JLIEncoder: Sendable {
         mw.writeDHT(tables: [(0, 0, table.bits, table.values)])
         mw.writeSOS(components: comps.map { (selector: $0.id, dcTableId: 0, acTableId: 0) },
                     spectralStart: predictor, spectralEnd: 0,
-                    successiveApproxHigh: 0, successiveApproxLow: 0)
+                    successiveApproxHigh: 0, successiveApproxLow: pt)
 
         var bw = BitWriter(estimatedMaxSize: w * h * nc * 2 + 1024)
         for y in 0..<h {

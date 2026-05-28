@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-28 (lossless SOF3 complete incl. 16-bit precision)._
+_Last updated: 2026-05-28 (lossless SOF3 complete incl. 16-bit precision + near-lossless point transform)._
 
 ## Completed
 
@@ -34,7 +34,8 @@ _Last updated: 2026-05-28 (lossless SOF3 complete incl. 16-bit precision)._
 - [x] **Lossless JPEG (SOF3)** — true lossless (predictive, no DCT/quant), the medical-archival item
   - grayscale + RGB color (stored direct, Adobe APP14 transform=0), predictors 1–7
   - **8 / 12 / 16-bit precision** (`losslessPrecision`; 16-bit for 16-bit medical sources)
-  - bit-exact, cross-validated vs libjpeg-turbo both directions (we read theirs; djpeg reads ours)
+  - **near-lossless** via point transform (`losslessPointTransform`; bounded error 2^Pt−1, smaller files)
+  - bit-exact (and bounded-exact for near-lossless), cross-validated vs libjpeg-turbo both directions (we read theirs; djpeg reads ours)
 
 ### Large efforts (high value, but multi-stage)
 - [ ] **jpegli-style quantizer** · quality / jpegli-parity · large — jpegli computes tables from a perceptual model per distance (not a matrix swap); butteraugli-gated, uncertain payoff without XYB

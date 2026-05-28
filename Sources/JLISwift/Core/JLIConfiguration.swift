@@ -98,6 +98,13 @@ public struct JLIEncoderConfiguration: Sendable {
     /// input. Ignored unless `lossless` is set; DCT modes always use 8/12-bit.
     public var losslessPrecision: Int
 
+    /// Point transform for **near-lossless** SOF3 encoding (0–`precision-1`;
+    /// default `0` = true lossless). When `> 0`, the low `Pt` bits of each sample
+    /// are discarded before prediction, bounding the reconstruction error to
+    /// `2^Pt − 1` while shrinking the file — a controlled-loss archival tradeoff.
+    /// Ignored unless `lossless` is set.
+    public var losslessPointTransform: Int
+
     /// Whether to use optimised Huffman coding.
     public var optimiseHuffman: Bool
 
@@ -123,6 +130,7 @@ public struct JLIEncoderConfiguration: Sendable {
         lossless: false,
         losslessPredictor: 1,
         losslessPrecision: 0,
+        losslessPointTransform: 0,
         optimiseHuffman: true,
         adaptiveQuantization: true
     )
@@ -148,6 +156,7 @@ public struct JLIEncoderConfiguration: Sendable {
         lossless: Bool = false,
         losslessPredictor: Int = 1,
         losslessPrecision: Int = 0,
+        losslessPointTransform: Int = 0,
         optimiseHuffman: Bool = true,
         adaptiveQuantization: Bool = true
     ) {
@@ -161,6 +170,7 @@ public struct JLIEncoderConfiguration: Sendable {
         self.lossless = lossless
         self.losslessPredictor = losslessPredictor
         self.losslessPrecision = losslessPrecision
+        self.losslessPointTransform = losslessPointTransform
         self.optimiseHuffman = optimiseHuffman
         self.adaptiveQuantization = adaptiveQuantization
     }

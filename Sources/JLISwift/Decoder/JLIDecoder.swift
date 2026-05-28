@@ -476,7 +476,9 @@ public struct JLIDecoder: Sendable {
                     if cat == 0 { diff = 0 }
                     else if cat == 16 { diff = -32768 }               // T.81 special case
                     else { diff = try HuffmanDecoder.decodeValue(from: &reader, category: cat) }
-                    planes[c][row + x] = (px + (diff << pt)) & mask
+                    // Prediction & differencing happen entirely in the point-transformed
+                    // (Pt-right-shifted) domain; the inverse shift is applied at output.
+                    planes[c][row + x] = (px + diff) & mask
                 }
             }
         }
@@ -486,7 +488,7 @@ public struct JLIDecoder: Sendable {
         let count = w * h
         if precision <= 8 {
             var bytes = [UInt8](repeating: 0, count: count * nc)
-            for i in 0..<count { for c in 0..<nc { bytes[i * nc + c] = UInt8(clamping: Int(planes[c][i])) } }
+            for i in 0..<count { for c in 0..<nc { bytes[i * nc + c] = UInt8(clamping: Int(planes[c][i]) << pt) } }
             return try JLIImage(width: w, height: h,
                                 pixelFormat: configuration.outputPixelFormat ?? .uint8,
                                 colorModel: model, data: bytes)
@@ -494,7 +496,7 @@ public struct JLIDecoder: Sendable {
         var bytes = [UInt8](repeating: 0, count: count * nc * 2)
         for i in 0..<count {
             for c in 0..<nc {
-                let v = UInt16(clamping: Int(planes[c][i]))
+                let v = UInt16(clamping: Int(planes[c][i]) << pt)
                 bytes[(i * nc + c) * 2] = UInt8(v & 0xFF)
                 bytes[(i * nc + c) * 2 + 1] = UInt8(v >> 8)
             }
