@@ -646,6 +646,12 @@ public struct JLIEncoder: Sendable {
                 throw JLIError.invalidDistance(distance)
             }
         }
+        // The DRI restart interval is a 16-bit field; reject out-of-range values
+        // cleanly rather than overflowing UInt16 when the marker is written.
+        guard (0...65535).contains(configuration.restartInterval) else {
+            throw JLIError.unsupportedJPEGFeature(
+                "restartInterval \(configuration.restartInterval) (must be 0…65535)")
+        }
     }
 
     /// Extract every 8×8 block from a component plane → batched forward DCT +
