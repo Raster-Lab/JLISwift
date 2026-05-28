@@ -368,6 +368,62 @@ struct EncoderDecoderTests {
         #expect(maxErr <= 48, "max 12-bit color error \(maxErr) exceeds tolerance")
     }
 
+    // MARK: - Restart markers
+
+    @Test("Restart markers round-trip identically to no-restart and emit DRI + RSTn")
+    func restartMarkers() throws {
+        let w = 48, h = 40   // 4:2:0 → 3×3 = 9 MCUs
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 3
+                rgb[i] = UInt8((x * 5) & 0xFF)
+                rgb[i + 1] = UInt8((y * 7) & 0xFF)
+                rgb[i + 2] = UInt8(((x + y) * 3) & 0xFF)
+            }
+        }
+        let image = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
+
+        var base = JLIEncoderConfiguration.default
+        base.progressive = false; base.chromaSubsampling = .yuv420; base.restartInterval = 0
+        var rst = base; rst.restartInterval = 3
+
+        let baseJPEG = try JLIEncoder().encode(image, configuration: base)
+        let rstJPEG = try JLIEncoder().encode(image, configuration: rst)
+
+        // Count RSTn markers in the entropy segment (after SOS, where 0xFF is only
+        // ever followed by 0x00 stuffing or 0xD0–0xD7 restart).
+        func sos(_ d: [UInt8]) -> Int {
+            var i = 2; while i < d.count - 1 { if d[i] == 0xFF && d[i + 1] == 0xDA { return i }; i += 1 }; return d.count
+        }
+        func rstCount(_ d: [UInt8]) -> Int {
+            var n = 0; var i = sos(d) + 2
+            while i < d.count - 1 {
+                if d[i] == 0xFF && (0xD0...0xD7).contains(d[i + 1]) { n += 1; i += 2 } else { i += 1 }
+            }
+            return n
+        }
+        func hasDRI(_ d: [UInt8]) -> Bool {
+            var i = 2; while i < d.count - 1 { if d[i] == 0xFF && d[i + 1] == 0xDD { return true }; i += 1 }; return false
+        }
+
+        // RST fires before MCU 3 and MCU 6 → exactly 2 markers; baseline has none.
+        #expect(rstCount(rstJPEG) == 2, "expected 2 RST markers, got \(rstCount(rstJPEG))")
+        #expect(hasDRI(rstJPEG))
+        #expect(rstCount(baseJPEG) == 0 && !hasDRI(baseJPEG))
+        #expect(rstJPEG.count > baseJPEG.count)
+
+        // Restart markers don't change the image — decode must be pixel-identical.
+        let baseDec = try JLIDecoder().decode(from: baseJPEG)
+        let rstDec = try JLIDecoder().decode(from: rstJPEG)
+        #expect(rstDec.width == w && rstDec.height == h)
+        var maxDiff = 0
+        for i in 0..<min(baseDec.data.count, rstDec.data.count) {
+            maxDiff = max(maxDiff, abs(Int(baseDec.data[i]) - Int(rstDec.data[i])))
+        }
+        #expect(maxDiff == 0, "restart vs no-restart decode differ by \(maxDiff)")
+    }
+
     // MARK: - Distance parameter
 
     @Test("Larger distance produces smaller output (monotonic rate)")

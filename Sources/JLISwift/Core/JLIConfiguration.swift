@@ -76,6 +76,13 @@ public struct JLIEncoderConfiguration: Sendable {
     /// compresses flat / medical content best.
     public var progressiveMode: JLIProgressiveMode
 
+    /// Emit a restart marker (RST) every N MCUs, with a DRI marker declaring the
+    /// interval. `0` (default) disables restart markers. Restart markers add
+    /// resync points so a corrupt run only damages one interval rather than the
+    /// rest of the scan, and enable segmented decoding — at a small size cost.
+    /// Applies to the baseline / extended-sequential path (not progressive).
+    public var restartInterval: Int
+
     /// Whether to use optimised Huffman coding.
     public var optimiseHuffman: Bool
 
@@ -97,6 +104,7 @@ public struct JLIEncoderConfiguration: Sendable {
         colorSpace: .yCbCr,
         progressive: false,
         progressiveMode: .spectralSelection,
+        restartInterval: 0,
         optimiseHuffman: true,
         adaptiveQuantization: true
     )
@@ -118,6 +126,7 @@ public struct JLIEncoderConfiguration: Sendable {
         colorSpace: JLIEncodingColorSpace = .yCbCr,
         progressive: Bool = true,
         progressiveMode: JLIProgressiveMode = .spectralSelection,
+        restartInterval: Int = 0,
         optimiseHuffman: Bool = true,
         adaptiveQuantization: Bool = true
     ) {
@@ -127,6 +136,7 @@ public struct JLIEncoderConfiguration: Sendable {
         self.colorSpace = colorSpace
         self.progressive = progressive
         self.progressiveMode = progressiveMode
+        self.restartInterval = restartInterval
         self.optimiseHuffman = optimiseHuffman
         self.adaptiveQuantization = adaptiveQuantization
     }

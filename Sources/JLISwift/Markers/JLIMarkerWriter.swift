@@ -199,6 +199,15 @@ struct MarkerWriter {
         data.append(UInt8((successiveApproxHigh << 4) | (successiveApproxLow & 0x0F)))
     }
 
+    /// Writes a DRI (Define Restart Interval) marker: restart every `interval`
+    /// MCUs. `interval` 0 conventionally means "no restart markers".
+    mutating func writeDRI(interval: Int) {
+        data.append(JPEGMarker.prefix)
+        data.append(JPEGMarker.dri)
+        writeUInt16(4)                       // segment length
+        writeUInt16(UInt16(interval))
+    }
+
     /// Appends raw entropy-coded data (already byte-stuffed).
     mutating func writeEntropyData(_ entropyData: [UInt8]) {
         data.append(contentsOf: entropyData)

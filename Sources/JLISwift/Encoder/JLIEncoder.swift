@@ -328,9 +328,19 @@ public struct JLIEncoder: Sendable {
             var acChrFreq = [Int](repeating: 0, count: 256)
             var prevDC = [Int32](repeating: 0, count: numComponents)
             var zigzagBuf = [Int32](repeating: 0, count: 64)
+            // Restart resets DC predictors mid-scan; the counting pass must reset
+            // at the same boundaries as the emit pass, or the optimal Huffman
+            // table is built for the wrong DC-diff distribution and may lack codes
+            // for the large post-reset diffs the emit pass produces.
+            var countMCU = 0
 
             for mcuY in 0..<mcuCountV {
                 for mcuX in 0..<mcuCountH {
+                    if configuration.restartInterval > 0 && countMCU > 0
+                        && countMCU % configuration.restartInterval == 0 {
+                        for i in 0..<numComponents { prevDC[i] = 0 }
+                    }
+                    countMCU += 1
                     for by in 0..<vMax {
                         for bx in 0..<hMax {
                             let yIdx = (mcuY * vMax + by) * yBlocksPerRow + (mcuX * hMax + bx)
@@ -376,9 +386,20 @@ public struct JLIEncoder: Sendable {
         var bitWriter = BitWriter(estimatedMaxSize: width * height * 3 + 4096)
         var prevDC = [Int32](repeating: 0, count: numComponents)
         var zigzagBuf = [Int32](repeating: 0, count: 64)
+        let restartInterval = configuration.restartInterval
+        var mcuCount = 0
+        var restartIndex = 0
 
         for mcuY in 0..<mcuCountV {
             for mcuX in 0..<mcuCountH {
+                // Emit RSTn every `restartInterval` MCUs and reset DC predictors —
+                // the exact inverse of the decoder's restart handling.
+                if restartInterval > 0 && mcuCount > 0 && mcuCount % restartInterval == 0 {
+                    bitWriter.emitRestartMarker(restartIndex)
+                    restartIndex = (restartIndex + 1) & 7
+                    for i in 0..<numComponents { prevDC[i] = 0 }
+                }
+                mcuCount += 1
                 for by in 0..<vMax {
                     for bx in 0..<hMax {
                         let yIdx = (mcuY * vMax + by) * yBlocksPerRow + (mcuX * hMax + bx)
@@ -422,6 +443,11 @@ public struct JLIEncoder: Sendable {
             dhtTables.append((1, 1, acChrTable.bits, acChrTable.values))
         }
         mw.writeDHT(tables: dhtTables)
+
+        // DRI (define restart interval) before the scan, when restart is enabled.
+        if restartInterval > 0 {
+            mw.writeDRI(interval: restartInterval)
+        }
 
         // SOS + entropy data
         if isGrayscale {

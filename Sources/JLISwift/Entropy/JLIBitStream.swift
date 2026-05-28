@@ -79,6 +79,19 @@ struct BitWriter {
         nbits = 0
     }
 
+    /// Pads to a byte boundary (1-bits, per spec) and writes a restart marker
+    /// `0xFF 0xD0…0xD7` (`index` cycles 0–7). The marker bytes are written raw —
+    /// the `0xFF` here is a real marker prefix, not stuffed data.
+    mutating func emitRestartMarker(_ index: Int) {
+        flush()                       // align to byte boundary (no-op if already aligned)
+        if byteCount + 2 > buffer.count { grow() }
+        buffer.withUnsafeMutableBufferPointer { buf in
+            buf[byteCount] = 0xFF
+            buf[byteCount + 1] = 0xD0 + UInt8(index & 7)
+        }
+        byteCount += 2
+    }
+
     /// Doubles the backing buffer when the initial estimate was too small.
     /// Allocating in chunks keeps the amortized cost ~O(1) per byte.
     private mutating func grow() {
