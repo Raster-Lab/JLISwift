@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decode; multi-threaded trellis; jpegli perceptual quantizer; ICC/Exif metadata; progressive+restart)._
+_Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decode; multi-threaded trellis + AC-count; jpegli perceptual quantizer; ICC/Exif metadata; progressive+restart; restartInterval validation; new-path fuzzing). All large/marginal items done — only deferred-risky + release remain._
 
 ## Completed
 
@@ -26,9 +26,14 @@ _Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decod
 
 ## Remaining
 
-> Honest status: the easy, high-confidence wins are done. What's left is either a
-> **large effort** (its own mini-project) or **marginal/niche/risky**. Pick
-> deliberately — or proceed to release.
+> Honest status (2026-05-28): **every large-effort and marginal/niche item below
+> is now done and CI-green** — lossless+near-lossless, jpegli perceptual
+> quantizer, 1/2 & 1/4 scaled decode, ICC/Exif metadata, progressive+restart,
+> multi-threaded encode. What remains is only the **Deferred** tier (genuinely
+> risky / unvalidatable without a reference — best left for a supervised session),
+> `float32` *input* (needs an API decision on what range it represents), and
+> **Tier 4 release**. The codec is feature-complete; next deliberate step is
+> release prep when you're ready.
 
 ### Completed large efforts
 - [x] **Lossless JPEG (SOF3)** — true lossless (predictive, no DCT/quant), the medical-archival item
