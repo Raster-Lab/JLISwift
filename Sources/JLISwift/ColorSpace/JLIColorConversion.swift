@@ -56,6 +56,25 @@ enum ColorConversion {
         )
     }
 
+    /// 12-bit color: converts interleaved little-endian UInt16 RGB(A) to Y/Cb/Cr
+    /// planes, with chroma centered at `center` (2^(P-1)).
+    static func imageRGB16ToYCbCr(data: [UInt8], width: Int, height: Int,
+                                  componentCount: Int, center: Float)
+        -> (y: [Float], cb: [Float], cr: [Float]) {
+        return AccelerateDSP.imageRGB16ToYCbCr(
+            data: data, pixelCount: width * height, componentCount: componentCount, center: center
+        )
+    }
+
+    /// 12-bit color: converts Y/Cb/Cr planes back to interleaved little-endian
+    /// UInt16 RGB, de-centering chroma at `center` and clamping to `0...maxValue`.
+    static func imageYCbCr16ToRGB(y: [Float], cb: [Float], cr: [Float],
+                                  width: Int, height: Int, center: Float, maxValue: Float) -> [UInt8] {
+        return AccelerateDSP.imageYCbCr16ToRGB(
+            y: y, cb: cb, cr: cr, pixelCount: width * height, center: center, maxValue: maxValue
+        )
+    }
+
     /// Converts a grayscale image buffer to a luminance plane.
     static func imageGrayscaleToY(data: [UInt8], width: Int, height: Int) -> [Float] {
         return data.map { Float($0) }

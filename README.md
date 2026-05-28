@@ -6,7 +6,7 @@ A native-Swift JPEG codec for Apple platforms, with Accelerate-backed DSP.
 [![Platforms](https://img.shields.io/badge/Platforms-macOS%20|%20iOS%20|%20tvOS%20|%20watchOS%20|%20visionOS-blue.svg)](#platform-support)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 
-> **Status:** experimental, pre-1.0, Apple-only. JLISwift is a pure-Swift JPEG codec (Accelerate-backed DSP) that encodes and decodes **baseline (SOF0)**, **extended-sequential (SOF1, 12-bit)**, and **progressive (SOF2)** JPEG, with **optimized per-image Huffman tables**, **trellis (rate-distortion) quantization**, and **jpegli/JPEG-XL distance-driven quality**. It targets feature parity with Google's [jpegli](https://github.com/google/jpegli); the main features still missing are **XYB color JPEG** and **12-bit color** (12-bit grayscale works). See [What's actually implemented](#whats-actually-implemented) for the full matrix.
+> **Status:** experimental, pre-1.0, Apple-only. JLISwift is a pure-Swift JPEG codec (Accelerate-backed DSP) that encodes and decodes **baseline (SOF0)**, **extended-sequential (SOF1, 12-bit)**, and **progressive (SOF2)** JPEG, with **optimized per-image Huffman tables**, **trellis (rate-distortion) quantization**, and **jpegli/JPEG-XL distance-driven quality**. It targets feature parity with Google's [jpegli](https://github.com/google/jpegli); the main feature still missing is **XYB color JPEG**. See [What's actually implemented](#whats-actually-implemented) for the full matrix.
 
 ## Quick start
 
@@ -49,6 +49,7 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | Distance parameter (jpegli/JXL convention; maps to IJG quality) | ✅ |
 | RGB / RGBA / grayscale / pre-converted YCbCr input (8-bit) | ✅ |
 | **12-bit grayscale** encode + decode (`.uint16` → SOF1 precision-12 JPEG) | ✅ |
+| **12-bit color** encode + decode (`.uint16` RGB ↔ SOF1 precision-12 YCbCr) | ✅ |
 | SOF1 (extended sequential) decode — reads 12-bit JPEGs from libjpeg/ImageIO | ✅ |
 | **Progressive (SOF2) decode** — multi-scan, spectral selection, successive approximation | ✅ |
 | **Progressive (SOF2) encode** — spectral-selection *and* successive-approximation scan scripts (`progressive` + `progressiveMode`, opt-in) | ✅ |
@@ -56,7 +57,7 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | Accelerate `vDSP_mmul` DCT, `vDSP_vmul` quant, vectorized BT.601 color conversion | ✅ |
 | Round-trip + cross-codec tested (ImageIO, libjpeg-turbo, mozjpeg) on synthetic + DICOM | ✅ |
 | Trellis quantization — keep/drop + HF magnitude reduction (`adaptiveQuantization`, 8-bit, default on) | ✅ |
-| 12-bit *color* / 16-bit / float32 input | ❌ planned (12-bit grayscale works; color path still assumes 8-bit BT.601) |
+| 16-bit / float32 input | ❌ planned (8- and 12-bit integer paths work) |
 | XYB color space JPEG | ❌ planned (XYB transform math exists, encoder doesn't emit XYB) |
 | Metal GPU pipeline | ⚠️ kernels compile but are not wired into encode/decode |
 
@@ -191,7 +192,7 @@ Sources/JLIBench/
 ├── Harness.swift         Median-of-N timing, PSNR, self/cross runners
 └── main.swift            CLI: synthetic + DICOM modes, regression flags
 
-Tests/JLISwiftTests/      107 tests across 8 suites (Swift Testing framework)
+Tests/JLISwiftTests/      116 tests across 10 suites (Swift Testing framework)
 ```
 
 ## Bench: cross-codec + regression
@@ -263,10 +264,10 @@ Next-up candidates (rough order):
 Remaining:
 
 1. **XYB color-space encoding** — perceptual color space from JPEG XL; the transform math exists but the encoder doesn't emit XYB JPEGs.
-2. **12-bit color** — extend the YCbCr path to 12-bit (12-bit grayscale works; color still assumes 8-bit BT.601). Low priority — clinical corpora are grayscale.
+2. **16-bit / float32 input** — wider source formats (8- and 12-bit integer paths work).
 3. **Metal hot path** — actually invoke the existing `JLIMetalPipeline` kernels (marginal over the Accelerate CPU path).
 
-Done since 0.1 — all cross-validated against libjpeg-turbo, mozjpeg, and ImageIO with PSNR + butteraugli, regression-tracked: spec-compliance fixes (byte-unstuffing, DRI/RST, SOF1), Accelerate-backed batched DCT, **optimized Huffman tables** (≈ libjpeg-turbo `-optimize`), **12-bit grayscale** encode/decode, **distance parameter**, **trellis quantization** (keep/drop + HF magnitude reduction), and **progressive (SOF2) decode and encode** (spectral selection + successive approximation).
+Done since 0.1 — all cross-validated against libjpeg-turbo, mozjpeg, and ImageIO with PSNR + butteraugli, regression-tracked: spec-compliance fixes (byte-unstuffing, DRI/RST, SOF1), Accelerate-backed batched DCT, **optimized Huffman tables** (≈ libjpeg-turbo `-optimize`), **12-bit grayscale and color** encode/decode, **distance parameter**, **trellis quantization** (keep/drop + HF magnitude reduction), **progressive (SOF2) decode and encode** (spectral selection + successive approximation), and **fuzz-hardened decoding** (throws, never traps, on malformed input).
 
 ## Requirements
 

@@ -328,6 +328,46 @@ struct EncoderDecoderTests {
         #expect(maxErr <= 40, "max 12-bit error \(maxErr) exceeds tolerance")
     }
 
+    @Test("12-bit color round-trips and outputs uint16 RGB")
+    func twelveBitColorRoundTrip() throws {
+        let w = 32, h = 32
+        // Independent smooth 12-bit ramps per channel.
+        var samples = [UInt16](repeating: 0, count: w * h * 3)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 3
+                samples[i]     = UInt16(x * 4095 / (w - 1))
+                samples[i + 1] = UInt16(y * 4095 / (h - 1))
+                samples[i + 2] = UInt16((x + y) * 4095 / (w + h - 2))
+            }
+        }
+        let image = try JLIImage(
+            width: w, height: h, pixelFormat: .uint16, colorModel: .rgb,
+            data: packLE16(samples)
+        )
+        var config = JLIEncoderConfiguration.default
+        config.quality = 95
+        config.chromaSubsampling = .yuv444   // no chroma loss, isolate precision
+
+        let jpeg = try JLIEncoder().encode(image, configuration: config)
+        let info = try JLIDecoder().inspect(data: jpeg)
+        #expect(info.bitsPerComponent == 12)
+        #expect(info.componentCount == 3)
+
+        let decoded = try JLIDecoder().decode(from: jpeg)
+        #expect(decoded.pixelFormat == .uint16)
+        #expect(decoded.colorModel == .rgb)
+        #expect(decoded.width == w && decoded.height == h)
+
+        let out = unpackLE16(decoded.data)
+        #expect(out.count == samples.count)
+        // 12-bit uses the standard (8-bit-range) quant tables, so coefficients are
+        // barely quantized → near-lossless. Allow color-conversion + quant rounding.
+        var maxErr = 0
+        for i in 0..<out.count { maxErr = max(maxErr, abs(Int(out[i]) - Int(samples[i]))) }
+        #expect(maxErr <= 48, "max 12-bit color error \(maxErr) exceeds tolerance")
+    }
+
     // MARK: - Distance parameter
 
     @Test("Larger distance produces smaller output (monotonic rate)")

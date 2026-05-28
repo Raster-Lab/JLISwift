@@ -282,9 +282,9 @@ public struct JLIDecoder: Sendable {
         // Step 8: Chroma upsample and color convert
         let outputData: [UInt8]
         let outputColorModel: JLIColorModel
-        // 12-bit grayscale decodes to a uint16 buffer (little-endian samples);
-        // 8-bit stays uint8. Color is always 8-bit today.
-        let isExtendedPrecision = numComponents == 1 && frame.precision > 8
+        // 12-bit (grayscale or color) decodes to a uint16 buffer (little-endian
+        // samples); 8-bit stays uint8.
+        let isExtendedPrecision = frame.precision > 8
 
         if numComponents == 1 {
             // Grayscale
@@ -333,10 +333,21 @@ public struct JLIDecoder: Sendable {
                 yTrimmed = yPlane.data
             }
 
-            outputData = ColorConversion.imageYCbCrToRGB(
-                y: yTrimmed, cb: cbUp, cr: crUp,
-                width: frame.width, height: frame.height
-            )
+            if isExtendedPrecision {
+                // 12-bit color → little-endian UInt16 RGB. Planes are already
+                // reconstructed in 0...2^P-1 with chroma centered at 2^(P-1).
+                outputData = ColorConversion.imageYCbCr16ToRGB(
+                    y: yTrimmed, cb: cbUp, cr: crUp,
+                    width: frame.width, height: frame.height,
+                    center: Float(1 << (frame.precision - 1)),
+                    maxValue: Float((1 << frame.precision) - 1)
+                )
+            } else {
+                outputData = ColorConversion.imageYCbCrToRGB(
+                    y: yTrimmed, cb: cbUp, cr: crUp,
+                    width: frame.width, height: frame.height
+                )
+            }
             outputColorModel = configuration.outputColorModel ?? .rgb
         }
 
@@ -382,9 +393,6 @@ public struct JLIDecoder: Sendable {
         guard frame.precision == 8 || frame.precision == 12 else {
             throw JLIError.unsupportedJPEGFeature(
                 "sample precision \(frame.precision) (only 8 and 12 supported)")
-        }
-        guard frame.precision == 8 || frame.components.count == 1 else {
-            throw JLIError.unsupportedJPEGFeature("12-bit color JPEG (12-bit is grayscale-only)")
         }
         // Dimensions: positive and within the 16-bit SOF field range. Zero width
         // or height would divide by zero when computing the MCU grid.

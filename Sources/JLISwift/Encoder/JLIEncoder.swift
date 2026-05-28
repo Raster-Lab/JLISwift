@@ -86,9 +86,11 @@ public struct JLIEncoder: Sendable {
         let isGrayscale = image.colorModel == .grayscale
             || configuration.chromaSubsampling == .yuv400
 
-        if precision > 8 && !isGrayscale {
+        // 12-bit color is supported for RGB/RGBA input. Pre-converted 12-bit
+        // YCbCr input isn't — the direct-extract path below assumes 8-bit samples.
+        if precision > 8 && !isGrayscale && image.colorModel == .yCbCr {
             throw JLIError.unsupportedColorSpaceConversion(
-                from: "\(precision)-bit \(image.colorModel)", to: "12-bit JPEG (grayscale only)"
+                from: "12-bit pre-converted YCbCr", to: "JPEG (use RGB/RGBA input for 12-bit color)"
             )
         }
 
@@ -145,6 +147,16 @@ public struct JLIEncoder: Sendable {
                     cr[i] = Float(image.data[i * cc + 2])
                 }
                 yPlane = y; cbPlane = cb; crPlane = cr
+            } else if precision == 12 {
+                // 12-bit color: little-endian UInt16 RGB(A), chroma centered at
+                // the level-shift value (2^(P-1) = 2048).
+                let planes = ColorConversion.imageRGB16ToYCbCr(
+                    data: image.data, width: width, height: height,
+                    componentCount: image.colorModel.componentCount, center: levelShift
+                )
+                yPlane = planes.y
+                cbPlane = planes.cb
+                crPlane = planes.cr
             } else {
                 let planes = ColorConversion.imageRGBToYCbCr(
                     data: image.data, width: width, height: height,

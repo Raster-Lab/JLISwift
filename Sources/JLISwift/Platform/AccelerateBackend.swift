@@ -310,6 +310,102 @@ enum AccelerateDSP {
         return rgb
     }
 
+    // MARK: - 16-bit (12-bit precision) color conversion
+    //
+    // Separate from the 8-bit path above so that path stays bit-identical. Input
+    // and output samples are little-endian UInt16; `center` is the chroma offset
+    // 2^(P-1) (2048 for 12-bit) and `maxValue` is 2^P-1 (4095). The BT.601 matrix
+    // is the same — only the sample range and IO width differ.
+
+    /// Converts interleaved little-endian UInt16 RGB(A) to planar Y/Cb/Cr planes.
+    static func imageRGB16ToYCbCr(
+        data: [UInt8], pixelCount: Int, componentCount: Int, center: Float
+    ) -> (y: [Float], cb: [Float], cr: [Float]) {
+        precondition(componentCount == 3 || componentCount == 4)
+        precondition(data.count >= pixelCount * componentCount * 2)
+
+        var r = [Float](repeating: 0, count: pixelCount)
+        var g = [Float](repeating: 0, count: pixelCount)
+        var b = [Float](repeating: 0, count: pixelCount)
+        // Scalar little-endian deinterleave — UInt8 storage isn't UInt16-aligned.
+        for i in 0..<pixelCount {
+            let p = i * componentCount * 2
+            r[i] = Float(UInt16(data[p])     | (UInt16(data[p + 1]) << 8))
+            g[i] = Float(UInt16(data[p + 2]) | (UInt16(data[p + 3]) << 8))
+            b[i] = Float(UInt16(data[p + 4]) | (UInt16(data[p + 5]) << 8))
+        }
+
+        var y = [Float](repeating: 0, count: pixelCount)
+        var cb = [Float](repeating: 0, count: pixelCount)
+        var cr = [Float](repeating: 0, count: pixelCount)
+        let n = vDSP_Length(pixelCount)
+
+        var yR: Float = 0.299, yG: Float = 0.587, yB: Float = 0.114
+        vDSP_vsmul(r, 1, &yR, &y, 1, n)
+        vDSP_vsma(g, 1, &yG, y, 1, &y, 1, n)
+        vDSP_vsma(b, 1, &yB, y, 1, &y, 1, n)
+
+        var cbR: Float = -0.168736, cbG: Float = -0.331264, cbB: Float = 0.5
+        var ctr = center
+        vDSP_vsmul(r, 1, &cbR, &cb, 1, n)
+        vDSP_vsma(g, 1, &cbG, cb, 1, &cb, 1, n)
+        vDSP_vsma(b, 1, &cbB, cb, 1, &cb, 1, n)
+        vDSP_vsadd(cb, 1, &ctr, &cb, 1, n)
+
+        var crR: Float = 0.5, crG: Float = -0.418688, crB: Float = -0.081312
+        vDSP_vsmul(r, 1, &crR, &cr, 1, n)
+        vDSP_vsma(g, 1, &crG, cr, 1, &cr, 1, n)
+        vDSP_vsma(b, 1, &crB, cr, 1, &cr, 1, n)
+        vDSP_vsadd(cr, 1, &ctr, &cr, 1, n)
+
+        return (y, cb, cr)
+    }
+
+    /// Converts planar Y/Cb/Cr back to interleaved little-endian UInt16 RGB,
+    /// de-centering chroma at `center` and clamping to `0...maxValue`.
+    static func imageYCbCr16ToRGB(
+        y: [Float], cb: [Float], cr: [Float], pixelCount: Int, center: Float, maxValue: Float
+    ) -> [UInt8] {
+        precondition(y.count == pixelCount && cb.count == pixelCount && cr.count == pixelCount)
+        let n = vDSP_Length(pixelCount)
+
+        var cbS = [Float](repeating: 0, count: pixelCount)
+        var crS = [Float](repeating: 0, count: pixelCount)
+        var negCenter = -center
+        vDSP_vsadd(cb, 1, &negCenter, &cbS, 1, n)
+        vDSP_vsadd(cr, 1, &negCenter, &crS, 1, n)
+
+        var r = [Float](repeating: 0, count: pixelCount)
+        var g = [Float](repeating: 0, count: pixelCount)
+        var b = [Float](repeating: 0, count: pixelCount)
+        var rCr: Float = 1.402
+        var gCb: Float = -0.344136, gCr: Float = -0.714136
+        var bCb: Float = 1.772
+
+        vDSP_vsma(crS, 1, &rCr, y, 1, &r, 1, n)
+        vDSP_vsmul(cbS, 1, &gCb, &g, 1, n)
+        vDSP_vsma(crS, 1, &gCr, g, 1, &g, 1, n)
+        vDSP_vadd(y, 1, g, 1, &g, 1, n)
+        vDSP_vsma(cbS, 1, &bCb, y, 1, &b, 1, n)
+
+        var lo: Float = 0.0, hi = maxValue
+        vDSP_vclip(r, 1, &lo, &hi, &r, 1, n)
+        vDSP_vclip(g, 1, &lo, &hi, &g, 1, n)
+        vDSP_vclip(b, 1, &lo, &hi, &b, 1, n)
+
+        var out = [UInt8](repeating: 0, count: pixelCount * 3 * 2)
+        for i in 0..<pixelCount {
+            let p = i * 6
+            let rv = UInt16(r[i].rounded(.toNearestOrEven))
+            let gv = UInt16(g[i].rounded(.toNearestOrEven))
+            let bv = UInt16(b[i].rounded(.toNearestOrEven))
+            out[p]     = UInt8(rv & 0xFF); out[p + 1] = UInt8(rv >> 8)
+            out[p + 2] = UInt8(gv & 0xFF); out[p + 3] = UInt8(gv >> 8)
+            out[p + 4] = UInt8(bv & 0xFF); out[p + 5] = UInt8(bv >> 8)
+        }
+        return out
+    }
+
     // MARK: - Batched quantization
 
     /// Quantize `n` contiguous 8×8 blocks against a single 64-element inverse table.
