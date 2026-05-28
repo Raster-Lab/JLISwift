@@ -35,6 +35,11 @@ public struct JLIEncoder: Sendable {
     /// runtime cost is steep). Bounds worst-case encode time on noisy content.
     static let trellisMaxNonzeros = 32
 
+    /// Trellis magnitude reduction (q→q∓1) is only considered for zigzag
+    /// positions ≥ this — reducing the lowest AC frequencies costs visible
+    /// quality (butteraugli) for negligible rate; HF reduction is near-free.
+    static let trellisReduceMinZigzag = 6
+
     /// Encodes an image to JPEG data using the jpegli algorithm.
     ///
     /// - Parameters:
@@ -454,22 +459,21 @@ public struct JLIEncoder: Sendable {
         let lambda: Double
     }
 
-    /// Trellis quantization (keep/drop): for each block, a Viterbi DP chooses
-    /// which nonzero AC coefficients to keep vs. force to zero, minimizing
-    /// D + λ·R — DCT-domain squared error (= pixel² by Parseval) against the
-    /// run-length-coded bits. Unlike a trailing-only EOB pass it can drop
-    /// *interior* coefficients (an isolated nonzero that costs a ZRL + symbol
-    /// but barely reduces distortion), merging the surrounding zero runs. The
-    /// EOB choice falls out as "which kept coefficient is last."
+    /// Trellis quantization: for each block, a Viterbi DP chooses, for every
+    /// nonzero AC coefficient, whether to drop it (→0), reduce its magnitude by
+    /// one step (q→q∓1 toward zero), or keep it — minimizing D + λ·R: DCT-domain
+    /// squared error (= pixel² by Parseval) against the run-length-coded bits.
     ///
-    /// Only ever zeros coefficients (never grows magnitudes or alters kept
-    /// values), so the kept coefficients' distortion is constant and drops out
-    /// of the objective — we minimize Σ(drop distortion) + λ·R. Output stays
-    /// standard baseline JPEG. Magnitude reduction (q→q−1) is a further trellis
-    /// refinement left for later.
+    /// Dropping interior coefficients merges the surrounding zero runs; magnitude
+    /// reduction trims a coefficient's size category and additional bits. The EOB
+    /// choice falls out as "which kept coefficient is last." Magnitudes are only
+    /// ever reduced, never grown, so output stays standard baseline JPEG; the
+    /// rate model uses the fixed Annex K table lengths, sidestepping the
+    /// chicken-and-egg with optimized Huffman (built afterward).
     ///
-    /// O(m²) per block in the number of nonzero AC coefficients m. High-entropy
-    /// blocks (m large) are capped to the cheaper EOB-only pass.
+    /// State = (candidate, variant ∈ {full q, reduced q∓1}); transitions account
+    /// for the inter-coefficient run (incl. ZRL). O(m²) per block in the nonzero
+    /// AC count m; high-entropy blocks (m large) skip the DP.
     private func applyTrellisQuantization(
         dctBuf: [Float], quant: inout [Int32], blockCount: Int, rdo: RDOContext
     ) {
@@ -487,70 +491,103 @@ public struct JLIEncoder: Sendable {
             return bits
         }
 
-        // Reused per-block scratch.
-        var nz = [Int](repeating: 0, count: 64)        // zigzag positions of nonzeros
-        var dropDist = [Double](repeating: 0, count: 64)
-        var sizeOf = [Int](repeating: 0, count: 64)
+        // Per-block scratch. Each nonzero candidate has up to two "kept" variants
+        // (full, reduced); states are flattened as candidate*2 + variant.
+        let maxN = JLIEncoder.trellisMaxNonzeros
+        var nz = [Int](repeating: 0, count: 64)              // zigzag position
+        var dropDist = [Double](repeating: 0, count: 64)     // distortion if zeroed
         var cumDrop = [Double](repeating: 0, count: 65)
-        var dp = [Double](repeating: 0, count: 64)
-        var prev = [Int](repeating: -1, count: 64)
-        var keep = [Bool](repeating: false, count: 64)
+        var vCount = [Int](repeating: 0, count: 64)          // 1 or 2 variants
+        var vVal = [Int32](repeating: 0, count: 128)         // quantized value
+        var vDist = [Double](repeating: 0, count: 128)       // distortion if kept at variant
+        var vSize = [Int](repeating: 0, count: 128)          // category
+        var dp = [Double](repeating: 0, count: 128)
+        var prevState = [Int](repeating: -1, count: 128)     // previous (candidate*2+variant), or -1
+        var chosen = [Int](repeating: -1, count: 64)         // backtracked variant per candidate, -1 = dropped
 
         for b in 0..<blockCount {
             let base = b * 64
             var m = 0
             for z in 1..<64 {
                 let q = quant[base + zz[z]]
-                if q != 0 {
-                    let nat = zz[z]
-                    let recon = Double(q) * Double(rdo.quantTable[nat])
-                    let c = Double(dctBuf[base + nat])
-                    nz[m] = z
-                    dropDist[m] = c * c - (c - recon) * (c - recon)
-                    sizeOf[m] = HuffmanEncoder.category(for: q)
-                    m += 1
+                if q == 0 { continue }
+                let nat = zz[z]
+                let c = Double(dctBuf[base + nat])
+                let qf = Double(rdo.quantTable[nat])
+                nz[m] = z
+                dropDist[m] = c * c
+                // Variant 0: full magnitude.
+                let reconF = Double(q) * qf
+                vVal[m * 2] = q
+                vDist[m * 2] = (c - reconF) * (c - reconF)
+                vSize[m * 2] = HuffmanEncoder.category(for: q)
+                // Variant 1: magnitude reduced one step toward zero (if still
+                // nonzero). Restricted to higher-frequency positions — reducing
+                // the lowest AC frequencies trims perceptually-visible energy
+                // (butteraugli regresses), while HF reduction is near-invisible.
+                let qr = q > 0 ? q - 1 : q + 1
+                if qr != 0 && z >= JLIEncoder.trellisReduceMinZigzag {
+                    let reconR = Double(qr) * qf
+                    vVal[m * 2 + 1] = qr
+                    vDist[m * 2 + 1] = (c - reconR) * (c - reconR)
+                    vSize[m * 2 + 1] = HuffmanEncoder.category(for: qr)
+                    vCount[m] = 2
+                } else {
+                    vCount[m] = 1  // |q| == 1: reducing == dropping, already covered
                 }
+                m += 1
             }
-            // High-entropy blocks (many nonzeros) have little to gain from
-            // dropping — the coefficients are mostly real signal — and the DP is
-            // O(m²). Skip them: they keep plain round-to-nearest.
-            if m == 0 || m > JLIEncoder.trellisMaxNonzeros { continue }
+            if m == 0 || m > maxN { continue }
 
             cumDrop[0] = 0
             for k in 0..<m { cumDrop[k + 1] = cumDrop[k] + dropDist[k] }
 
-            // dp[i] = min (Σ drop-dist + λ·rate) with nz[i] kept as last-so-far.
+            // dp[state] = min (Σ distortion + λ·rate) ending with candidate i kept
+            // at variant v as the last-kept-so-far.
             for i in 0..<m {
-                // j = -1 (no prior kept): drop nz[0..<i], run = nz[i]-1.
-                var best = cumDrop[i] + lambda * Double(symbolBits(run: nz[i] - 1, size: sizeOf[i]))
-                var bestPrev = -1
-                for j in 0..<i {
-                    let between = cumDrop[i] - cumDrop[j + 1]   // dropped nonzeros (j, i)
-                    let run = nz[i] - nz[j] - 1
-                    let cost = dp[j] + between
-                        + lambda * Double(symbolBits(run: run, size: sizeOf[i]))
-                    if cost < best { best = cost; bestPrev = j }
+                for v in 0..<vCount[i] {
+                    let s = i * 2 + v
+                    let keepBits = lambda * Double(symbolBits(run: nz[i] - 1, size: vSize[s]))
+                    var best = cumDrop[i] + keepBits + vDist[s]   // j = -1 (start)
+                    var bestPrev = -1
+                    for j in 0..<i {
+                        let between = cumDrop[i] - cumDrop[j + 1]
+                        let run = nz[i] - nz[j] - 1
+                        let rate = lambda * Double(symbolBits(run: run, size: vSize[s]))
+                        for vj in 0..<vCount[j] {
+                            let cost = dp[j * 2 + vj] + between + rate + vDist[s]
+                            if cost < best { best = cost; bestPrev = j * 2 + vj }
+                        }
+                    }
+                    dp[s] = best
+                    prevState[s] = bestPrev
                 }
-                dp[i] = best
-                prev[i] = bestPrev
             }
 
-            // Pick last-kept coefficient (+ EOB unless it's at position 63), or
-            // keep nothing (drop all AC, emit only EOB).
+            // Final: last-kept (i, v) + EOB (unless at position 63), or keep nothing.
             var bestCost = cumDrop[m] + lambda * Double(eobLen)
-            var bestLast = -1
+            var bestState = -1
             for i in 0..<m {
                 let afterDrop = cumDrop[m] - cumDrop[i + 1]
                 let eobCost = nz[i] < 63 ? lambda * Double(eobLen) : 0.0
-                let cost = dp[i] + afterDrop + eobCost
-                if cost < bestCost { bestCost = cost; bestLast = i }
+                for v in 0..<vCount[i] {
+                    let cost = dp[i * 2 + v] + afterDrop + eobCost
+                    if cost < bestCost { bestCost = cost; bestState = i * 2 + v }
+                }
             }
 
-            // Backtrack the kept set; zero everything else.
-            for k in 0..<m { keep[k] = false }
-            var cur = bestLast
-            while cur >= 0 { keep[cur] = true; cur = prev[cur] }
-            for k in 0..<m where !keep[k] { quant[base + zz[nz[k]]] = 0 }
+            // Backtrack chosen variant per candidate (-1 = dropped).
+            for k in 0..<m { chosen[k] = -1 }
+            var st = bestState
+            while st >= 0 {
+                chosen[st / 2] = st % 2
+                st = prevState[st]
+            }
+            // Write decided values back (drop → 0, else the variant's value).
+            for k in 0..<m {
+                let nat = zz[nz[k]]
+                quant[base + nat] = chosen[k] < 0 ? 0 : vVal[k * 2 + chosen[k]]
+            }
         }
     }
 
