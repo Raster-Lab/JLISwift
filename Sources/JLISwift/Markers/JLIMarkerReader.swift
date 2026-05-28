@@ -280,6 +280,16 @@ struct MarkerReader {
             let info = try readByte()
             let precision = Int(info >> 4)
             let tableId = Int(info & 0x0F)
+            // T.81: Pq (precision) is 0 (8-bit) or 1 (16-bit); Tq (table id) is
+            // 0–3. A corrupted DQT length desyncs parsing and feeds garbage here,
+            // so reject out-of-range ids/precision rather than indexing past the
+            // 4-slot quant-table array.
+            guard precision == 0 || precision == 1 else {
+                throw JLIError.decodingFailed("invalid DQT precision \(precision)")
+            }
+            guard tableId <= 3 else {
+                throw JLIError.decodingFailed("invalid DQT table id \(tableId)")
+            }
 
             var values = [Int](repeating: 0, count: 64)
             for i in 0..<64 {
@@ -311,6 +321,23 @@ struct MarkerReader {
             for i in 0..<16 {
                 bits[i] = try readByte()
                 totalValues += Int(bits[i])
+            }
+            // Validate BITS forms a legal canonical Huffman code (T.81 Annex C):
+            // a table has ≤ 256 symbols, and at no bit length may the running
+            // code count exceed the 2^length slots available. Rejects forged or
+            // corrupted DHTs that would otherwise overflow code generation in
+            // `HuffmanTable.init`.
+            guard totalValues <= 256 else {
+                throw JLIError.decodingFailed("invalid DHT: \(totalValues) codes (max 256)")
+            }
+            var codeSpace = 0
+            for len in 1...16 {
+                codeSpace += Int(bits[len - 1])
+                guard codeSpace <= (1 << len) else {
+                    throw JLIError.decodingFailed(
+                        "invalid DHT: Huffman code oversubscribed at length \(len)")
+                }
+                codeSpace <<= 1
             }
 
             var values = [UInt8]()

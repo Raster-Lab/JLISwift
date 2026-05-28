@@ -121,6 +121,13 @@ struct BitReader {
 
     /// Reads `count` bits and returns them as an unsigned integer.
     mutating func readBits(_ count: Int) throws -> UInt32 {
+        // Every legitimate JPEG bit-read is ≤ 16 bits (magnitude categories ≤ 15,
+        // EOBRUN appendages ≤ 14). A larger width only arises from a malformed or
+        // forged Huffman table (whose decoded "category" can be any byte) and
+        // would overflow the 32-bit `bitBuffer` in `loadByte` — throw instead.
+        guard count >= 0, count <= 16 else {
+            throw JLIError.decodingFailed("invalid bit-read width \(count)")
+        }
         while bitsAvailable < count {
             try loadByte()
         }

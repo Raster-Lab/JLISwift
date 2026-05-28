@@ -36,7 +36,11 @@ struct HuffmanTable {
         var minC = [Int32](repeating: -1, count: 17)
         var vPtr = [Int](repeating: 0, count: 17)
 
-        var code: UInt16 = 0
+        // Wider than the 16-bit codes it produces so canonical-code generation
+        // can't overflow on a malformed BITS array — a complete length-16 code
+        // walks `code` up to 2^16, one past UInt16's range. Stored codes still
+        // fit in 16 bits for any well-formed table.
+        var code: UInt32 = 0
         var valueIndex = 0
 
         for bitLength in 1...16 {
@@ -44,9 +48,9 @@ struct HuffmanTable {
             if count > 0 {
                 vPtr[bitLength] = valueIndex
                 minC[bitLength] = Int32(code)
-                for _ in 0..<count {
+                for _ in 0..<count where valueIndex < values.count {
                     let symbol = values[valueIndex]
-                    encoding[Int(symbol)] = (code, UInt8(bitLength))
+                    encoding[Int(symbol)] = (UInt16(truncatingIfNeeded: code), UInt8(bitLength))
                     valueIndex += 1
                     code += 1
                 }
@@ -332,6 +336,12 @@ enum HuffmanDecoder {
 
             if table.maxCode[bitLength] >= 0 && code <= table.maxCode[bitLength] {
                 let index = table.valPtr[bitLength] + Int(code - table.minCode[bitLength])
+                // A malformed DHT (e.g. a corrupted code-count byte) can yield a
+                // valPtr/minCode that points past the value list; bounds-check
+                // rather than trap on untrusted input.
+                guard index >= 0, index < table.values.count else {
+                    throw JLIError.decodingFailed("Huffman code index out of range")
+                }
                 return table.values[index]
             }
         }

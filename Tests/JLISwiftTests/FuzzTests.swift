@@ -1,0 +1,106 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024 Raster Lab. All rights reserved.
+
+import Testing
+@testable import JLISwift
+
+/// Robustness: JLISwift decodes JPEGs embedded in untrusted clinical DICOM
+/// files, so malformed / truncated / adversarial bytes must fail by *throwing*
+/// (a `JLIError`), never by trapping (force-unwrap nil, out-of-bounds, integer
+/// overflow, `fatalError`). A trap aborts the test process, so any of these
+/// cases surfacing one shows up as a hard failure here.
+///
+/// The fuzzers use a seeded PRNG so a discovered crash reproduces deterministically.
+@Suite("Decoder robustness / malformed input")
+struct FuzzTests {
+
+    /// Deterministic SplitMix64 — reproducible fuzz corpora across runs.
+    struct SeededRNG: RandomNumberGenerator {
+        var state: UInt64
+        init(seed: UInt64) { state = seed }
+        mutating func next() -> UInt64 {
+            state &+= 0x9E3779B97F4A7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+            z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+            return z ^ (z >> 31)
+        }
+    }
+
+    /// A real, valid baseline JPEG to mutate from.
+    static func validJPEG(progressive: Bool = false) throws -> [UInt8] {
+        let w = 32, h = 24
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        for i in 0..<rgb.count { rgb[i] = UInt8((i &* 7) & 0xFF) }
+        let img = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
+        var cfg = JLIEncoderConfiguration.default
+        cfg.chromaSubsampling = .yuv420
+        cfg.progressive = progressive
+        return try JLIEncoder().encode(img, configuration: cfg)
+    }
+
+    /// Feed bytes to both entry points; thrown errors are fine, a trap is not.
+    private func probe(_ data: [UInt8]) {
+        _ = try? JLIDecoder().inspect(data: data)
+        _ = try? JLIDecoder().decode(from: data)
+    }
+
+    @Test("Truncation at every prefix length never crashes")
+    func truncations() throws {
+        for valid in [try Self.validJPEG(), try Self.validJPEG(progressive: true)] {
+            for len in 0...valid.count {
+                probe(Array(valid[0..<len]))
+            }
+        }
+    }
+
+    @Test("Single-byte mutations never crash (baseline + progressive)")
+    func singleByteMutations() throws {
+        for valid in [try Self.validJPEG(), try Self.validJPEG(progressive: true)] {
+            for pos in 0..<valid.count {
+                for v: UInt8 in [0x00, 0xFF, 0xD8, 0xD9, 0xC0, 0xC2, 0x01, 0x80] {
+                    var m = valid
+                    m[pos] = v
+                    probe(m)
+                }
+            }
+        }
+    }
+
+    @Test("Random byte arrays never crash")
+    func randomBytes() {
+        var rng = SeededRNG(seed: 0xCAFEBABE)
+        for _ in 0..<3000 {
+            let n = Int.random(in: 0...4096, using: &rng)
+            var d = [UInt8](repeating: 0, count: n)
+            for i in 0..<n { d[i] = UInt8.random(in: 0...255, using: &rng) }
+            probe(d)
+        }
+    }
+
+    @Test("Random payloads behind a valid SOI never crash")
+    func randomWithSOI() {
+        var rng = SeededRNG(seed: 0x1234_5678_9ABC_DEF0)
+        for _ in 0..<3000 {
+            let n = Int.random(in: 0...4096, using: &rng)
+            var d: [UInt8] = [0xFF, 0xD8]   // SOI — get past the magic-number gate
+            for _ in 0..<n { d.append(UInt8.random(in: 0...255, using: &rng)) }
+            probe(d)
+        }
+    }
+
+    @Test("Corrupted marker length fields never crash")
+    func markerLengthFuzz() throws {
+        let valid = try Self.validJPEG()
+        for pos in 2..<(valid.count - 4) where valid[pos] == 0xFF {
+            let m1 = valid[pos + 1]
+            guard m1 != 0x00, m1 != 0xFF else { continue }
+            for (hi, lo): (UInt8, UInt8) in [(0xFF, 0xFF), (0x00, 0x00), (0x00, 0x01), (0xFF, 0xFE)] {
+                var m = valid
+                m[pos + 2] = hi
+                m[pos + 3] = lo
+                probe(m)
+            }
+        }
+    }
+}

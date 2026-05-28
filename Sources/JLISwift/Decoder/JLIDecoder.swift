@@ -76,6 +76,9 @@ public struct JLIDecoder: Sendable {
             return natural
         }
 
+        // Reject structurally-invalid frames before any size math or indexing.
+        try validateDecodable(frame, quantTableCount: quantTables.count)
+
         // Step 3: Prepare Huffman tables (use standard tables as fallback)
         let dcTables = prepareDCTables(parsed.huffmanDCTables)
         let acTables = prepareACTables(parsed.huffmanACTables)
@@ -156,8 +159,8 @@ public struct JLIDecoder: Sendable {
                         let scanComp = scan.header.components.first { $0.componentSelector == comp.id }
                         let dcTableId = scanComp?.dcTableId ?? 0
                         let acTableId = scanComp?.acTableId ?? 0
-                        let dcTable = dcTables[dcTableId]
-                        let acTable = acTables[acTableId]
+                        let dcTable = dcTables[dcTableId] ?? StandardHuffmanTables.dcLuminance
+                        let acTable = acTables[acTableId] ?? StandardHuffmanTables.acLuminance
                         let blocksPerRow = componentBlocksPerRow[compIdx]
 
                         for by in 0..<comp.verticalSampling {
@@ -351,19 +354,62 @@ public struct JLIDecoder: Sendable {
 
     // MARK: - Private Helpers
 
-    /// Returns DC Huffman tables, using standard tables as fallback.
-    private func prepareDCTables(_ parsed: [Int: HuffmanTable]) -> [HuffmanTable] {
-        var tables = [HuffmanTable]()
-        tables.append(parsed[0] ?? StandardHuffmanTables.dcLuminance)
-        tables.append(parsed[1] ?? StandardHuffmanTables.dcChrominance)
+    /// DC Huffman tables keyed by table id, with standard tables filled in for
+    /// ids 0/1. Keyed (not positional) so a scan referencing any 4-bit table id
+    /// (0–15) resolves with a fallback instead of indexing past a fixed array.
+    private func prepareDCTables(_ parsed: [Int: HuffmanTable]) -> [Int: HuffmanTable] {
+        var tables = parsed
+        if tables[0] == nil { tables[0] = StandardHuffmanTables.dcLuminance }
+        if tables[1] == nil { tables[1] = StandardHuffmanTables.dcChrominance }
         return tables
     }
 
-    /// Returns AC Huffman tables, using standard tables as fallback.
-    private func prepareACTables(_ parsed: [Int: HuffmanTable]) -> [HuffmanTable] {
-        var tables = [HuffmanTable]()
-        tables.append(parsed[0] ?? StandardHuffmanTables.acLuminance)
-        tables.append(parsed[1] ?? StandardHuffmanTables.acChrominance)
+    /// AC Huffman tables keyed by table id, with standard tables filled in for
+    /// ids 0/1. See ``prepareDCTables(_:)``.
+    private func prepareACTables(_ parsed: [Int: HuffmanTable]) -> [Int: HuffmanTable] {
+        var tables = parsed
+        if tables[0] == nil { tables[0] = StandardHuffmanTables.acLuminance }
+        if tables[1] == nil { tables[1] = StandardHuffmanTables.acChrominance }
         return tables
+    }
+
+    /// Rejects structurally-invalid frames that the decode pipeline cannot
+    /// handle without trapping — malformed input (e.g. JPEG-in-DICOM from an
+    /// untrusted source) must fail with a thrown ``JLIError``, never a crash.
+    private func validateDecodable(_ frame: JPEGFrameInfo, quantTableCount: Int) throws {
+        // Precision drives the level shift `1 << (precision-1)`, which traps for
+        // precision 0; we only decode 8-bit (color/gray) and 12-bit (gray).
+        guard frame.precision == 8 || frame.precision == 12 else {
+            throw JLIError.unsupportedJPEGFeature(
+                "sample precision \(frame.precision) (only 8 and 12 supported)")
+        }
+        guard frame.precision == 8 || frame.components.count == 1 else {
+            throw JLIError.unsupportedJPEGFeature("12-bit color JPEG (12-bit is grayscale-only)")
+        }
+        // Dimensions: positive and within the 16-bit SOF field range. Zero width
+        // or height would divide by zero when computing the MCU grid.
+        guard frame.width >= 1, frame.height >= 1,
+              frame.width <= 65535, frame.height <= 65535 else {
+            throw JLIError.decodingFailed("invalid image dimensions \(frame.width)×\(frame.height)")
+        }
+        // Only grayscale (1) and YCbCr (3) layouts are decodable; the color path
+        // assumes exactly three planes (Y, Cb, Cr).
+        guard frame.components.count == 1 || frame.components.count == 3 else {
+            throw JLIError.unsupportedJPEGFeature(
+                "\(frame.components.count)-component JPEG (only 1 or 3 supported)")
+        }
+        for comp in frame.components {
+            // Sampling factors are 1–4 per T.81; a zero factor zeroes the max and
+            // divides by zero in the MCU-grid math.
+            guard (1...4).contains(comp.horizontalSampling),
+                  (1...4).contains(comp.verticalSampling) else {
+                throw JLIError.decodingFailed("invalid sampling factor for component \(comp.id)")
+            }
+            // The component must reference a quant table that was actually defined.
+            guard comp.quantTableIndex >= 0, comp.quantTableIndex < quantTableCount else {
+                throw JLIError.decodingFailed(
+                    "component \(comp.id) references undefined quant table \(comp.quantTableIndex)")
+            }
+        }
     }
 }
