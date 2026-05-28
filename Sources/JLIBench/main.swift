@@ -8,15 +8,15 @@ import JLISwift
 
 struct BenchOptions {
     enum Mode { case syntheticOnly, dicomOnly, both }
+    enum Regression { case none, save(String), check(String) }
 
     var mode: Mode = .syntheticOnly
     var dicomRoot: String = "Sources/LocalDatasets/medical-dicom-organized"
     var perModality: Int = 3
     var dicomQualities: [Int] = [50, 90]
     var rebuildCache: Bool = false
-    /// Skip huge plates (e.g. 5k×5k DX) by default so a single bench run
-    /// stays under a minute. Bump on the CLI for an exhaustive sweep.
-    var maxPixels: Int = 4_000_000
+    var regression: Regression = .none
+    var maxPixels: Int = 4_000_000  // skip huge plates (e.g. 5k×5k DX) to keep runtime bounded
 }
 
 func parseArgs(_ argv: [String]) -> BenchOptions {
@@ -34,6 +34,10 @@ func parseArgs(_ argv: [String]) -> BenchOptions {
             i += 1; opts.perModality = Int(argv[i]) ?? opts.perModality
         case "--max-pixels":
             i += 1; opts.maxPixels = Int(argv[i]) ?? opts.maxPixels
+        case "--save-baseline":
+            i += 1; opts.regression = .save(argv[i])
+        case "--check-baseline":
+            i += 1; opts.regression = .check(argv[i])
         case "--help", "-h":
             printHelp(); exit(0)
         default:
@@ -47,7 +51,7 @@ func parseArgs(_ argv: [String]) -> BenchOptions {
 
 func printHelp() {
     print("""
-    JLIBench — JPEG codec benchmark
+    JLIBench — JPEG codec benchmark and regression harness
 
     Usage:
       JLIBench [flags]
@@ -59,6 +63,10 @@ func printHelp() {
       --per-modality <N>     DICOM images per modality (default: 3)
       --max-pixels <N>       Skip DICOMs above this pixel count (default: 4000000)
       --rebuild-cache        Clear ~/.cache/jlibench/corpus before running
+
+    Regression flags:
+      --save-baseline <path>   Save run results as baseline JSON
+      --check-baseline <path>  Load baseline JSON, compare, exit 1 on regression
     """)
 }
 
@@ -78,6 +86,37 @@ let crossPairs: [(encoder: Codec, decoder: Codec)] = [
     (imageIO, jli444),
 ]
 
+// Accumulator that everything (synthetic + DICOM, self + cross) appends to,
+// then fed into baseline save / regression check.
+var baselineRows = [BaselineRow]()
+
+@MainActor @inline(__always)
+func recordSelf(_ r: Result) {
+    baselineRows.append(BaselineRow(
+        kind: "self", codec: r.codec, image: r.image, quality: r.quality,
+        bytes: r.encodedBytes, psnrDB: r.psnrDB
+    ))
+}
+
+@MainActor @inline(__always)
+func recordCross(_ r: CrossResult) {
+    guard let psnr = r.psnrDB else {
+        // Decode failure — encode an explicit -inf so a baseline can pin
+        // "this pair fails" and the regression check flags it if it changes.
+        baselineRows.append(BaselineRow(
+            kind: "cross", codec: "\(r.encoderName)->\(r.decoderName)",
+            image: r.image, quality: r.quality,
+            bytes: r.encodedBytes, psnrDB: -Double.infinity
+        ))
+        return
+    }
+    baselineRows.append(BaselineRow(
+        kind: "cross", codec: "\(r.encoderName)->\(r.decoderName)",
+        image: r.image, quality: r.quality,
+        bytes: r.encodedBytes, psnrDB: psnr
+    ))
+}
+
 // MARK: - Synthetic bench
 
 if opts.mode != .dicomOnly {
@@ -92,7 +131,7 @@ if opts.mode != .dicomOnly {
                 for codec in codecs {
                     do {
                         let r = try Harness.run(codec: codec, image: image, quality: q)
-                        selfResults.append(r)
+                        selfResults.append(r); recordSelf(r)
                     } catch {
                         print("FAIL \(codec.name) / \(image.name) / q=\(q): \(error)")
                     }
@@ -114,7 +153,7 @@ if opts.mode != .dicomOnly {
                         encoder: pair.encoder, decoder: pair.decoder,
                         image: image, quality: q
                     )
-                    crossResults.append(r)
+                    crossResults.append(r); recordCross(r)
                 }
             }
         }
@@ -154,23 +193,25 @@ if opts.mode != .syntheticOnly {
             let testImage = TestImage(
                 name: img.id, width: img.width, height: img.height, rgb: img.rgb
             )
+            // Self-codec
             for q in opts.dicomQualities {
                 for codec in codecs {
                     do {
                         let r = try Harness.run(codec: codec, image: testImage, quality: q)
-                        dicomSelf.append(r)
+                        dicomSelf.append(r); recordSelf(r)
                     } catch {
                         print("FAIL self \(codec.name) / \(img.id) / q=\(q): \(error)")
                     }
                 }
             }
+            // Cross-codec
             for q in opts.dicomQualities {
                 for pair in crossPairs {
                     let r = Harness.runCross(
                         encoder: pair.encoder, decoder: pair.decoder,
                         image: testImage, quality: q
                     )
-                    dicomCross.append(r)
+                    dicomCross.append(r); recordCross(r)
                 }
             }
         }
@@ -180,6 +221,39 @@ if opts.mode != .syntheticOnly {
         print("")
         print("--- DICOM cross-codec ---")
         printCrossTable(dicomCross)
+    }
+}
+
+// MARK: - Regression
+
+switch opts.regression {
+case .none:
+    break
+
+case .save(let path):
+    let baseline = Baseline(
+        createdAt: ISO8601DateFormatter().string(from: Date()),
+        toolVersion: JLISwift.version,
+        rows: baselineRows
+    )
+    do {
+        try BaselineStore.save(baseline, to: path)
+        print("")
+        print("baseline saved: \(path) (\(baselineRows.count) rows)")
+    } catch {
+        FileHandle.standardError.write(Data("save failed: \(error)\n".utf8))
+        exit(2)
+    }
+
+case .check(let path):
+    do {
+        let baseline = try BaselineStore.load(path)
+        let diffs = BaselineCompare.diff(baseline: baseline, current: baselineRows)
+        let hasRegression = BaselineCompare.printSummary(diffs)
+        exit(hasRegression ? 1 : 0)
+    } catch {
+        FileHandle.standardError.write(Data("check failed: \(error)\n".utf8))
+        exit(2)
     }
 }
 
