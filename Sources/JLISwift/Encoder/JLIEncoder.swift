@@ -48,6 +48,14 @@ public struct JLIEncoder: Sendable {
     /// regardless of how many threads run.
     static let trellisMinBlocksPerChunk = 2048
 
+    /// Minimum blocks per worker for parallel AC-frequency counting. AC counting
+    /// is order-independent (frequencies commute) and carries no cross-block
+    /// state, so partitioning a flat block range and summing the partial
+    /// histograms is bit-identical to the serial count; this just gates when the
+    /// thread-dispatch cost is worth paying. (DC counting stays serial — its
+    /// predictor chain is cheap and order-dependent.)
+    static let acCountMinBlocksPerChunk = 8192
+
     /// Encodes an image to JPEG data using the jpegli algorithm.
     ///
     /// - Parameters:
@@ -364,17 +372,14 @@ public struct JLIEncoder: Sendable {
 
         if optimiseHuffman {
             var dcLumFreq = [Int](repeating: 0, count: 256)
-            var acLumFreq = [Int](repeating: 0, count: 256)
             var dcChrFreq = [Int](repeating: 0, count: 256)
-            var acChrFreq = [Int](repeating: 0, count: 256)
             var prevDC = [Int32](repeating: 0, count: numComponents)
-            var zigzagBuf = [Int32](repeating: 0, count: 64)
-            // Restart resets DC predictors mid-scan; the counting pass must reset
-            // at the same boundaries as the emit pass, or the optimal Huffman
-            // table is built for the wrong DC-diff distribution and may lack codes
-            // for the large post-reset diffs the emit pass produces.
+            // DC counting: serial MCU walk — the DC predictor chain is
+            // order-dependent and resets at restart boundaries, exactly as the
+            // emit pass does (else the table lacks codes for post-reset diffs).
+            // It's cheap (one diff/block); AC counting is the heavy part and is
+            // parallelized separately below.
             var countMCU = 0
-
             for mcuY in 0..<mcuCountV {
                 for mcuX in 0..<mcuCountH {
                     if configuration.restartInterval > 0 && countMCU > 0
@@ -385,24 +390,31 @@ public struct JLIEncoder: Sendable {
                     for by in 0..<vMax {
                         for bx in 0..<hMax {
                             let yIdx = (mcuY * vMax + by) * yBlocksPerRow + (mcuX * hMax + bx)
-                            prevDC[0] = countBlock(
-                                quantized: yQuant, blockIndex: yIdx, prevDC: prevDC[0],
-                                zigzagBuf: &zigzagBuf, dcFreq: &dcLumFreq, acFreq: &acLumFreq
-                            )
+                            let dc = yQuant[yIdx * 64]
+                            HuffmanEncoder.countDC(dc - prevDC[0], freq: &dcLumFreq)
+                            prevDC[0] = dc
                         }
                     }
                     if !isGrayscale {
                         let cIdx = mcuY * mcuCountH + mcuX
-                        prevDC[1] = countBlock(
-                            quantized: cbQuant, blockIndex: cIdx, prevDC: prevDC[1],
-                            zigzagBuf: &zigzagBuf, dcFreq: &dcChrFreq, acFreq: &acChrFreq
-                        )
-                        prevDC[2] = countBlock(
-                            quantized: crQuant, blockIndex: cIdx, prevDC: prevDC[2],
-                            zigzagBuf: &zigzagBuf, dcFreq: &dcChrFreq, acFreq: &acChrFreq
-                        )
+                        let cb = cbQuant[cIdx * 64]
+                        HuffmanEncoder.countDC(cb - prevDC[1], freq: &dcChrFreq)
+                        prevDC[1] = cb
+                        let cr = crQuant[cIdx * 64]
+                        HuffmanEncoder.countDC(cr - prevDC[2], freq: &dcChrFreq)
+                        prevDC[2] = cr
                     }
                 }
+            }
+
+            // AC counting: order-independent, so count over flat block ranges in
+            // parallel and sum — the same multiset of blocks the emit walk visits.
+            let acLumFreq = JLIEncoder.parallelACFreqs(yQuant, blockCount: yBlockCount)
+            var acChrFreq = [Int](repeating: 0, count: 256)
+            if !isGrayscale {
+                let cbF = JLIEncoder.parallelACFreqs(cbQuant, blockCount: cBlockCount)
+                let crF = JLIEncoder.parallelACFreqs(crQuant, blockCount: cBlockCount)
+                for i in 0..<256 { acChrFreq[i] = cbF[i] + crF[i] }
             }
 
             dcLumTable = HuffmanTableBuilder.build(
@@ -732,6 +744,48 @@ public struct JLIEncoder: Sendable {
         let quant: UnsafeMutablePointer<Int32>
     }
 
+    /// `@unchecked Sendable` carrier for the per-worker partial AC histograms;
+    /// each concurrent worker writes one disjoint slot.
+    private struct ACPartialsPtr: @unchecked Sendable {
+        let p: UnsafeMutablePointer<[Int]>
+    }
+
+    /// AC symbol histogram for `quant`'s blocks in `blocks` (zigzag + run-length
+    /// count). Order-independent, so callable on any disjoint block range.
+    private static func countACFreqs(_ quant: [Int32], blocks: Range<Int>) -> [Int] {
+        var freq = [Int](repeating: 0, count: 256)
+        var zz = [Int32](repeating: 0, count: 64)
+        for b in blocks {
+            Quantization.zigzagScan(quant, offset: b * 64, into: &zz)
+            HuffmanEncoder.countAC(zz, freq: &freq)
+        }
+        return freq
+    }
+
+    /// Parallel AC histogram over all `blockCount` blocks of `quant`, summing the
+    /// per-worker partials — bit-identical to a serial `countACFreqs(quant,
+    /// 0..<blockCount)` since AC frequencies are order-independent. Runs serially
+    /// for small inputs (see ``acCountMinBlocksPerChunk``).
+    private static func parallelACFreqs(_ quant: [Int32], blockCount: Int) -> [Int] {
+        guard blockCount > 0 else { return [Int](repeating: 0, count: 256) }
+        let chunks = min(ProcessInfo.processInfo.activeProcessorCount,
+                         max(1, blockCount / acCountMinBlocksPerChunk))
+        if chunks <= 1 { return countACFreqs(quant, blocks: 0..<blockCount) }
+        let span = (blockCount + chunks - 1) / chunks
+        var partials = [[Int]](repeating: [], count: chunks)
+        partials.withUnsafeMutableBufferPointer { buf in
+            let ptr = ACPartialsPtr(p: buf.baseAddress!)
+            DispatchQueue.concurrentPerform(iterations: chunks) { c in
+                let lo = c * span, hi = min(lo + span, blockCount)
+                ptr.p[c] = lo < hi ? countACFreqs(quant, blocks: lo..<hi)
+                                   : [Int](repeating: 0, count: 256)
+            }
+        }
+        var total = [Int](repeating: 0, count: 256)
+        for part in partials { for i in 0..<256 { total[i] += part[i] } }
+        return total
+    }
+
     /// Trellis-quantize the blocks in `blocks`. `static` with fully self-contained
     /// per-call scratch so it is safe to run concurrently over disjoint ranges of
     /// the same `dct`/`quant` buffers. See ``applyTrellisQuantization`` for the
@@ -901,20 +955,6 @@ public struct JLIEncoder: Sendable {
         let dcDiff = zigzagBuf[0] - prevDC
         HuffmanEncoder.encodeDC(dcDiff, table: dcTable, writer: &writer)
         HuffmanEncoder.encodeAC(zigzagBuf, table: acTable, writer: &writer)
-        return zigzagBuf[0]
-    }
-
-    /// Counting analogue of ``emitBlock`` — gathers DC/AC symbol frequencies for
-    /// optimal-table generation. Must walk identically to the emit pass so the
-    /// DC DPCM predictor stays in lockstep. Returns the block's DC value.
-    @inline(__always)
-    private func countBlock(
-        quantized: [Int32], blockIndex: Int, prevDC: Int32,
-        zigzagBuf: inout [Int32], dcFreq: inout [Int], acFreq: inout [Int]
-    ) -> Int32 {
-        Quantization.zigzagScan(quantized, offset: blockIndex * 64, into: &zigzagBuf)
-        HuffmanEncoder.countDC(zigzagBuf[0] - prevDC, freq: &dcFreq)
-        HuffmanEncoder.countAC(zigzagBuf, freq: &acFreq)
         return zigzagBuf[0]
     }
 

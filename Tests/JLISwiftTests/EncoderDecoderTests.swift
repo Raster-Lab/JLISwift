@@ -585,19 +585,23 @@ struct EncoderDecoderTests {
         }
     }
 
-    @Test("Parallel trellis encode is deterministic and round-trips (large image)")
+    @Test("Parallel trellis + AC-count encode is deterministic and round-trips (large image)")
     func parallelTrellisEncodeDeterministic() throws {
-        // 1024×768 4:2:0 → Y is ~12k blocks → split across several trellis workers
-        // (chroma stays serial); a data race would surface as non-identical output
-        // across runs, and partitioning bugs as round-trip corruption.
-        let w = 1024, h = 768
+        // 1024×1024 4:2:0 → Y is 16384 blocks, hitting both the trellis (≥4096)
+        // and AC-count (≥16384) parallel thresholds, so both parallel stages run;
+        // a data race in either surfaces as non-identical output across runs, and
+        // a partitioning bug as round-trip corruption.
+        let w = 1024, h = 1024
         var rgb = [UInt8](repeating: 0, count: w * h * 3)
         for y in 0..<h {
             for x in 0..<w {
                 let i = (y * w + x) * 3
-                rgb[i] = UInt8((x ^ y) & 0xFF)                 // textured → trellis is active
-                rgb[i + 1] = UInt8((x &* 5 &+ y &* 3) & 0xFF)
-                rgb[i + 2] = UInt8((x &+ y &* 7) & 0xFF)
+                // Smooth gradient + light texture: races in the parallel stages
+                // show up regardless of content (they run on block count), so keep
+                // the trellis DP light to keep this large-image test fast.
+                rgb[i] = UInt8((30 + x / 6 + (x & 3)) & 0xFF)
+                rgb[i + 1] = UInt8((40 + y / 6 + (y & 3)) & 0xFF)
+                rgb[i + 2] = UInt8((50 + (x + y) / 8) & 0xFF)
             }
         }
         let img = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
@@ -605,7 +609,7 @@ struct EncoderDecoderTests {
         cfg.quality = 88; cfg.chromaSubsampling = .yuv420      // trellis on (adaptiveQuantization default)
         let enc = JLIEncoder()
         let first = try enc.encode(img, configuration: cfg)
-        for _ in 0..<3 {
+        for _ in 0..<2 {
             #expect(try enc.encode(img, configuration: cfg) == first,
                     "parallel trellis encode is not deterministic (possible data race)")
         }
