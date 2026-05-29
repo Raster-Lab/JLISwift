@@ -3,9 +3,37 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-29 — **tagging 0.2.0**: jpegli perceptual-quant default (data-driven medical quality win — CT q90 ba 1.20 vs 1.82 at equal bytes), **~15–16% faster encode** + **~26–43% faster decode** (byte-identical: uninitialized buffers, COW removal, raw-pointer color/upsample, parallel chroma upsample), the **JLILab** macOS lab (DICOM/standard round-trip + cross-codec + RD curves), and measurement tooling (`--profile-encode/-decode`, `--rd-matrix`, SSIMULACRA2). Prior 0.1.0: table-driven Huffman decode, float32 input, adaptive-quant field, XYB (experimental), lossless+near-lossless, scaled decode, multi-threaded trellis, jpegli quantizer, ICC/Exif, progressive+restart, fuzzing._
+_Last updated: 2026-05-29 — **0.2.0 RELEASED** (tagged `v0.2.0`, GitHub Release live): jpegli perceptual-quant default (medical quality win — CT q90 ba 1.20 vs 1.82 at equal bytes), **~15–16% faster encode** + **~26–43% faster decode** (byte-identical), the **JLILab** macOS lab (now with an app icon), and measurement tooling. Focus is now the **0.3.0 plan** (below): close the jpegli quality gap (full adaptive-quant field) + ship JLILab as a signed app._
 
-## 0.2.0 — Optimization release plan (active, 2026-05-29)
+## 0.3.0 — Proposed Plan (active, 2026-05-29)
+
+**Theme: close the jpegli quality gap, and turn JLILab into a real distributable app.**
+**Goals:** match jpegli on butteraugli-at-matched-bytes across the DICOM corpus (today behind ~0.25 ba — CT q90 ours 1.20 vs jpegli 0.95) with **no medical regression**; ship a **signed/notarized JLILab.app** (+ DMG). Discipline unchanged: RD-validated quality, byte-identical (or explicitly re-validated) perf, CI-green.
+
+### WS-A — Full jpegli adaptive-quant field (P1, headline quality)
+The current `adaptiveQuantField` is near-inert under perceptual tables; the real lever is jpegli's psychovisual field + dead-zone.
+- [ ] Port libjxl `adaptive_quantization.cc`: pre-blur, `ComputeMask`, gamma + HF modulation, erosion → per-8×8-block quant-field (FastLog2/Pow2 helpers).
+- [ ] Apply as **per-block zero-bias / dead-zone** in quantization (decodable with a single quant table — how jpegli stays standard-JPEG).
+- [ ] RD-validate (`--rd-matrix`, butteraugli + SSIMULACRA2) vs jpegli/mozjpeg across the corpus → decide default-on; replace the simplified λ-field. *Risk: large/intricate port; residual gap may be partly XYB → WS-E.*
+
+### WS-B — JLILab distribution (P1)
+- [ ] Sign + notarize (hardened runtime + entitlements) → DMG. *Needs the Apple Developer signing identity.*
+- [ ] QoL: batch mode (folder of DICOMs → CSV of size/PSNR/butteraugli), DICOM window/level controls, save/load presets, export comparison report.
+
+### WS-C — Targeted performance (P2, diminishing returns)
+- [ ] Parallelize inverse color conversion + per-component decode (byte-identical, `concurrentPerform`).
+- [ ] Parallel entropy emit via restart-interval segmentation — **opt-in only** (adds RST markers → not bit-identical).
+- [ ] Fuse dequant+IDCT.
+
+### WS-D — Features / robustness (P2)
+- [ ] float32 **decode output** (currently input-only); DocC catalog; expand fuzz/conformance corpus.
+
+### WS-E — Re-evaluate XYB with the mature perceptual machinery (P3).
+
+### Sequencing
+M1 **WS-A** (quality — the medical raison d'être) → M2 **WS-B** (ship the app) → M3 WS-C/D → tag 0.3.0.
+
+## 0.2.0 — Optimization release (shipped v0.2.0, 2026-05-29)
 
 **Reframe first — the "570 ms encode" seen in JLILab was a Debug-build artifact, not the codec.**
 Re-measured in **release** via JLIBench (512×512 @ q90, in-process):
