@@ -6,7 +6,7 @@ A native-Swift JPEG codec for Apple platforms, with Accelerate-backed DSP.
 [![Platforms](https://img.shields.io/badge/Platforms-macOS%20|%20iOS%20|%20tvOS%20|%20watchOS%20|%20visionOS-blue.svg)](#platform-support)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 
-> **Status:** experimental, pre-1.0, Apple-only. JLISwift is a pure-Swift JPEG codec (Accelerate-backed DSP) that encodes and decodes **baseline (SOF0)**, **extended-sequential (SOF1, 12-bit)**, and **progressive (SOF2)** JPEG, with **optimized per-image Huffman tables**, **trellis (rate-distortion) quantization**, and **jpegli/JPEG-XL distance-driven quality**. It targets feature parity with Google's [jpegli](https://github.com/google/jpegli); the main feature still missing is **XYB color JPEG**. See [What's actually implemented](#whats-actually-implemented) for the full matrix.
+> **Status:** experimental, pre-1.0, Apple-only. JLISwift is a pure-Swift JPEG codec (Accelerate-backed DSP) that encodes and decodes **baseline (SOF0)**, **extended-sequential (SOF1, 12-bit)**, **progressive (SOF2, with restart markers)**, and **lossless (SOF3, predictive — incl. near-lossless)** JPEG at **8/12/16-bit**, plus **reduced-scale decode** (1/2, 1/4, 1/8). Quality tooling: **optimized per-image Huffman tables**, **trellis (rate-distortion) quantization**, **jpegli/JPEG-XL distance**, opt-in **jpegli perceptual quant tables** and a **spatial adaptive-quant field**, and **ICC / Exif** preservation. **XYB** color is implemented (experimental — see caveats below). It targets feature parity with Google's [jpegli](https://github.com/google/jpegli); the main thing left unwired is the **Metal** hot path. See [What's actually implemented](#whats-actually-implemented) for the full matrix.
 
 ## Quick start
 
@@ -44,7 +44,7 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | Chroma subsampling: 4:4:4, 4:2:2, 4:2:0, 4:0:0 (grayscale) | ✅ |
 | Standard ITU-T T.81 Annex K Huffman tables | ✅ |
 | **Optimized (per-image) Huffman tables** (Annex K.2, `optimiseHuffman`, default on) | ✅ |
-| Restart marker (DRI / RST) decode — interop with ImageIO/libjpeg output | ✅ |
+| Restart markers (DRI / RST) — decode **and** encode (baseline + progressive, `restartInterval`) | ✅ |
 | Quality-scaled standard quantization tables (IJG formula) | ✅ |
 | Distance parameter (jpegli/JXL convention; maps to IJG quality) | ✅ |
 | RGB / RGBA / grayscale / pre-converted YCbCr input (8-bit) | ✅ |
@@ -53,12 +53,18 @@ print(info.width, info.height, info.componentCount, info.chromaSubsampling)
 | SOF1 (extended sequential) decode — reads 12-bit JPEGs from libjpeg/ImageIO | ✅ |
 | **Progressive (SOF2) decode** — multi-scan, spectral selection, successive approximation | ✅ |
 | **Progressive (SOF2) encode** — spectral-selection *and* successive-approximation scan scripts (`progressive` + `progressiveMode`, opt-in) | ✅ |
+| **Lossless (SOF3, predictive)** encode + decode — 8/12/16-bit, grayscale + RGB, predictors 1–7 | ✅ |
+| **Near-lossless** via point transform (`losslessPointTransform`, bounded error 2^Pt−1) | ✅ |
+| **Reduced-scale decode** — 1/2, 1/4, 1/8 (exact box averages from low-frequency coefficients, `scale`) | ✅ |
 | `inspect()` — metadata parse without full decode | ✅ |
 | Accelerate `vDSP_mmul` DCT, `vDSP_vmul` quant, vectorized BT.601 color conversion | ✅ |
 | Round-trip + cross-codec tested (ImageIO, libjpeg-turbo, mozjpeg) on synthetic + DICOM | ✅ |
 | Trellis quantization — keep/drop + HF magnitude reduction (`adaptiveQuantization`, 8-bit, default on) | ✅ |
-| 16-bit / float32 input | ❌ planned (8- and 12-bit integer paths work) |
-| XYB color space JPEG | ❌ planned (XYB transform math exists, encoder doesn't emit XYB) |
+| **jpegli perceptual quant tables** — libjxl base matrices + non-linear distance scale (`perceptualQuantTables`, opt-in) | ✅ |
+| **Spatial adaptive-quant field** — per-block λ from a masking proxy (`adaptiveQuantField`, opt-in) | ✅ |
+| **ICC profile + Exif** — extracted on decode, embedded on encode (`JLIImage.iccProfile` / `.exif`) | ✅ |
+| **16-bit input** (lossless `.uint16`) · **float32 input** (normalised [0,1] → 8-bit) | ✅ |
+| **XYB color space JPEG** — encode + decode + ICC; experimental (see caveats) | ✅ |
 | Metal GPU pipeline | ⚠️ kernels compile but are not wired into encode/decode |
 
 ### Optimized Huffman tables
@@ -103,8 +109,11 @@ mid-magnitude (photographic) content. 12-bit stays exact round-to-nearest
 (medical precision is not traded for bytes). High-entropy blocks (>32 nonzero AC
 coeffs) skip the O(m²) DP, bounding worst-case encode time.
 `optimiseHuffman`, `adaptiveQuantization` (trellis), `distance`, and `progressive`
-are all honored. `colorSpace = .xyb` is still a stub (the XYB transform math
-exists but the encoder doesn't emit XYB JPEGs yet).
+are all honored. Two opt-in perceptual levers go further: `perceptualQuantTables`
+derives the quant tables from jpegli's base matrices + non-linear distance scale
+(rather than scaling Annex K), and `adaptiveQuantField` varies the trellis λ per
+luma block by a masking proxy (~5–8% lower butteraugli on detailed 4:4:4 content;
+off by default because it can slightly enlarge low-quality 4:2:0).
 
 On the DICOM corpus, **spectral-selection** progressive 4:4:4 is ~5% smaller
 than baseline 4:4:4 at identical PSNR — the AC-scan EOBRUN codes the long runs
@@ -133,8 +142,25 @@ config.progressive = true
 
 `distance` maps to an effective IJG quality (libjxl's `JpegQualityToDistance`
 curve, inverted) that scales the standard quant tables — same monotonic
-rate/distance behavior as jpegli, but not byte-identical since JLISwift scales
-the standard tables rather than jpegli's perceptual base matrices.
+rate/distance behavior as jpegli. For jpegli's actual perceptual rate
+allocation, set `perceptualQuantTables = true`, which builds the tables from
+libjxl's XYB base matrices and a per-coefficient non-linear distance function.
+
+### XYB color (experimental)
+
+`colorSpace = .xyb` encodes in JPEG XL's XYB perceptual color space (4:4:4) and
+embeds an ICC profile (a faithful port of libjxl's XYB profile) so the result is
+a standard JPEG. The color is provably correct — Apple's CoreGraphics transforms
+the embedded profile to sRGB matching the codec's own inverse to **0.28/255**.
+Two caveats keep it experimental:
+
+- **Apple's image-render path** (Preview, `CGContext` drawing, `sips`) does **not**
+  apply CLUT-based A2B ICC profiles, so it misrenders XYB JPEGs despite the
+  profile being correct — on Apple, decode them with **this** library
+  (`JLIDecoder` detects the profile and inverts XYB); browsers / libjxl-based
+  CMS render them correctly.
+- In current tuning the size/quality is ≈ at parity with the tuned YCbCr 4:4:4
+  perceptual path, not a clear win — so the default stays YCbCr.
 
 ## Platform support
 
@@ -161,7 +187,13 @@ Numbers from `swift run -c release JLIBench` on Apple Silicon (M-series), median
 | noise — encode | 24.9 ms | 3.3 ms |
 | noise — decode | 33.0 ms | 2.7 ms |
 
-ImageIO is ~10× faster today. The remaining headroom is mostly batched DCT (currently one `vDSP_mmul` per 8×8 block; per-call overhead dominates), an AAN/LLM fast DCT, and SIMD-friendly Huffman encoding. Compression ratios are within a few percent of ImageIO at matched quality.
+(Numbers from an earlier run; encode has since gained a batched-accumulator
+`BitWriter` and multi-threaded trellis + Huffman-counting.) ImageIO (C + hand-asm
+libjpeg-turbo) is still several × faster. The forward/inverse DCT already runs as
+a batched GEMM on Accelerate, so the gap is *cumulative* — spread across the DCT,
+trellis, the optimized-Huffman counting pass, color conversion, and per-bit
+entropy coding — rather than one fixable hotspot. Compression ratios are within a
+few percent of ImageIO at matched quality.
 
 Run the benchmark yourself:
 
@@ -174,8 +206,8 @@ swift run -c release JLIBench
 ```
 Sources/JLISwift/
 ├── Core/                 JLIImage, JLIError, JLIConfiguration, JLIJPEGInfo
-├── Encoder/              JLIEncoder (SOF0/SOF1/SOF2 encode) + JLIProgressiveEncoder
-├── Decoder/              JLIDecoder (SOF0/SOF1/SOF2 decode + inspect()) + JLIProgressiveDecoder
+├── Encoder/              JLIEncoder (SOF0/SOF1/SOF2/SOF3 + XYB encode) + JLIProgressiveEncoder
+├── Decoder/              JLIDecoder (SOF0/SOF1/SOF2/SOF3 decode, scaled decode, inspect()) + JLIProgressiveDecoder
 ├── DSP/                  JLIDCT (Accelerate façade), JLIQuantization
 ├── Entropy/              BitWriter/BitReader (incl. JPEG byte stuffing), Huffman tables + encode/decode
 ├── Markers/              SOI/APP0/SOF0/DHT/DQT/SOS/EOI writer + parser
@@ -192,7 +224,7 @@ Sources/JLIBench/
 ├── Harness.swift         Median-of-N timing, PSNR, self/cross runners
 └── main.swift            CLI: synthetic + DICOM modes, regression flags
 
-Tests/JLISwiftTests/      116 tests across 10 suites (Swift Testing framework)
+Tests/JLISwiftTests/      160 tests across 16 suites (Swift Testing framework)
 ```
 
 ## Bench: cross-codec + regression
@@ -257,17 +289,14 @@ JLISwift ↔ libjpeg-turbo-12 cross-decode passes both directions.
 
 ## Roadmap
 
-JLISwift's long-term direction is feature parity with [jpegli](https://github.com/google/jpegli) — Google's improved JPEG encoder that ships ~35% smaller files at matched visual quality. The 0.1.x line already covers baseline, extended-sequential (12-bit), and progressive JPEG with optimized Huffman, trellis quantization, and distance-driven quality; subsequent releases add the remaining jpegli-specific features.
+JLISwift's direction is feature parity with [jpegli](https://github.com/google/jpegli), Google's improved JPEG encoder. The 0.1.x line already covers the bulk of it: baseline / extended-sequential (12-bit) / progressive / lossless JPEG, optimized Huffman, trellis quantization, distance, jpegli perceptual quant tables and a spatial adaptive-quant field, and XYB color (experimental). A measured finding from this work: most of jpegli's quality gain comes from the perceptual quantization (which the YCbCr path now has) rather than the XYB color space — in testing, XYB lands ≈ at parity with the YCbCr perceptual path.
 
-Next-up candidates (rough order):
+Remaining (deferred — low/uncertain value or out of scope for now):
 
-Remaining:
+1. **Metal hot path** — actually invoke the existing `JLIMetalPipeline` kernels; marginal over the Accelerate AMX/GPU GEMM, and hard to validate bit-exactly.
+2. **Table-driven (multi-bit) Huffman decode** — ~2–3 ms; conflicts with the restart/byte-alignment path, risky against the fuzz-hardened decoder.
 
-1. **XYB color-space encoding** — perceptual color space from JPEG XL; the transform math exists but the encoder doesn't emit XYB JPEGs.
-2. **16-bit / float32 input** — wider source formats (8- and 12-bit integer paths work).
-3. **Metal hot path** — actually invoke the existing `JLIMetalPipeline` kernels (marginal over the Accelerate CPU path).
-
-Done since 0.1 — all cross-validated against libjpeg-turbo, mozjpeg, and ImageIO with PSNR + butteraugli, regression-tracked: spec-compliance fixes (byte-unstuffing, DRI/RST, SOF1), Accelerate-backed batched DCT, **optimized Huffman tables** (≈ libjpeg-turbo `-optimize`), **12-bit grayscale and color** encode/decode, **distance parameter**, **trellis quantization** (keep/drop + HF magnitude reduction), **progressive (SOF2) decode and encode** (spectral selection + successive approximation), and **fuzz-hardened decoding** (throws, never traps, on malformed input).
+Done since 0.1 — all cross-validated against libjpeg-turbo / mozjpeg / ImageIO (and Apple CoreGraphics for XYB color) with PSNR + butteraugli, regression-tracked: spec fixes (byte-unstuffing, DRI/RST, SOF1); Accelerate-backed batched DCT; **optimized Huffman tables**; **12/16-bit** and **float32** input; **distance parameter**; **trellis quantization**; **jpegli perceptual quant tables** + **spatial adaptive-quant field**; **progressive (SOF2)** decode + encode **with restart markers**; **lossless (SOF3)** + **near-lossless**; **reduced-scale decode** (1/2, 1/4, 1/8); **ICC / Exif** metadata; **XYB** color encode/decode (experimental); **multi-threaded** trellis + Huffman-counting encode; and **fuzz-hardened decoding** (throws, never traps).
 
 ## Requirements
 
