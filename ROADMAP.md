@@ -3,12 +3,14 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-29 — **0.2.0 RELEASED** (tagged `v0.2.0`, GitHub Release live): jpegli perceptual-quant default (medical quality win — CT q90 ba 1.20 vs 1.82 at equal bytes), **~15–16% faster encode** + **~26–43% faster decode** (byte-identical), the **JLILab** macOS lab (now with an app icon), and measurement tooling. Focus is now the **0.3.0 plan** (below): close the jpegli quality gap (full adaptive-quant field) + ship JLILab as a signed app._
+_Last updated: 2026-05-29 — **0.2.0 RELEASED** (tagged `v0.2.0`, GitHub Release live): jpegli perceptual-quant default (medical quality win — CT q90 ba 1.20 vs 1.82 at equal bytes), **~15–16% faster encode** + **~26–43% faster decode** (byte-identical), the **JLILab** macOS lab (now with an app icon), and measurement tooling. Focus is now the **0.3.0 plan** (below): ship JLILab as a signed/notarized app (+ DMG) with the adaptive-quant field opt-in; the jpegli quality-parity goal (MR gap, needs a field oracle) moved to 0.4.0._
 
-## 0.3.0 — Proposed Plan (active, 2026-05-29)
+## 0.3.0 — Plan (active, 2026-05-29)
 
-**Theme: close the jpegli quality gap, and turn JLILab into a real distributable app.**
-**Goals:** match jpegli on butteraugli-at-matched-bytes across the DICOM corpus (today behind ~0.25 ba — CT q90 ours 1.20 vs jpegli 0.95) with **no medical regression**; ship a **signed/notarized JLILab.app** (+ DMG). Discipline unchanged: RD-validated quality, byte-identical (or explicitly re-validated) perf, CI-green.
+**Theme: turn JLILab into a real, distributable signed app; ship the adaptive-quant field opt-in.**
+**Goals:** a **signed/notarized JLILab.app (+ DMG)** is the headline deliverable, with the jpegli **adaptive-quant field landed as an opt-in/experimental path** (no medical regression — default stays `perceptual-420`). Matching jpegli on butteraugli-at-matched-bytes (the residual **MR gap**) proved to need a field oracle, so it's **moved to 0.4.0**. Discipline unchanged: RD-validated quality, byte-identical (or explicitly re-validated) perf, CI-green.
+
+**Release gate:** code is ready now; the only blocker is the signed DMG, which needs an Apple Developer identity + a stored `notarytool` keychain profile (see WS-B). Tag `v0.3.0` once the DMG is produced.
 
 ### WS-A — Full jpegli adaptive-quant field (P1, headline quality)
 - [x] **Ported** libjxl `adaptive_quantization.cc` (faithful scalar): pre-erosion → fuzzy erosion → mask/HF/gamma per-block modulations → `aq_strength`. Operates on the block-padded luma grid (edge-replicated). Sanity-tested.
@@ -16,7 +18,7 @@ _Last updated: 2026-05-29 — **0.2.0 RELEASED** (tagged `v0.2.0`, GitHub Releas
 - [~] **RD-measured (`--rd-matrix`, butteraugli) — first cut does NOT close the gap.** vs `perceptual-420` (the 0.2.0 default) it makes files *smaller* but butteraugli is mixed (CT q90 1.16 vs 1.20 slightly better; MR 1.59 vs 1.25 worse; XA ~wash) and still well behind jpegli (CT 0.95). The "smaller-but-worse" pattern points to a **quantized-value scale mismatch** (jpegli's DCT normalization differs → the 0.59-ish thresholds are mis-scaled) plus a **per-component field on chroma** (jpegli uses the luma-derived field for all channels). **Default stays `perceptual-420`; the path ships opt-in/experimental.**
 - [~] **Calibration attempted (aq_strength scale sweep) — image-dependent, not a uniform win.** `dctMatrix` is orthonormal, so the threshold *offset* (0.59) is correctly scaled; the over-aggression is `aq_strength` magnitude. Sweeping aq×{1.0, 0.5}: at **4:4:4** jpegliAQ matches/beats both perceptual *and* jpegli on **CT** (×1.0: ba 0.94 ≈ jpegli 0.95, < perceptual 1.07) and **XA** (×0.5: 1.33 < perceptual 1.50), but stays worse on **MR** (≈1.22 vs perceptual 0.99) at *every* scale. No single global scale wins → the field's *response shape* (luma input-scaling vs jpegli's `input_buffer` range), not its magnitude, is the likely culprit. Default stays `perceptual-420`; path remains opt-in/experimental at the faithful aq (×1.0).
 - [x] **Luma-derived field for chroma** (faithful — jpegli computes the masking field once on luma and maps it to every channel; box-averaged for subsampled chroma). Correct for color input. **Medical results unchanged** (CT/MR/XA are grayscale → chroma≈0, so they're luma-dominated). After it: **jpegliAQ-444 matches jpegli on CT (0.944 ≈ 0.946) and beats the perceptual default on CT (1.07) and XA (1.50→1.26)** — but still **loses on MR (1.24 vs perceptual 0.99)**. So the residual gap is the **luma field over-quantizing MR-type (smooth-with-subtle-detail) content**, not chroma.
-- [ ] **Close the MR gap (deferred — needs an oracle):** the luma field diverges from jpegli's on smooth content; debugging it principledly needs a **jpegli field oracle** (instrument `cjpegli` to dump its `quant_field`) to diff against — blind tuning is image-dependent (a global aq scale helps MR but hurts CT). The 0.2.0 perceptual default already banked the headline medical win, so this is upside. Residual gap may also be partly XYB → WS-E.
+- [ ] **Close the MR gap — moved to 0.4.0 (needs an oracle):** the luma field diverges from jpegli's on smooth content; debugging it principledly needs a **jpegli field oracle** (instrument `cjpegli` to dump its `quant_field`) to diff against — blind tuning is image-dependent (a global aq scale helps MR but hurts CT). The 0.2.0 perceptual default already banked the headline medical win, so this is upside, not a 0.3.0 blocker. Residual gap may also be partly XYB → WS-E.
 
 ### WS-B — JLILab distribution (P1)
 - [x] **Sign/notarize/DMG scaffolding**: `JLILab/scripts/package.sh` (archive → Developer-ID export → `notarytool --wait` → staple → DMG) + `ExportOptions.plist`; hardened runtime already on, non-sandboxed (so it reads user files + shells out to butteraugli/cjpeg). *The notarize step needs your Apple Developer identity + a stored `notarytool` keychain profile — everything else is ready.*
@@ -35,7 +37,11 @@ _Last updated: 2026-05-29 — **0.2.0 RELEASED** (tagged `v0.2.0`, GitHub Releas
 ### WS-E — Re-evaluate XYB with the mature perceptual machinery (P3).
 
 ### Sequencing
-M1 **WS-A** (quality — the medical raison d'être) → M2 **WS-B** (ship the app) → M3 WS-C/D → tag 0.3.0.
+WS-A's opt-in field has landed; the remaining 0.3.0 work is **WS-B** (ship the signed app). **Tag `v0.3.0` once the notarized DMG is produced.** Closing the jpegli/MR gap (needs a field oracle) + WS-C/D/E move to **0.4.0**.
+
+## 0.4.0 — Proposed (quality + perf)
+- **Close the jpegli quality gap (MR):** build a **field oracle** (instrument `cjpegli` to dump its `quant_field`), diff against ours, and fix the luma field's response shape on smooth content (WS-A residual, above).
+- **WS-C** targeted perf (parallel inverse color/decode, parallel entropy emit opt-in, fused dequant+IDCT); **WS-D** float32 decode output + DocC + expanded fuzz/conformance; **WS-E** re-evaluate XYB with the mature perceptual machinery.
 
 ## 0.2.0 — Optimization release (shipped v0.2.0, 2026-05-29)
 
