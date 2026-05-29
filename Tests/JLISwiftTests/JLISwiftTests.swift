@@ -185,8 +185,11 @@ struct CoreTypeTests {
 
     // MARK: - Version
 
-    @Test("Library version is set")
+    @Test("Library version is a valid semantic version")
     func libraryVersion() {
-        #expect(JLISwift.version == "0.1.0")
+        // Validate the shape, not a literal, so version bumps don't break the test.
+        let parts = JLISwift.version.split(separator: "-")[0].split(separator: ".")
+        #expect(parts.count == 3, "expected MAJOR.MINOR.PATCH, got \(JLISwift.version)")
+        #expect(parts.allSatisfy { UInt($0) != nil }, "non-numeric version component in \(JLISwift.version)")
     }
 }
