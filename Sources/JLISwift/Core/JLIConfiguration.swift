@@ -175,19 +175,23 @@ public struct JLIEncoderConfiguration: Sendable {
     /// Creates an encoder configuration.
     ///
     /// - Parameters:
+    /// All parameters default to the same values as ``default``; see each
+    /// property for the full description and trade-offs.
+    ///
+    /// - Parameters:
     ///   - quality: JPEG quality level (0.0 – 100.0). Default is 90.
     ///   - distance: Optional jpegli distance parameter. Overrides quality when set.
     ///   - chromaSubsampling: Chroma subsampling mode. Default is `.yuv420`.
     ///   - colorSpace: Encoding color space. Default is `.yCbCr`.
-    ///   - progressive: Whether to produce a progressive JPEG. Default is `true`.
+    ///   - progressive: Whether to produce a progressive JPEG. Default is `false` (opt-in).
     ///   - optimiseHuffman: Whether to use optimised Huffman tables. Default is `true`.
-    ///   - adaptiveQuantization: Whether to enable adaptive quantization. Default is `true`.
+    ///   - adaptiveQuantization: Whether to enable trellis quantization. Default is `true`.
     public init(
         quality: Double = 90.0,
         distance: Double? = nil,
         chromaSubsampling: JLIChromaSubsampling = .yuv420,
         colorSpace: JLIEncodingColorSpace = .yCbCr,
-        progressive: Bool = true,
+        progressive: Bool = false,
         progressiveMode: JLIProgressiveMode = .spectralSelection,
         restartInterval: Int = 0,
         lossless: Bool = false,
@@ -250,7 +254,7 @@ public struct JLIDecoderConfiguration: Sendable {
     /// - Parameters:
     ///   - outputPixelFormat: Desired output pixel format, or `nil` for auto-detection.
     ///   - outputColorModel: Desired output color model, or `nil` for auto-detection.
-    ///   - scale: Decode at `1/scale` resolution (`1` full, `8` for 1/8 thumbnails).
+    ///   - scale: Decode at `1/scale` resolution — `1` (full), `2`, `4`, or `8`.
     public init(
         outputPixelFormat: JLIPixelFormat? = nil,
         outputColorModel: JLIColorModel? = nil,

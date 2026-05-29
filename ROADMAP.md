@@ -60,4 +60,4 @@ _Last updated: 2026-05-29 (adaptive-quant field `adaptiveQuantField`, opt-in —
 
 ### Tier 4 — release (final state)
 - [ ] Tag release (Version Bump → Release GitHub Actions; currently `0.1.0`, untagged)
-- [ ] DocC API documentation
+- [~] DocC API documentation — library overview rewritten accurately (real feature set, DocC `## Topics`, usage examples; dropped the old overstated "35% / NEON-SSE / Metal" claims) and stale public-API doc/defaults corrected. Remaining: a `.docc` catalog + `swift-docc-plugin` for `swift package generate-documentation` (couldn't add it here — this machine's git `safe.bareRepository=explicit` blocks SwiftPM fetching the plugin; add in an unrestricted env / Xcode).
