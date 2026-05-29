@@ -1,11 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024 Raster Lab. All rights reserved.
 
+import Foundation
+
 /// Chroma subsampling and upsampling operations.
 ///
 /// Handles chroma plane downsampling (encoder) and upsampling (decoder)
 /// for the supported subsampling modes: 4:4:4, 4:2:2, 4:2:0, and 4:0:0.
 enum ChromaSampling {
+
+    /// Raw pointers for the parallel upsample. Each row is written independently,
+    /// so sharing these across `concurrentPerform` workers is safe (the buffers
+    /// stay alive for the synchronous duration of the call).
+    private struct UpsamplePtrs: @unchecked Sendable {
+        let src: UnsafePointer<Float>
+        let dst: UnsafeMutablePointer<Float>
+        let sx0: UnsafePointer<Int>
+        let sx1: UnsafePointer<Int>
+        let fx: UnsafePointer<Float>
+    }
 
     /// Downsamples a component plane by a factor of 2 in each specified dimension.
     ///
@@ -90,27 +103,47 @@ enum ChromaSampling {
         var result = [Float](unsafeUninitializedCapacity: targetWidth * targetHeight) {
             _, c in c = targetWidth * targetHeight
         }
+        // Hoist into Sendable scalars for the parallel closure.
+        let th = targetHeight, tw = targetWidth, w = width, h = height, ys = yScale
         plane.withUnsafeBufferPointer { srcBuf in
             result.withUnsafeMutableBufferPointer { dstBuf in
                 sx0.withUnsafeBufferPointer { x0b in
                     sx1.withUnsafeBufferPointer { x1b in
                         fxs.withUnsafeBufferPointer { fxb in
-                            let p = srcBuf.baseAddress!, d = dstBuf.baseAddress!
-                            let X0 = x0b.baseAddress!, X1 = x1b.baseAddress!, FX = fxb.baseAddress!
-                            for ty in 0..<targetHeight {
-                                let srcY = Float(ty) * yScale
-                                let sy0 = min(Int(srcY), height - 1)
-                                let sy1 = min(sy0 + 1, height - 1)
-                                let fy = srcY - Float(sy0)
-                                let row0 = sy0 * width, row1 = sy1 * width
-                                let drow = ty * targetWidth
-                                for tx in 0..<targetWidth {
-                                    let x0 = X0[tx], x1 = X1[tx], fx = FX[tx]
-                                    let v00 = p[row0 + x0], v10 = p[row0 + x1]
-                                    let v01 = p[row1 + x0], v11 = p[row1 + x1]
-                                    d[drow + tx] = v00 * (1 - fx) * (1 - fy) + v10 * fx * (1 - fy) +
-                                                   v01 * (1 - fx) * fy + v11 * fx * fy
+                            let ptrs = UpsamplePtrs(
+                                src: srcBuf.baseAddress!, dst: dstBuf.baseAddress!,
+                                sx0: x0b.baseAddress!, sx1: x1b.baseAddress!, fx: fxb.baseAddress!)
+                            // Each output row is independent → bit-identical whether
+                            // computed serially or split across cores.
+                            let rows: @Sendable (Int, Int) -> Void = { rowStart, rowEnd in
+                                let p = ptrs.src, d = ptrs.dst
+                                let X0 = ptrs.sx0, X1 = ptrs.sx1, FX = ptrs.fx
+                                for ty in rowStart..<rowEnd {
+                                    let srcY = Float(ty) * ys
+                                    let sy0 = min(Int(srcY), h - 1)
+                                    let sy1 = min(sy0 + 1, h - 1)
+                                    let fy = srcY - Float(sy0)
+                                    let row0 = sy0 * w, row1 = sy1 * w
+                                    let drow = ty * tw
+                                    for tx in 0..<tw {
+                                        let x0 = X0[tx], x1 = X1[tx], fx = FX[tx]
+                                        let v00 = p[row0 + x0], v10 = p[row0 + x1]
+                                        let v01 = p[row1 + x0], v11 = p[row1 + x1]
+                                        d[drow + tx] = v00 * (1 - fx) * (1 - fy) + v10 * fx * (1 - fy) +
+                                                       v01 * (1 - fx) * fy + v11 * fx * fy
+                                    }
                                 }
+                            }
+                            let cores = max(1, ProcessInfo.processInfo.activeProcessorCount)
+                            if tw * th >= 65_536 && th >= 2 * cores {
+                                let chunkRows = (th + cores - 1) / cores
+                                let chunks = (th + chunkRows - 1) / chunkRows
+                                DispatchQueue.concurrentPerform(iterations: chunks) { c in
+                                    let s = c * chunkRows
+                                    rows(s, min(s + chunkRows, th))
+                                }
+                            } else {
+                                rows(0, th)
                             }
                         }
                     }
