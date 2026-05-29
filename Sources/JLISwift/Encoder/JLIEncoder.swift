@@ -827,18 +827,23 @@ public struct JLIEncoder: Sendable {
         rdo: RDOContext? = nil, adaptiveField: Bool = false
     ) -> [Int32] {
         let n = blocksH * blocksV
-        var blockBuf = [Float](repeating: 0, count: n * 64)
+        // These three n·64 buffers are each fully overwritten downstream
+        // (extract writes every block element edge-clamped; the DCT and quantize
+        // batches process every coefficient), so allocate them *uninitialized* —
+        // the zero-fill was the dominant `bzero` cost in the encode profile. The
+        // round-trip + cross-codec suite verifies nothing is left unwritten.
+        var blockBuf = [Float](unsafeUninitializedCapacity: n * 64) { _, c in c = n * 64 }
         extractAllBlocksLevelShifted(
             plane, planeWidth: planeWidth, planeHeight: planeHeight,
             blocksH: blocksH, blocksV: blocksV, levelShift: levelShift, into: &blockBuf
         )
 
-        var dctBuf = [Float](repeating: 0, count: n * 64)
+        var dctBuf = [Float](unsafeUninitializedCapacity: n * 64) { _, c in c = n * 64 }
         AccelerateDSP.forwardDCTBatch(
             blockBuf, into: &dctBuf, scratch: &scratch, blockCount: n
         )
 
-        var quant = [Int32](repeating: 0, count: n * 64)
+        var quant = [Int32](unsafeUninitializedCapacity: n * 64) { _, c in c = n * 64 }
         AccelerateDSP.quantizeBatch(
             dctBuf, invTable: invQuant, into: &quant, blockCount: n
         )

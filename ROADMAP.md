@@ -35,9 +35,10 @@ release-measured + regression-baselined; byte/bit-identical gates; fuzz still th
 ### WS2 — Encode speed (P1; real ~6× gap)
 - [x] **Profiled** (`JLIBench --profile-encode` + `sample`, release, 1024²). Baseline ms/encode: gradient 17.6, checker 16.7, **noise 51**. Self-time leaders: **allocation churn dominates the non-compute cost** — `memmove` + `bzero` + `madvise` + `Array.init` ≈ 1238 samples, > any single compute stage; then `quantizePlane` 455, `countAC` 295, `encodeAC` 276, `trellisBlocks` 196; DCT (BLAS/vDSP) is comparatively small (already a GEMM).
 - [x] **Color-conversion alloc/COW fix** (first allocation win): `imageRGBToYCbCr`/`imageYCbCrToRGB` rewritten to use one *uninitialized* scratch block + raw pointers — kills the zero-fill of fully-overwritten buffers and the per-call copy-on-write the in-place `vDSP_vsma` chain triggered. **Byte-identical** (same vDSP ops; 164 tests + cross-codec green). ~12% faster checker / ~6% gradient encode (negligible on noise, where entropy coding dominates); decode gets the same fix.
+- [x] **Uninitialized quantize-pipeline buffers**: `quantizePlane`'s three n·64 buffers (`blockBuf`/`dctBuf`/`quant`) are fully overwritten downstream, so they now allocate without the zero-fill (the dominant `bzero`). Byte-identical (164 tests). **Cumulative WS2 so far: ~15–16% faster encode** on smooth/textured (gradient 17.6→15.0, checker 16.7→14.0 ms @1024²), ~5% on noise.
 - [ ] Parallelize the **entropy emit** via restart-interval segmentation (the remaining serial stage)
 - [ ] **Fuse** forward-DCT → quantize → symbol-count into one cache-resident sweep
-- [ ] Remove remaining hot-loop allocations (DCT/quant scratch, Huffman freq arrays); `withUnsafeBufferPointer` inner loops
+- [ ] Remaining hot-loop allocations (DCT-batch internals, Huffman freq arrays) + decode-side scratch (WS3)
 - [ ] SIMD scalar stages (level-shift, RGB→YCbCr, zig-zag, quantize) via Accelerate/SIMD
 - [ ] Optional **"fast" preset** (skip trellis + optimized-Huffman) for latency-critical use (~trellis is 22%)
 - *Validate:* FNV byte-identical vs serial; bench timing regression baseline (`--save-baseline`)
