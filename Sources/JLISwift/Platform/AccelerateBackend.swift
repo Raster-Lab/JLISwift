@@ -220,44 +220,57 @@ enum AccelerateDSP {
         precondition(componentCount == 3 || componentCount == 4)
         precondition(data.count >= pixelCount * componentCount)
 
-        var r = [Float](repeating: 0, count: pixelCount)
-        var g = [Float](repeating: 0, count: pixelCount)
-        var b = [Float](repeating: 0, count: pixelCount)
         let n = vDSP_Length(pixelCount)
         let stride = vDSP_Stride(componentCount)
 
+        // Outputs allocated *uninitialized* (vDSP fully overwrites every element,
+        // so the zero-fill is wasted) and returned directly (no copy). R/G/B live
+        // in one uninitialized scratch block. All vDSP calls use raw pointers so
+        // the in-place `vDSP_vsma` chain doesn't trip Swift array copy-on-write
+        // (the previous `&y … y … &y` form copied `y` on every call). Same math →
+        // byte-identical output.
+        func uninit() -> [Float] {
+            [Float](unsafeUninitializedCapacity: pixelCount) { _, c in c = pixelCount }
+        }
+        var y = uninit(), cb = uninit(), cr = uninit()
+        let rgbScratch = UnsafeMutableBufferPointer<Float>.allocate(capacity: pixelCount * 3)
+        defer { rgbScratch.deallocate() }
+        let r = rgbScratch.baseAddress!, g = r + pixelCount, b = r + pixelCount * 2
+
         data.withUnsafeBufferPointer { buf in
             let base = buf.baseAddress!
-            vDSP_vfltu8(base + 0, stride, &r, 1, n)
-            vDSP_vfltu8(base + 1, stride, &g, 1, n)
-            vDSP_vfltu8(base + 2, stride, &b, 1, n)
+            vDSP_vfltu8(base + 0, stride, r, 1, n)
+            vDSP_vfltu8(base + 1, stride, g, 1, n)
+            vDSP_vfltu8(base + 2, stride, b, 1, n)
         }
 
-        var y = [Float](repeating: 0, count: pixelCount)
-        var cb = [Float](repeating: 0, count: pixelCount)
-        var cr = [Float](repeating: 0, count: pixelCount)
-
+        var center: Float = 128.0
         // Y = 0.299 R + 0.587 G + 0.114 B
         var yR: Float = 0.299, yG: Float = 0.587, yB: Float = 0.114
-        vDSP_vsmul(r, 1, &yR, &y, 1, n)
-        vDSP_vsma(g, 1, &yG, y, 1, &y, 1, n)
-        vDSP_vsma(b, 1, &yB, y, 1, &y, 1, n)
-
+        y.withUnsafeMutableBufferPointer { yp in
+            let yb = yp.baseAddress!
+            vDSP_vsmul(r, 1, &yR, yb, 1, n)
+            vDSP_vsma(g, 1, &yG, yb, 1, yb, 1, n)
+            vDSP_vsma(b, 1, &yB, yb, 1, yb, 1, n)
+        }
         // Cb = -0.168736 R - 0.331264 G + 0.5 B + 128
         var cbR: Float = -0.168736, cbG: Float = -0.331264, cbB: Float = 0.5
-        var center: Float = 128.0
-        vDSP_vsmul(r, 1, &cbR, &cb, 1, n)
-        vDSP_vsma(g, 1, &cbG, cb, 1, &cb, 1, n)
-        vDSP_vsma(b, 1, &cbB, cb, 1, &cb, 1, n)
-        vDSP_vsadd(cb, 1, &center, &cb, 1, n)
-
+        cb.withUnsafeMutableBufferPointer { cbp in
+            let cbb = cbp.baseAddress!
+            vDSP_vsmul(r, 1, &cbR, cbb, 1, n)
+            vDSP_vsma(g, 1, &cbG, cbb, 1, cbb, 1, n)
+            vDSP_vsma(b, 1, &cbB, cbb, 1, cbb, 1, n)
+            vDSP_vsadd(cbb, 1, &center, cbb, 1, n)
+        }
         // Cr = 0.5 R - 0.418688 G - 0.081312 B + 128
         var crR: Float = 0.5, crG: Float = -0.418688, crB: Float = -0.081312
-        vDSP_vsmul(r, 1, &crR, &cr, 1, n)
-        vDSP_vsma(g, 1, &crG, cr, 1, &cr, 1, n)
-        vDSP_vsma(b, 1, &crB, cr, 1, &cr, 1, n)
-        vDSP_vsadd(cr, 1, &center, &cr, 1, n)
-
+        cr.withUnsafeMutableBufferPointer { crp in
+            let crb = crp.baseAddress!
+            vDSP_vsmul(r, 1, &crR, crb, 1, n)
+            vDSP_vsma(g, 1, &crG, crb, 1, crb, 1, n)
+            vDSP_vsma(b, 1, &crB, crb, 1, crb, 1, n)
+            vDSP_vsadd(crb, 1, &center, crb, 1, n)
+        }
         return (y, cb, cr)
     }
 
@@ -267,47 +280,49 @@ enum AccelerateDSP {
     ) -> [UInt8] {
         precondition(y.count == pixelCount && cb.count == pixelCount && cr.count == pixelCount)
         let n = vDSP_Length(pixelCount)
-
-        // Shift chroma by -128 once; reuse for all three output channels.
-        var cbS = [Float](repeating: 0, count: pixelCount)
-        var crS = [Float](repeating: 0, count: pixelCount)
-        var neg128: Float = -128.0
-        vDSP_vsadd(cb, 1, &neg128, &cbS, 1, n)
-        vDSP_vsadd(cr, 1, &neg128, &crS, 1, n)
-
-        // R = Y + 1.402 Cr',  G = Y - 0.344136 Cb' - 0.714136 Cr',  B = Y + 1.772 Cb'
-        var r = [Float](repeating: 0, count: pixelCount)
-        var g = [Float](repeating: 0, count: pixelCount)
-        var b = [Float](repeating: 0, count: pixelCount)
-        var rCr: Float = 1.402
-        var gCb: Float = -0.344136, gCr: Float = -0.714136
-        var bCb: Float = 1.772
-
-        vDSP_vsma(crS, 1, &rCr, y, 1, &r, 1, n)
-
-        vDSP_vsmul(cbS, 1, &gCb, &g, 1, n)
-        vDSP_vsma(crS, 1, &gCr, g, 1, &g, 1, n)
-        vDSP_vadd(y, 1, g, 1, &g, 1, n)
-
-        vDSP_vsma(cbS, 1, &bCb, y, 1, &b, 1, n)
-
-        var lo: Float = 0.0
-        var hi: Float = 255.0
-        vDSP_vclip(r, 1, &lo, &hi, &r, 1, n)
-        vDSP_vclip(g, 1, &lo, &hi, &g, 1, n)
-        vDSP_vclip(b, 1, &lo, &hi, &b, 1, n)
-
-        var rgb = [UInt8](repeating: 0, count: pixelCount * 3)
         let stride = vDSP_Stride(3)
-        rgb.withUnsafeMutableBufferPointer { buf in
-            let base = buf.baseAddress!
-            // vDSP_vfixru8 rounds to nearest (ties to even), matching the scalar
-            // `Int(value.rounded())` semantics used by the previous implementation.
-            vDSP_vfixru8(r, 1, base + 0, stride, n)
-            vDSP_vfixru8(g, 1, base + 1, stride, n)
-            vDSP_vfixru8(b, 1, base + 2, stride, n)
+
+        // One uninitialized scratch block (cbS, crS, r, g, b) + raw pointers so
+        // the in-place `g` updates don't trip copy-on-write, and no buffer is
+        // zero-filled before vDSP overwrites it. Output allocated uninitialized
+        // (the 3 strided vDSP_vfixru8 cover every byte). Byte-identical math.
+        let scratch = UnsafeMutableBufferPointer<Float>.allocate(capacity: pixelCount * 5)
+        defer { scratch.deallocate() }
+        let cbS = scratch.baseAddress!
+        let crS = cbS + pixelCount, r = cbS + pixelCount * 2
+        let g = cbS + pixelCount * 3, b = cbS + pixelCount * 4
+
+        var neg128: Float = -128.0
+        var rCr: Float = 1.402, gCb: Float = -0.344136, gCr: Float = -0.714136, bCb: Float = 1.772
+        var lo: Float = 0.0, hi: Float = 255.0
+
+        return y.withUnsafeBufferPointer { yp in
+            cb.withUnsafeBufferPointer { cbp in
+                cr.withUnsafeBufferPointer { crp in
+                    let yb = yp.baseAddress!, cbb = cbp.baseAddress!, crb = crp.baseAddress!
+                    vDSP_vsadd(cbb, 1, &neg128, cbS, 1, n)
+                    vDSP_vsadd(crb, 1, &neg128, crS, 1, n)
+                    // R = Y + 1.402 Cr',  G = Y - 0.344136 Cb' - 0.714136 Cr',  B = Y + 1.772 Cb'
+                    vDSP_vsma(crS, 1, &rCr, yb, 1, r, 1, n)
+                    vDSP_vsmul(cbS, 1, &gCb, g, 1, n)
+                    vDSP_vsma(crS, 1, &gCr, g, 1, g, 1, n)
+                    vDSP_vadd(yb, 1, g, 1, g, 1, n)
+                    vDSP_vsma(cbS, 1, &bCb, yb, 1, b, 1, n)
+                    vDSP_vclip(r, 1, &lo, &hi, r, 1, n)
+                    vDSP_vclip(g, 1, &lo, &hi, g, 1, n)
+                    vDSP_vclip(b, 1, &lo, &hi, b, 1, n)
+                    // vDSP_vfixru8 rounds to nearest (ties to even), matching the
+                    // scalar `Int(value.rounded())` semantics.
+                    return [UInt8](unsafeUninitializedCapacity: pixelCount * 3) { buf, cnt in
+                        let base = buf.baseAddress!
+                        vDSP_vfixru8(r, 1, base + 0, stride, n)
+                        vDSP_vfixru8(g, 1, base + 1, stride, n)
+                        vDSP_vfixru8(b, 1, base + 2, stride, n)
+                        cnt = pixelCount * 3
+                    }
+                }
+            }
         }
-        return rgb
     }
 
     // MARK: - 16-bit (12-bit precision) color conversion

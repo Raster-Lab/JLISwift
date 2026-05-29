@@ -64,6 +64,29 @@ func runRDMatrix(root: String) {
     }
 }
 
+/// Tight encode loop for profiling (run `sample <pid>` while it spins). Prints
+/// per-encode ms for gradient/checker/noise, then sustains the checkerboard loop.
+func runProfileEncode(size: Int) {
+    let imgs = TestImages.make(size: size)
+    let cfg = JLIEncoderConfiguration.default
+    func loop(_ ti: TestImage, seconds: Double) -> (Int, Double) {
+        let image = try! JLIImage(width: ti.width, height: ti.height,
+                                  pixelFormat: .uint8, colorModel: .rgb, data: ti.rgb)
+        for _ in 0..<3 { _ = try! JLIEncoder().encode(image, configuration: cfg) }  // warm
+        var n = 0; let t0 = Date(); let deadline = t0.addingTimeInterval(seconds)
+        while Date() < deadline { _ = try! JLIEncoder().encode(image, configuration: cfg); n += 1 }
+        return (n, Date().timeIntervalSince(t0) * 1000 / Double(max(1, n)))
+    }
+    print("PID \(ProcessInfo.processInfo.processIdentifier) — profiling \(size)×\(size) encode (.default)")
+    for ti in imgs {
+        let (n, ms) = loop(ti, seconds: 2.0)
+        print(String(format: "  %-14@ %6.2f ms/encode (%d runs)", ti.name as NSString, ms, n))
+    }
+    let checker = imgs.first { $0.name.contains("checker") } ?? imgs[0]
+    print("sustaining \(checker.name) loop ~10s — run: sample \(ProcessInfo.processInfo.processIdentifier) 5")
+    _ = loop(checker, seconds: 10.0)
+}
+
 // MARK: - CLI
 
 struct BenchOptions {
@@ -139,6 +162,10 @@ func printHelp() {
     """)
 }
 
+if let i = CommandLine.arguments.firstIndex(of: "--profile-encode") {
+    let size = (i + 1 < CommandLine.arguments.count ? Int(CommandLine.arguments[i + 1]) : nil) ?? 1024
+    runProfileEncode(size: size); exit(0)
+}
 if CommandLine.arguments.contains("--rd-matrix") {
     var root = "Sources/LocalDatasets/medical-dicom-organized"
     if let i = CommandLine.arguments.firstIndex(of: "--dicom-root"), i + 1 < CommandLine.arguments.count {
