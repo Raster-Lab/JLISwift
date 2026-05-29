@@ -10,12 +10,24 @@ enum Render {
 
     static func cgImage(rgb8: [UInt8], width: Int, height: Int) -> CGImage? {
         guard width > 0, height > 0, rgb8.count >= width * height * 3 else { return nil }
+        // Expand to 32-bpp RGBA with an opaque (ignored) alpha. SwiftUI composites
+        // images through Core Animation / the GPU, which renders 24-bpp no-alpha
+        // CGImages unreliably (often as a blank/white tile); 32-bpp RGBA is the
+        // format the compositor handles correctly.
+        let pixels = width * height
+        var rgba = [UInt8](repeating: 0, count: pixels * 4)
+        for i in 0..<pixels {
+            rgba[i * 4]     = rgb8[i * 3]
+            rgba[i * 4 + 1] = rgb8[i * 3 + 1]
+            rgba[i * 4 + 2] = rgb8[i * 3 + 2]
+            rgba[i * 4 + 3] = 255
+        }
         let cs = CGColorSpaceCreateDeviceRGB()
-        let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue)
-        guard let provider = CGDataProvider(data: Data(rgb8) as CFData) else { return nil }
+        let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue)
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData) else { return nil }
         return CGImage(
-            width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 24,
-            bytesPerRow: width * 3, space: cs, bitmapInfo: info,
+            width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+            bytesPerRow: width * 4, space: cs, bitmapInfo: info,
             provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent
         )
     }

@@ -39,7 +39,7 @@ let package = Package(
         ),
         .testTarget(
             name: "JLISwiftTests",
-            dependencies: ["JLISwift"]
+            dependencies: ["JLISwift", "JLIDICOM"]
         ),
     ]
 )

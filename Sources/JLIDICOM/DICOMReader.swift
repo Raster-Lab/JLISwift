@@ -27,6 +27,13 @@ public struct DICOMImage: Sendable {
     public let windowCenter: Double?
     /// Window width (DICOM tag (0028,1051)) if present.
     public let windowWidth: Double?
+    /// Modality-LUT rescale slope (0028,1053); `1` when absent.
+    public let rescaleSlope: Double
+    /// Modality-LUT rescale intercept (0028,1052); `0` when absent. CT stores
+    /// raw values that become Hounsfield units via `raw·slope + intercept`, and
+    /// window center/width are specified in those rescaled units — so this must
+    /// be applied before windowing or CT renders as a blown-out white frame.
+    public let rescaleIntercept: Double
     /// Raw pixel bytes exactly as they appeared in (7FE0,0010).
     public let pixelData: [UInt8]
     /// Transfer Syntax UID — recorded so we can skip files we can't decode.
@@ -112,6 +119,11 @@ public struct DICOMImage: Sendable {
                 }
             }
         }
+        // Modality LUT: stored value → real-world value (e.g. Hounsfield). Identity
+        // when slope/intercept are absent, so 8-bit photographic DICOM is unchanged.
+        if rescaleSlope != 1.0 || rescaleIntercept != 0.0 {
+            for i in 0..<out.count { out[i] = out[i] * rescaleSlope + rescaleIntercept }
+        }
         return out
     }
 
@@ -173,6 +185,8 @@ public enum DICOMReader {
     static let tagPhotometric           = tag(0x0028, 0x0004)
     static let tagWindowCenter          = tag(0x0028, 0x1050)
     static let tagWindowWidth           = tag(0x0028, 0x1051)
+    static let tagRescaleIntercept      = tag(0x0028, 0x1052)
+    static let tagRescaleSlope          = tag(0x0028, 0x1053)
     static let tagPixelData             = tag(0x7FE0, 0x0010)
     static let tagTransferSyntax        = tag(0x0002, 0x0010)
     static let tagItem                  = tag(0xFFFE, 0xE000)
@@ -223,6 +237,8 @@ public enum DICOMReader {
         var photometric = "MONOCHROME2"
         var windowCenter: Double? = nil
         var windowWidth: Double? = nil
+        var rescaleSlope: Double? = nil
+        var rescaleIntercept: Double? = nil
         var pixelData: [UInt8] = []
 
         var p = datasetStart
@@ -246,6 +262,8 @@ public enum DICOMReader {
             case tagPhotometric:         photometric = readString(data, range: parsed.valueRange)
             case tagWindowCenter:        windowCenter = readDecimalString(data, range: parsed.valueRange)
             case tagWindowWidth:         windowWidth = readDecimalString(data, range: parsed.valueRange)
+            case tagRescaleIntercept:    rescaleIntercept = readDecimalString(data, range: parsed.valueRange)
+            case tagRescaleSlope:        rescaleSlope = readDecimalString(data, range: parsed.valueRange)
             case tagPixelData:
                 pixelData = Array(data[parsed.valueRange])
             default: break
@@ -266,6 +284,8 @@ public enum DICOMReader {
             pixelRepresentation: pixelRep,
             photometric: photometric.trimmingCharacters(in: .whitespacesAndNewlines),
             windowCenter: windowCenter, windowWidth: windowWidth,
+            rescaleSlope: rescaleSlope ?? 1.0,
+            rescaleIntercept: rescaleIntercept ?? 0.0,
             pixelData: pixelData,
             transferSyntax: transferSyntax
         )

@@ -76,26 +76,29 @@ enum ImageLoader {
         let w = cg.width, h = cg.height
         guard w > 0, h > 0 else { throw LoadError.decodeFailed("Image has zero dimensions") }
 
-        // Render into a tightly-packed RGBA8 buffer, then drop alpha. A
-        // freshly-created bitmap context is top-down (row 0 = top), matching how
-        // we later build CGImages from the raw buffer, so both panes stay
-        // mutually consistent.
-        var rgba = [UInt8](repeating: 0, count: w * h * 4)
+        // Render into a Core Graphics-owned RGBA8 buffer (top-down), then drop
+        // alpha. Letting the context allocate its own backing store avoids
+        // escaping a Swift array's transient pointer past its access scope.
         let cs = CGColorSpaceCreateDeviceRGB()
         let info = CGImageAlphaInfo.premultipliedLast.rawValue
-        guard let ctx = rgba.withUnsafeMutableBytes({ raw in
-            CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8,
-                      bytesPerRow: w * 4, space: cs, bitmapInfo: info)
-        }) else {
+        // bytesPerRow 0 → Core Graphics picks an (aligned) stride; read it back
+        // rather than assuming w*4, since it may pad each row.
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: cs, bitmapInfo: info),
+              let base = ctx.data else {
             throw LoadError.decodeFailed("Could not create bitmap context")
         }
         ctx.draw(cg, in: CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
 
+        let stride = ctx.bytesPerRow
+        let p = base.bindMemory(to: UInt8.self, capacity: stride * h)
         var rgb = [UInt8](repeating: 0, count: w * h * 3)
-        for i in 0..<(w * h) {
-            rgb[i * 3]     = rgba[i * 4]
-            rgb[i * 3 + 1] = rgba[i * 4 + 1]
-            rgb[i * 3 + 2] = rgba[i * 4 + 2]
+        for y in 0..<h {
+            for x in 0..<w {
+                let s = y * stride + x * 4
+                let d = (y * w + x) * 3
+                rgb[d] = p[s]; rgb[d + 1] = p[s + 1]; rgb[d + 2] = p[s + 2]
+            }
         }
         let label = ext(url).isEmpty ? "Image" : ext(url).uppercased()
         return SourceImage(
