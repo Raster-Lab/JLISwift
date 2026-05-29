@@ -46,9 +46,9 @@ release-measured + regression-baselined; byte/bit-identical gates; fuzz still th
 ### WS3 — Decode speed (P1; table-driven Huffman already landed)
 - [x] **Profiled** (`JLIBench --profile-decode` + `sample`, release 1024²). Dominant cost: **`ChromaSampling.upsample` (1134 samples, ~3× the next item)** — per-pixel array subscripting (copy-on-write checks on every write) + recomputing the x-mapping per pixel. Then inverse color (already optimized) + `Array.init`/COW churn.
 - [x] **Optimized chroma upsample**: precompute the column x-mapping once (identical every row) + raw-pointer source/dest planes (no per-element COW) + uninitialized output. **Byte-identical** (same bilinear formula/order; 164 tests + cross-codec). **~12–19% faster decode** @1024² (gradient 26.1→21.1, checker 24.6→20.6, noise 47.4→41.6 ms).
+- [x] **Killed decode COW + scratch zero-fill**: the scan loop wrote coefficients via nested-array subscript (`componentZigzag[c][dst+i]` → 64 uniqueness checks/block) — now one buffer-pointer write per block; and the four reused per-component scratch buffers (`natural`/`dctBuf`/`pixelsBuf`/`idctScratch`) allocate uninitialized. Byte-identical (164 tests). **Cumulative WS3 decode: ~18–23% faster** @1024² (gradient 26.1→20.0, checker 24.6→19.3, noise 47.4→38.9 ms).
 - [ ] Fuse dequant + IDCT; ensure the batched Accelerate IDCT path for all block counts
 - [ ] Parallelize MCU decode across restart intervals (independent segments)
-- [ ] Decode into a contiguous coefficient plane (kill per-block `[Int32]` churn)
 - *Validate:* bit-identical across suite + cross-codec + fuzz
 
 ### WS4 — Quality-per-byte / jpegli parity (P1; biggest user-visible win)

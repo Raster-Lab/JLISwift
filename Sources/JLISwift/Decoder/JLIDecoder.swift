@@ -194,8 +194,13 @@ public struct JLIDecoder: Sendable {
                                 )
                                 acBuf[0] = prevDC[compIdx]
 
-                                for i in 0..<64 {
-                                    componentZigzag[compIdx][dst + i] = acBuf[i]
+                                // One uniqueness check per block via the buffer
+                                // pointer, instead of 64 from nested-array
+                                // subscript writes (the COW-check cost in the
+                                // decode profile).
+                                componentZigzag[compIdx].withUnsafeMutableBufferPointer { zz in
+                                    let d = zz.baseAddress! + dst
+                                    for i in 0..<64 { d[i] = acBuf[i] }
                                 }
                             }
                         }
@@ -208,10 +213,13 @@ public struct JLIDecoder: Sendable {
         // level-shift up, then write each block into its plane.
         var componentPlanes = [(data: [Float], width: Int, height: Int)]()
         let maxBlockCount = componentDimensions.map { $0.blocksH * $0.blocksV }.max() ?? 0
-        var natural = [Int32](repeating: 0, count: maxBlockCount * 64)
-        var dctBuf = [Float](repeating: 0, count: maxBlockCount * 64)
-        var pixelsBuf = [Float](repeating: 0, count: maxBlockCount * 64)
-        var idctScratch = [Float](repeating: 0, count: maxBlockCount * 64)
+        // Reused per-component scratch; each component fully writes its used
+        // region before reading it, so skip the zero-fill (a per-decode bzero).
+        let scratchN = maxBlockCount * 64
+        var natural = [Int32](unsafeUninitializedCapacity: scratchN) { _, c in c = scratchN }
+        var dctBuf = [Float](unsafeUninitializedCapacity: scratchN) { _, c in c = scratchN }
+        var pixelsBuf = [Float](unsafeUninitializedCapacity: scratchN) { _, c in c = scratchN }
+        var idctScratch = [Float](unsafeUninitializedCapacity: scratchN) { _, c in c = scratchN }
 
         for compIdx in 0..<numComponents {
             let comp = components[compIdx]
