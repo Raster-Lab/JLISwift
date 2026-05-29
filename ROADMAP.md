@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-29 (adaptive-quant field `adaptiveQuantField`, opt-in — ~5–8% butteraugli win on 4:4:4; XYB color implemented end-to-end & validated — transform + CoreGraphics-validated ICC + encode/decode; experimental/opt-in, honest caveats below). Earlier 2026-05-28: lossless+near-lossless, scaled decode, multi-threaded trellis+AC-count, jpegli quantizer, ICC/Exif, progressive+restart, fuzzing._
+_Last updated: 2026-05-29 (float32 input; DocC overview rewrite; adaptive-quant field `adaptiveQuantField`, opt-in — ~5–8% butteraugli win on 4:4:4; XYB color implemented end-to-end & validated — transform + CoreGraphics-validated ICC + encode/decode; experimental/opt-in, honest caveats below). Earlier 2026-05-28: lossless+near-lossless, scaled decode, multi-threaded trellis+AC-count, jpegli quantizer, ICC/Exif, progressive+restart, fuzzing._
 
 ## Completed
 
@@ -48,7 +48,7 @@ _Last updated: 2026-05-29 (adaptive-quant field `adaptiveQuantField`, opt-in —
 
 ### Marginal / niche (safe, bounded, lower value)
 - [x] **1/2 & 1/4 scaled decode** · `config.scale = 2/4` — each output sample is the *exact* mean of its scale×scale box, formed straight from the dequantized coefficients via a separable `A·F·Aᵀ` contraction (no full IDCT, so faster). Validated == box-average of the full decode (gray/color, 8/12-bit) and within ≤6 of `djpeg -scale` (embedded CI-safe fixtures)
-- [x] 16-bit **input** (via lossless `losslessPrecision`) · float32 input still TODO (DCT modes stay 8/12-bit)
+- [x] 16-bit **input** (via lossless `losslessPrecision`) · **float32 input** done — treated as normalised [0,1], clamped + quantised to 8-bit up front, then the normal path (use `.uint16` for 12-bit). Encodes identically to the equivalent 8-bit image (validated).
 - [x] EXIF / ICC **metadata** · `JLIImage.iccProfile` / `.exif` — decode extracts (APP2 `ICC_PROFILE` reassembled across segments, APP1 `Exif`), encode embeds (ICC chunked into ≤65519-byte APP2 segments) on baseline/progressive/lossless. Bit-exact round-trip; cross-validated both ways vs libjpeg-turbo (we read cjpeg's ICC; `djpeg -icc` extracts ours byte-exact, incl. a 140 KB multi-segment profile)
 - [x] Progressive **+ restart markers** · `restartInterval` now applies to progressive scans too (was baseline-only) — DRI + RSTn with DC-predictor reset (DC scan) and EOBRUN flush (AC first/refine) at boundaries, mirrored in the optimal-Huffman counting pass; interval counts interleaved MCUs (DC) / data units (AC) to match the decoder (which already handled restart). Validated: restart decode is pixel-identical to no-restart, and djpeg decodes our output (spectral + SA, 4:4:4/4:2:0/gray)
 - [x] **Multi-threaded encode** · trellis quantization (~22% of a big encode) **and** optimized-Huffman AC-frequency counting (~9%) are partitioned across cores via `concurrentPerform`: trellis over disjoint block ranges (private scratch), AC counting over a flat block range with summed partial histograms (order-independent → trivially correct). Both **byte-identical** to serial (FNV-checksum verified, serial==parallel==pre-change); DC counting stays serial (cheap, order-dependent chain). ~20% faster on 8 cores for a 2048² plate (100.8→81.0 ms). (Entropy *emit* is still serial — would need per-restart-interval segmentation.)

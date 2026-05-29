@@ -742,4 +742,52 @@ struct EncoderDecoderTests {
             #expect(dec.data.count == w * h * 3)
         }
     }
+
+    // MARK: - float32 input
+
+    private func float32LE(_ values: [Float]) -> [UInt8] {
+        var out = [UInt8](); out.reserveCapacity(values.count * 4)
+        for v in values {
+            let b = v.bitPattern
+            out.append(UInt8(b & 0xFF)); out.append(UInt8((b >> 8) & 0xFF))
+            out.append(UInt8((b >> 16) & 0xFF)); out.append(UInt8((b >> 24) & 0xFF))
+        }
+        return out
+    }
+
+    @Test("float32 input ([0,1]) encodes identically to its 8-bit quantization")
+    func float32Input() throws {
+        let w = 40, h = 32
+        var floats = [Float](repeating: 0, count: w * h * 3)
+        var u8 = [UInt8](repeating: 0, count: w * h * 3)
+        for i in 0..<floats.count {
+            let v = Float(i % 256) / 255.0                   // in [0,1]
+            floats[i] = v
+            u8[i] = UInt8(clamping: Int((v * 255).rounded()))
+        }
+        let fImg = try JLIImage(width: w, height: h, pixelFormat: .float32, colorModel: .rgb, data: float32LE(floats))
+        let uImg = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: u8)
+        // The float path quantizes to exactly `u8`, so the encoded bytes match.
+        for cfg in [JLIEncoderConfiguration.default,
+                    { var c = JLIEncoderConfiguration.default; c.lossless = true; c.chromaSubsampling = .yuv444; return c }()] {
+            #expect(try JLIEncoder().encode(fImg, configuration: cfg) == JLIEncoder().encode(uImg, configuration: cfg),
+                    "float32 input must encode identically to its 8-bit quantization")
+        }
+        let dec = try JLIDecoder().decode(from: try JLIEncoder().encode(fImg, configuration: .default))
+        #expect(dec.width == w && dec.height == h && dec.pixelFormat == .uint8 && dec.colorModel == .rgb)
+    }
+
+    @Test("float32 input clamps out-of-range values to [0,1]")
+    func float32Clamp() throws {
+        let w = 8, h = 8
+        var cfg = JLIEncoderConfiguration.default
+        cfg.lossless = true; cfg.chromaSubsampling = .yuv400   // lossless → read back exact
+        for (v, expected): (Float, UInt8) in [(-0.5, 0), (1.5, 255), (0.5, 128)] {
+            let data = float32LE([Float](repeating: v, count: w * h))
+            let img = try JLIImage(width: w, height: h, pixelFormat: .float32, colorModel: .grayscale, data: data)
+            let dec = try JLIDecoder().decode(from: try JLIEncoder().encode(img, configuration: cfg))
+            #expect(dec.data.allSatisfy { $0 == expected },
+                    "float \(v) should clamp/scale to \(expected), got \(dec.data.first ?? 99)")
+        }
+    }
 }

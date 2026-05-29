@@ -59,7 +59,8 @@ public struct JLIEncoder: Sendable {
     /// Encodes an image to JPEG data using the jpegli algorithm.
     ///
     /// - Parameters:
-    ///   - image: The source image to encode. Must use `.uint8` pixel format.
+    ///   - image: The source image. `.uint8` (8-bit), `.uint16` (12-bit), or
+    ///     `.float32` (treated as normalised [0,1] and quantised to 8-bit).
     ///   - configuration: Encoder settings controlling quality, color space, and features.
     /// - Returns: The encoded JPEG data as a byte array.
     /// - Throws: ``JLIError`` if encoding fails or the input is invalid.
@@ -68,6 +69,13 @@ public struct JLIEncoder: Sendable {
         configuration: JLIEncoderConfiguration = .default
     ) throws -> [UInt8] {
         try validateConfiguration(configuration)
+
+        // float32 input is treated as normalised [0,1] and quantised to 8-bit up
+        // front (the DCT pipeline works in 8/12-bit integer samples), then encoded
+        // by the normal path. Use `.uint16` for 12-bit precision.
+        if image.pixelFormat == .float32 {
+            return try encode(quantizeFloat32ToUInt8(image), configuration: configuration)
+        }
 
         let width = image.width
         let height = image.height
@@ -83,8 +91,8 @@ public struct JLIEncoder: Sendable {
         let quality = max(1, min(100, Int(effectiveQuality.rounded())))
 
         // Sample precision: 8-bit for uint8, 12-bit for uint16 (JPEG supports 8
-        // or 12). 12-bit is currently grayscale-only — the color path still
-        // assumes 0–255 BT.601 ranges. Level shift is 2^(P-1): 128 or 2048.
+        // or 12). Level shift is 2^(P-1): 128 or 2048. (float32 was quantized to
+        // uint8 above, so it never reaches here.)
         let precision: Int
         switch image.pixelFormat {
         case .uint8:
@@ -92,9 +100,7 @@ public struct JLIEncoder: Sendable {
         case .uint16:
             precision = 12
         case .float32:
-            throw JLIError.unsupportedColorSpaceConversion(
-                from: "\(image.pixelFormat)", to: "JPEG encoding"
-            )
+            throw JLIError.unsupportedJPEGFeature("float32 must be quantized before encoding")
         }
         let levelShift = Float(1 << (precision - 1))
 
@@ -786,6 +792,25 @@ public struct JLIEncoder: Sendable {
             throw JLIError.unsupportedJPEGFeature(
                 "restartInterval \(configuration.restartInterval) (must be 0…65535)")
         }
+    }
+
+    /// Quantises a `.float32` image (normalised [0,1] per component, little-endian)
+    /// to `.uint8` (clamp to [0,1], scale to 0–255, round-to-nearest), preserving
+    /// dimensions, color model, and embedded ICC/Exif.
+    private func quantizeFloat32ToUInt8(_ image: JLIImage) throws -> JLIImage {
+        let n = image.width * image.height * image.colorModel.componentCount
+        var out = [UInt8](repeating: 0, count: n)
+        let src = image.data
+        for i in 0..<n {
+            let b = i * 4
+            let bits = UInt32(src[b]) | (UInt32(src[b + 1]) << 8)
+                | (UInt32(src[b + 2]) << 16) | (UInt32(src[b + 3]) << 24)
+            let v = Float(bitPattern: bits)
+            out[i] = UInt8(clamping: Int((min(max(v, 0), 1) * 255).rounded()))
+        }
+        return try JLIImage(width: image.width, height: image.height, pixelFormat: .uint8,
+                            colorModel: image.colorModel, data: out,
+                            iccProfile: image.iccProfile, exif: image.exif)
     }
 
     /// Extract every 8×8 block from a component plane → batched forward DCT +
