@@ -3,6 +3,56 @@
 
 import Foundation
 import JLISwift
+import JLIDICOM
+
+// MARK: - WS-B batch metrics (folder of DICOMs → CSV)
+
+/// Recursively round-trips every `.dcm` under `dir` with the JLISwift default
+/// and writes one CSV row per image (size, ratio, PSNR, butteraugli, timings).
+/// `out` is a file path, or nil for stdout.
+func runBatch(dir: String, out: String?) {
+    let fm = FileManager.default
+    var files: [String] = []
+    if let en = fm.enumerator(atPath: dir) {
+        for case let f as String in en where f.lowercased().hasSuffix(".dcm") {
+            files.append("\(dir)/\(f)")
+        }
+    }
+    files.sort()
+    let codec = JLISwiftCodec(subsampling: .yuv420)   // shipped default (perceptual, 4:2:0)
+    var lines = ["path,width,height,bytes,bpp,ratio,psnr_db,butteraugli,enc_ms,dec_ms"]
+    var ok = 0
+    for path in files {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let dicom = try? DICOMReader.read([UInt8](data)) else { continue }
+        let rgb = dicom.toRGB8(), w = dicom.width, h = dicom.height
+        let t0 = Date()
+        guard let jpeg = try? codec.encode(rgb: rgb, width: w, height: h, quality: 90) else { continue }
+        let encMs = Date().timeIntervalSince(t0) * 1000
+        let t1 = Date()
+        guard let dec = try? codec.decode(jpeg: jpeg) else { continue }
+        let decMs = Date().timeIntervalSince(t1) * 1000
+        let cmp = min(rgb.count, dec.rgb.count)
+        let psnr = Harness.psnr(Array(rgb.prefix(cmp)), Array(dec.rgb.prefix(cmp)))
+        let ba = (dec.width == w && dec.height == h)
+            ? Butteraugli.distance(reference: rgb, distorted: dec.rgb, width: w, height: h) : nil
+        let rel = path.hasPrefix(dir) ? String(path.dropFirst(dir.count).drop(while: { $0 == "/" })) : path
+        lines.append("\(rel),\(w),\(h),\(jpeg.count),"
+            + String(format: "%.4f,%.1f,%.2f,", Double(jpeg.count * 8) / Double(w * h),
+                     Double(rgb.count) / Double(jpeg.count), psnr)
+            + (ba.map { String(format: "%.4f", $0) } ?? "")
+            + String(format: ",%.1f,%.1f", encMs, decMs))
+        ok += 1
+    }
+    let csv = lines.joined(separator: "\n") + "\n"
+    if let out = out {
+        try? csv.write(toFile: out, atomically: true, encoding: .utf8)
+        FileHandle.standardError.write("batch: \(ok)/\(files.count) images → \(out)\n".data(using: .utf8)!)
+    } else {
+        print(csv, terminator: "")
+        FileHandle.standardError.write("batch: \(ok)/\(files.count) images\n".data(using: .utf8)!)
+    }
+}
 
 // MARK: - WS4 RD-matrix (quality-per-byte: which JLISwift config should be default?)
 
@@ -183,6 +233,12 @@ func printHelp() {
     """)
 }
 
+if let i = CommandLine.arguments.firstIndex(of: "--batch"), i + 1 < CommandLine.arguments.count {
+    let dir = CommandLine.arguments[i + 1]
+    let out = (i + 2 < CommandLine.arguments.count && !CommandLine.arguments[i + 2].hasPrefix("--"))
+        ? CommandLine.arguments[i + 2] : nil
+    runBatch(dir: dir, out: out); exit(0)
+}
 if let i = CommandLine.arguments.firstIndex(of: "--profile-encode") {
     let size = (i + 1 < CommandLine.arguments.count ? Int(CommandLine.arguments[i + 1]) : nil) ?? 1024
     runProfileEncode(size: size); exit(0)

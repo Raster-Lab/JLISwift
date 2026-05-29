@@ -18,8 +18,9 @@ _Last updated: 2026-05-29 — **0.2.0 RELEASED** (tagged `v0.2.0`, GitHub Releas
 - [ ] **Deeper calibration (deferred — hard research):** nail jpegli's field input range/scaling; use the luma-derived field for chroma (not per-component); then re-RD. The 0.2.0 perceptual default already banked the big medical win, so this is upside, not blocking. Residual gap may be partly XYB → WS-E.
 
 ### WS-B — JLILab distribution (P1)
-- [ ] Sign + notarize (hardened runtime + entitlements) → DMG. *Needs the Apple Developer signing identity.*
-- [ ] QoL: batch mode (folder of DICOMs → CSV of size/PSNR/butteraugli), DICOM window/level controls, save/load presets, export comparison report.
+- [x] **Sign/notarize/DMG scaffolding**: `JLILab/scripts/package.sh` (archive → Developer-ID export → `notarytool --wait` → staple → DMG) + `ExportOptions.plist`; hardened runtime already on, non-sandboxed (so it reads user files + shells out to butteraugli/cjpeg). *The notarize step needs your Apple Developer identity + a stored `notarytool` keychain profile — everything else is ready.*
+- [x] **Batch metrics**: `JLIBench --batch <dir> [out.csv]` recursively round-trips every `.dcm` (JLISwift default) → CSV (path, dims, bytes, bpp, ratio, PSNR, butteraugli, enc/dec ms). Validated on the corpus.
+- [ ] Remaining QoL (in-app): DICOM window/level controls, save/load presets, export comparison report.
 
 ### WS-C — Targeted performance (P2, diminishing returns)
 - [ ] Parallelize inverse color conversion + per-component decode (byte-identical, `concurrentPerform`).
