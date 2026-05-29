@@ -46,6 +46,12 @@ final class AppModel {
     var isComparing = false
     var showCrossSheet = false
 
+    // Rate–distortion curve (quality sweep across codecs).
+    var rdReport: RDReport?
+    var isComputingRD = false
+    var showRDSheet = false
+    var rdMetric: RDMetric = .butteraugli
+
     private var runTask: Task<Void, Never>?
 
     var butteraugliAvailable: Bool { Butteraugli.isAvailable }
@@ -123,6 +129,28 @@ final class AppModel {
             guard let self else { return }
             self.crossReport = report
             self.isComparing = false
+        }
+    }
+
+    /// Sweeps quality across all codecs to build rate–distortion curves. Many
+    /// encodes + metric runs, so it's explicit and runs off-main with a spinner.
+    func runRDCurve() {
+        guard let src = source else { return }
+        let rgb = src.rgb8, w = src.width, h = src.height
+        var s = settings
+        s.mode = .rgb8; s.lossless = false; s.useDistance = false
+        let cfg = s.encoderConfiguration()
+
+        rdReport = nil
+        isComputingRD = true
+        showRDSheet = true
+        Task { [weak self] in
+            let report = await Task.detached(priority: .userInitiated) {
+                RDCurveRunner.run(rgb8: rgb, width: w, height: h, jliConfig: cfg)
+            }.value
+            guard let self else { return }
+            self.rdReport = report
+            self.isComputingRD = false
         }
     }
 

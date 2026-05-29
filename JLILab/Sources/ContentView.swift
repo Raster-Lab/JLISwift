@@ -3,6 +3,7 @@
 
 import SwiftUI
 import AppKit
+import Charts
 import UniformTypeIdentifiers
 
 struct ContentView: View {
@@ -22,6 +23,8 @@ struct ContentView: View {
                     .keyboardShortcut("o", modifiers: .command)
                 Button { model.runCrossCodec() } label: { Label("Compare codecs", systemImage: "rectangle.split.3x1") }
                     .disabled(model.source == nil)
+                Button { model.runRDCurve() } label: { Label("RD curve", systemImage: "chart.xyaxis.line") }
+                    .disabled(model.source == nil)
                 Button { saveEncoded() } label: { Label("Save JPEG", systemImage: "square.and.arrow.down") }
                     .keyboardShortcut("s", modifiers: .command)
                     .disabled(model.output == nil)
@@ -30,6 +33,7 @@ struct ContentView: View {
         .onChange(of: model.settings) { _, _ in model.run() }
         .onChange(of: model.diffAmplification) { _, _ in model.recomputeDifference() }
         .sheet(isPresented: $model.showCrossSheet) { CrossCodecSheet(model: model) }
+        .sheet(isPresented: $model.showRDSheet) { RDCurveSheet(model: model) }
         .frame(minWidth: 900, minHeight: 560)
     }
 
@@ -369,6 +373,60 @@ private struct CrossCodecSheet: View {
 
     private func byteString(_ n: Int) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file)
+    }
+}
+
+// MARK: - RD-curve sheet
+
+private struct RDCurveSheet: View {
+    @Bindable var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Rate–distortion curves").font(.title3).bold()
+                Spacer()
+                Button("Done") { model.showRDSheet = false }.keyboardShortcut(.defaultAction)
+            }
+            if let r = model.rdReport {
+                Text("8-bit RGB · \(r.width)×\(r.height) · quality sweep \(r.qualities.first ?? 0)–\(r.qualities.last ?? 0)")
+                    .font(.caption).foregroundStyle(.secondary)
+                Picker("Metric", selection: $model.rdMetric) {
+                    ForEach(RDMetric.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented).labelsHidden()
+                chart(r)
+                Text("Each line is a codec across the quality sweep. Compare codecs at the **same bpp** (x-axis): for Butteraugli, lower is better (curve nearer the bottom wins); for SSIMULACRA2/PSNR, higher wins.")
+                    .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            } else if model.isComputingRD {
+                VStack(spacing: 8) {
+                    ProgressView()
+                    Text("Encoding the quality sweep across every codec (many encodes + metric runs)…\nSlower on large images.")
+                        .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(20)
+        .frame(width: 720, height: 560)
+    }
+
+    private func chart(_ r: RDReport) -> some View {
+        let m = model.rdMetric
+        let pts = r.points
+            .filter { $0.value(m) != nil }
+            .sorted { ($0.codec, $0.bpp) < ($1.codec, $1.bpp) }
+        return Chart(pts) { p in
+            LineMark(x: .value("bpp", p.bpp), y: .value("metric", p.value(m) ?? 0))
+                .foregroundStyle(by: .value("Codec", p.codec))
+            PointMark(x: .value("bpp", p.bpp), y: .value("metric", p.value(m) ?? 0))
+                .foregroundStyle(by: .value("Codec", p.codec))
+                .symbolSize(40)
+        }
+        .chartXAxisLabel("bits per pixel (→ larger file)")
+        .chartYAxisLabel(m.rawValue)
+        .chartLegend(position: .bottom)
+        .frame(minHeight: 360)
     }
 }
 

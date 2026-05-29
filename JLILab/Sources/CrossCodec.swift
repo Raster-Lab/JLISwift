@@ -243,15 +243,23 @@ enum LabPPM {
 
 // MARK: - Runner
 
+/// The ordered set of codecs both the comparison and RD-curve runners use.
+enum LabCodecs {
+    static func all(jliConfig: JLIEncoderConfiguration) -> [LabCodec] {
+        [JLISwiftLabCodec(base: jliConfig), ImageIOLabCodec(),
+         CLILabCodec.libjpegTurbo(), CLILabCodec.mozjpeg(), CLILabCodec.jpegli()]
+    }
+}
+
 enum CrossCodecRunner {
     static func run(rgb8: [UInt8], width: Int, height: Int, quality: Int,
                     jliConfig: JLIEncoderConfiguration) -> CrossCodecReport {
-        let jli = JLISwiftLabCodec(base: jliConfig)
-        let imageIO = ImageIOLabCodec()
-        let turbo = CLILabCodec.libjpegTurbo()
-        let moz = CLILabCodec.mozjpeg()
-        let jpegli = CLILabCodec.jpegli()
-        let codecs: [LabCodec] = [jli, imageIO, turbo, moz, jpegli]
+        let all = LabCodecs.all(jliConfig: jliConfig)
+        let jli = all[0]
+        let imageIO = all[1]
+        let turbo = all[2]
+        let moz = all[3]
+        let codecs = all
 
         // Tiny image to estimate per-codec process-spawn overhead (the actual
         // encode of 8×8 is negligible, so its wall time ≈ spawn + pipe cost).
