@@ -307,13 +307,25 @@ public struct JLIEncoder: Sendable {
         let maxBlockCount = max(yBlockCount, cBlockCount)
         var dctScratch = [Float](repeating: 0, count: maxBlockCount * 64)
 
+        // jpegli's masking field is computed once on the luma plane and reused
+        // (mapped) for every component.
+        let lumaField: [Float] = jpegliAQ
+            ? JLIAdaptiveQuant.computeField(
+                plane: yPlane, planeWidth: width, planeHeight: height,
+                blocksH: yBlocksPerRow, blocksV: yBlocksPerCol, yQuant01: yQuant01)
+            : []
+        func aqParams(_ c: Int) -> JpegliAQ? {
+            jpegliAQ ? JpegliAQ(component: c, distance: aqDistance, lumaField: lumaField,
+                                lumaBlocksH: yBlocksPerRow, lumaBlocksV: yBlocksPerCol) : nil
+        }
+
         let yQuant = quantizePlane(
             yPlane, planeWidth: width, planeHeight: height,
             blocksH: yBlocksPerRow, blocksV: yBlocksPerCol,
             invQuant: lumInv, levelShift: levelShift, scratch: &dctScratch,
             rdo: jpegliAQ ? nil : lumRDO,
             adaptiveField: configuration.adaptiveQuantField,
-            jpegli: jpegliAQ ? JpegliAQ(component: 0, distance: aqDistance, yQuant01: yQuant01) : nil
+            jpegli: aqParams(0)
         )
         let cbQuant: [Int32]
         let crQuant: [Int32]
@@ -325,14 +337,14 @@ public struct JLIEncoder: Sendable {
                 blocksH: mcuCountH, blocksV: mcuCountV,
                 invQuant: chromInv, levelShift: levelShift, scratch: &dctScratch,
                 rdo: jpegliAQ ? nil : chrRDO,
-                jpegli: jpegliAQ ? JpegliAQ(component: 1, distance: aqDistance, yQuant01: yQuant01) : nil
+                jpegli: aqParams(1)
             )
             crQuant = quantizePlane(
                 crPlane, planeWidth: crWidth, planeHeight: crHeight,
                 blocksH: mcuCountH, blocksV: mcuCountV,
                 invQuant: chromInv, levelShift: levelShift, scratch: &dctScratch,
                 rdo: jpegliAQ ? nil : chrRDO,
-                jpegli: jpegliAQ ? JpegliAQ(component: 2, distance: aqDistance, yQuant01: yQuant01) : nil
+                jpegli: aqParams(2)
             )
         }
 
@@ -861,7 +873,6 @@ public struct JLIEncoder: Sendable {
         if let j = jpegli {
             return quantizeZeroBias(
                 dctBuf: dctBuf, blockCount: n, invQuant: invQuant,
-                plane: plane, planeWidth: planeWidth, planeHeight: planeHeight,
                 blocksH: blocksH, blocksV: blocksV, jpegli: j
             )
         }
@@ -885,8 +896,16 @@ public struct JLIEncoder: Sendable {
     /// `Σ AC²` relative to the plane mean, shaped sublinearly and clamped. Busy
     /// blocks (high energy) → multiplier > 1 (quantize harder, masked); flat
     /// blocks → < 1 (preserve smooth detail, where banding shows).
-    /// Parameters for the jpegli adaptive (field + zero-bias) quant path.
-    struct JpegliAQ { let component: Int; let distance: Double; let yQuant01: Int }
+    /// Parameters for the jpegli adaptive (field + zero-bias) quant path. The
+    /// masking field is computed once on luma (jpegli uses the luma-derived field
+    /// for every channel) and carried here to be mapped onto each component grid.
+    struct JpegliAQ {
+        let component: Int
+        let distance: Double
+        let lumaField: [Float]
+        let lumaBlocksH: Int
+        let lumaBlocksV: Int
+    }
 
     /// Quantizes via jpegli's masking field + per-coefficient zero-bias
     /// (dead-zone), no trellis: `qval = dct·invQuant`; an AC coefficient survives
@@ -894,12 +913,22 @@ public struct JLIEncoder: Sendable {
     /// kept (its threshold is 0).
     private func quantizeZeroBias(
         dctBuf: [Float], blockCount n: Int, invQuant: [Float],
-        plane: [Float], planeWidth: Int, planeHeight: Int,
         blocksH: Int, blocksV: Int, jpegli j: JpegliAQ
     ) -> [Int32] {
-        let field = JLIAdaptiveQuant.computeField(
-            plane: plane, planeWidth: planeWidth, planeHeight: planeHeight,
-            blocksH: blocksH, blocksV: blocksV, yQuant01: j.yQuant01)
+        // Map the luma-derived field onto this component's block grid: 1:1 for
+        // luma / 4:4:4, box-average the covered luma blocks for subsampled chroma.
+        let rH = max(1, j.lumaBlocksH / blocksH), rV = max(1, j.lumaBlocksV / blocksV)
+        var field = [Float](repeating: 0, count: n)
+        for yb in 0..<blocksV {
+            for xb in 0..<blocksH {
+                var s: Float = 0
+                for dy in 0..<rV {
+                    let ly = min(yb * rV + dy, j.lumaBlocksV - 1) * j.lumaBlocksH
+                    for dx in 0..<rH { s += j.lumaField[ly + min(xb * rH + dx, j.lumaBlocksH - 1)] }
+                }
+                field[yb * blocksH + xb] = s / Float(rH * rV)
+            }
+        }
         let (zbOffset, zbMul) = JLIAdaptiveQuant.zeroBias(distance: j.distance, component: j.component)
         var quant = [Int32](unsafeUninitializedCapacity: n * 64) { _, c in c = n * 64 }
         dctBuf.withUnsafeBufferPointer { db in
