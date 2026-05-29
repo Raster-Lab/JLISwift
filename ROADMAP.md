@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decode; multi-threaded trellis + AC-count; jpegli perceptual quantizer; ICC/Exif metadata; progressive+restart; restartInterval validation; new-path fuzzing). All large/marginal items done — only deferred-risky + release remain._
+_Last updated: 2026-05-29 (XYB foundations: validated transform + CoreGraphics-validated ICC generator — encode/decode wiring remains). Earlier 2026-05-28: lossless+near-lossless, scaled decode, multi-threaded trellis+AC-count, jpegli quantizer, ICC/Exif, progressive+restart, fuzzing._
 
 ## Completed
 
@@ -53,7 +53,7 @@ _Last updated: 2026-05-28 (lossless SOF3 + near-lossless; 1/2 & 1/4 scaled decod
 - [x] **Multi-threaded encode** · trellis quantization (~22% of a big encode) **and** optimized-Huffman AC-frequency counting (~9%) are partitioned across cores via `concurrentPerform`: trellis over disjoint block ranges (private scratch), AC counting over a flat block range with summed partial histograms (order-independent → trivially correct). Both **byte-identical** to serial (FNV-checksum verified, serial==parallel==pre-change); DC counting stays serial (cheap, order-dependent chain). ~20% faster on 8 cores for a 2048² plate (100.8→81.0 ms). (Entropy *emit* is still serial — would need per-restart-interval segmentation.)
 
 ### Deferred (high risk / low reward / unvalidatable)
-- [ ] XYB color · no jpegli reference available to cross-validate against — high risk of subtly-wrong perceptual color
+- [~] XYB color · **foundations done & validated** — the "unvalidatable" worry is retired. (1) Correct XYB transform (faithful libjxl opsin port: sRGB EOTF → opsin matrix+bias → cbrt → XYB rotation → ScaleXYB), round-trips <0.5/255. (2) XYB **ICC profile generator** (libjxl `MaybeCreateProfileImpl` port: mAB tag w/ 2×2×2 CLUT + cube-root curves + matrix) — `CGColorSpace` accepts it and Apple's color engine transforms XYB→sRGB matching our inverse to **0.28/255**, so standard ICC-aware decoders render it correctly. **Remaining:** wire XYB into the encoder (RGB→XYB 3 planes, `kBaseQuantMatrixXYB`+`kGlobalScaleXYB` tables, 4:4:4, embed APP2 ICC + APP14) and decoder (detect via ICC, inverse) — substantial surgery on the core YCbCr encode path; left for a focused/supervised pass.
 - [ ] Table-driven Huffman decode · ~2–3 ms · conflicts with the restart decode path (buffered bytes vs byte alignment)
 - [ ] Metal hot path · marginal over Accelerate (already AMX/GPU-accelerated GEMM)
 
