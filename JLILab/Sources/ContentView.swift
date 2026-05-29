@@ -20,6 +20,8 @@ struct ContentView: View {
                 if model.isRunning { ProgressView().controlSize(.small) }
                 Button { openFile() } label: { Label("Open", systemImage: "folder") }
                     .keyboardShortcut("o", modifiers: .command)
+                Button { model.runCrossCodec() } label: { Label("Compare codecs", systemImage: "rectangle.split.3x1") }
+                    .disabled(model.source == nil)
                 Button { saveEncoded() } label: { Label("Save JPEG", systemImage: "square.and.arrow.down") }
                     .keyboardShortcut("s", modifiers: .command)
                     .disabled(model.output == nil)
@@ -27,6 +29,7 @@ struct ContentView: View {
         }
         .onChange(of: model.settings) { _, _ in model.run() }
         .onChange(of: model.diffAmplification) { _, _ in model.recomputeDifference() }
+        .sheet(isPresented: $model.showCrossSheet) { CrossCodecSheet(model: model) }
         .frame(minWidth: 900, minHeight: 560)
     }
 
@@ -262,6 +265,94 @@ private struct ViewerPane: View {
                 ImagePane(title: "Difference (amplified)", image: model.differenceImage)
             }
         }
+    }
+}
+
+// MARK: - Cross-codec sheet
+
+private struct CrossCodecSheet: View {
+    @Bindable var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Cross-codec comparison").font(.title3).bold()
+                Spacer()
+                Button("Done") { model.showCrossSheet = false }.keyboardShortcut(.defaultAction)
+            }
+            if let r = model.crossReport {
+                Text("8-bit RGB · \(r.width)×\(r.height) · quality \(r.quality)")
+                    .font(.caption).foregroundStyle(.secondary)
+                comparisonTable(r)
+                Divider()
+                Text("Interoperability (encode → decode across codecs)").font(.headline)
+                interopList(r)
+            } else if model.isComparing {
+                HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Encoding with each codec…") }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(20)
+        .frame(width: 640, height: 520)
+    }
+
+    private func comparisonTable(_ r: CrossCodecReport) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                cell("Codec", 150, .leading).bold()
+                cell("Size", 80).bold(); cell("Ratio", 60).bold()
+                cell("PSNR", 80).bold(); cell("b-augli", 70).bold(); cell("Enc ms", 70).bold()
+            }.font(.caption).foregroundStyle(.secondary)
+            Divider()
+            ForEach(r.rows) { row in
+                HStack {
+                    cell(row.name, 150, .leading)
+                    if !row.available {
+                        Text("not installed").font(.caption).foregroundStyle(.tertiary)
+                            .frame(width: 360, alignment: .leading)
+                    } else if let err = row.error {
+                        Text(err).font(.caption).foregroundStyle(.orange)
+                            .frame(width: 360, alignment: .leading).lineLimit(1)
+                    } else {
+                        cell(byteString(row.encodedBytes), 80)
+                        cell(String(format: "%.1f×", row.ratio), 60)
+                        cell(row.psnr.isInfinite ? "∞" : String(format: "%.1f", row.psnr), 80)
+                        cell(row.butteraugli.map { String(format: "%.3f", $0) } ?? "–", 70)
+                        cell(String(format: "%.0f", row.encodeMs), 70)
+                    }
+                }
+                .font(.callout.monospacedDigit())
+                .padding(.vertical, 3)
+                .background(row.name == "JLISwift" ? Color.accentColor.opacity(0.10) : .clear)
+            }
+        }
+    }
+
+    private func interopList(_ r: CrossCodecReport) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            if r.interop.isEmpty {
+                Text("No interop checks available (reference codecs not installed).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(r.interop) { item in
+                HStack(spacing: 8) {
+                    Image(systemName: item.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                        .foregroundStyle(item.ok ? .green : .red)
+                    Text(item.label).frame(width: 280, alignment: .leading)
+                    Text(item.detail).foregroundStyle(.secondary)
+                    Spacer()
+                }.font(.callout)
+            }
+        }
+    }
+
+    private func cell(_ s: String, _ w: CGFloat, _ align: Alignment = .trailing) -> some View {
+        Text(s).frame(width: w, alignment: align)
+    }
+
+    private func byteString(_ n: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file)
     }
 }
 

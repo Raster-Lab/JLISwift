@@ -41,6 +41,11 @@ final class AppModel {
     var decodedImage: CGImage?
     var differenceImage: CGImage?
 
+    // Cross-codec comparison (8-bit RGB) against reference codecs.
+    var crossReport: CrossCodecReport?
+    var isComparing = false
+    var showCrossSheet = false
+
     private var runTask: Task<Void, Never>?
 
     var butteraugliAvailable: Bool { Butteraugli.isAvailable }
@@ -95,6 +100,29 @@ final class AppModel {
                 self.differenceImage = nil
                 self.errorMessage = message
             }
+        }
+    }
+
+    /// Runs the loaded image (as 8-bit RGB, at the current quality) through
+    /// JLISwift + available reference codecs, plus both-directions interop checks.
+    func runCrossCodec() {
+        guard let src = source else { return }
+        let rgb = src.rgb8, w = src.width, h = src.height
+        let q = max(1, min(100, Int(settings.quality.rounded())))
+        var s = settings
+        s.mode = .rgb8; s.lossless = false; s.useDistance = false; s.quality = Double(q)
+        let cfg = s.encoderConfiguration()
+
+        crossReport = nil
+        isComparing = true
+        showCrossSheet = true
+        Task { [weak self] in
+            let report = await Task.detached(priority: .userInitiated) {
+                CrossCodecRunner.run(rgb8: rgb, width: w, height: h, quality: q, jliConfig: cfg)
+            }.value
+            guard let self else { return }
+            self.crossReport = report
+            self.isComparing = false
         }
     }
 
