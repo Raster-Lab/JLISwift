@@ -3,7 +3,65 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-29 (table-driven 8-bit-lookahead Huffman decode — ~15–19% faster decode on entropy-heavy content, bit-identical, A/B-proven; float32 input; DocC overview rewrite; adaptive-quant field `adaptiveQuantField`, opt-in — ~5–8% butteraugli win on 4:4:4; XYB color implemented end-to-end & validated — transform + CoreGraphics-validated ICC + encode/decode; experimental/opt-in, honest caveats below). Earlier 2026-05-28: lossless+near-lossless, scaled decode, multi-threaded trellis+AC-count, jpegli quantizer, ICC/Exif, progressive+restart, fuzzing._
+_Last updated: 2026-05-29 — **0.1.0 released** (tagged `v0.1.0`, GitHub Release live) + **JLILab** macOS round-trip/cross-codec lab shipped. Focus is now the **0.2.0 optimization release** (plan below). Earlier this milestone: table-driven 8-bit-lookahead Huffman decode (~15–19% faster, bit-identical, A/B-proven); float32 input; adaptive-quant field (opt-in); XYB color (experimental); and 2026-05-28: lossless+near-lossless, scaled decode, multi-threaded trellis+AC-count, jpegli quantizer, ICC/Exif, progressive+restart, fuzzing._
+
+## 0.2.0 — Optimization release plan (active, 2026-05-29)
+
+**Reframe first — the "570 ms encode" seen in JLILab was a Debug-build artifact, not the codec.**
+Re-measured in **release** via JLIBench (512×512 @ q90, in-process):
+
+| Codec | Encode | Decode | Note |
+|---|---|---|---|
+| JLISwift 4:4:4 | **5.7 ms** | 6.8 ms | Debug build ≈ 570 ms (~100× penalty) |
+| JLISwift 4:2:0 | 6.9 ms | 6.7 ms | |
+| ImageIO (libjpeg-turbo) | 0.95 ms | 0.88 ms | the fair in-process reference |
+| libjpeg-turbo / mozjpeg / jpegli | ~70–100 ms | ~70 ms | **shell-out: dominated by process-spawn overhead, not encode** |
+
+Only ImageIO is a fair in-process timing; CLI codecs are overhead-dominated; JLILab's JLISwift
+row is Debug. **Quality** columns are valid, though: default JLISwift ≈ libjpeg-turbo (30 KB /
+46.2 dB / ba 1.328), while **jpegli leads (28 KB / 47.8 dB / ba 1.060)**. Real gaps for 0.2.0:
+**~6× encode + ~7× decode vs ImageIO (release)**, and **quality-per-byte vs jpegli**.
+
+**Goals:** encode ≤ ~2× ImageIO (≤ ~2 ms @ 512² q90); decode ≤ ~2×; default config matches/beats
+jpegli on butteraugli-at-matched-bytes across the DICOM corpus + standard images; every claim
+release-measured + regression-baselined; byte/bit-identical gates; fuzz still throws; CI-green.
+
+### WS1 — Honest measurement (P0 — do first, or everything mis-prioritizes)
+- [ ] Build/measure JLISwift in **Release** in JLILab (or a "Debug — timings not representative" banner)
+- [ ] Separate encode time from **process-spawn overhead** for CLI codecs (subtract / warm / label)
+- [ ] **RD-curve view** — sweep q50–95, plot bytes vs butteraugli per codec (compare at matched rate, not one point)
+- [ ] Wire **SSIMULACRA2** (already installed via jpeg-xl) alongside butteraugli
+
+### WS2 — Encode speed (P1; real ~6× gap). Stage split (2048² 4:2:0 q90): base ≈74 ms, +trellis ≈24, +opt-Huffman count ≈9
+- [ ] **Profile first** (Instruments time-profiler, release) — exact 512² + large-plate attribution; don't optimize blind
+- [ ] Parallelize the **entropy emit** via restart-interval segmentation (the remaining serial stage)
+- [ ] **Fuse** forward-DCT → quantize → symbol-count into one cache-resident sweep
+- [ ] Remove hot-loop allocations; `withUnsafeBufferPointer` inner loops
+- [ ] SIMD scalar stages (level-shift, RGB→YCbCr, zig-zag, quantize) via Accelerate/SIMD
+- [ ] Optional **"fast" preset** (skip trellis + optimized-Huffman) for latency-critical use (~trellis is 22%)
+- *Validate:* FNV byte-identical vs serial; bench timing regression baseline (`--save-baseline`)
+
+### WS3 — Decode speed (P1; real ~7× gap; table-driven Huffman already landed)
+- [ ] Profile decode (IDCT vs color vs entropy)
+- [ ] Fuse dequant + IDCT; ensure the batched Accelerate IDCT path for all block counts
+- [ ] Parallelize MCU decode across restart intervals (independent segments)
+- [ ] Decode into a contiguous coefficient plane (kill per-block `[Int32]` churn)
+- *Validate:* bit-identical across suite + cross-codec + fuzz
+
+### WS4 — Quality-per-byte / jpegli parity (P1; biggest user-visible win)
+- [ ] Butteraugli/SSIMULACRA2 **RD-curve the corpus**: perceptual quant + adaptive field on/off, 4:4:4 vs 4:2:0 → pick new **defaults** (no medical regression)
+- [ ] Complete the jpegli **adaptive-quant field** (~560-line psychovisual model + per-block **zero-bias / dead-zone**)
+- [ ] jpegli **4:2:0 chroma** handling (`k420Rescale`) so 4:2:0 stops being the weak spot
+- [ ] Re-evaluate **XYB** now the perceptual machinery is mature
+- *Validate:* RD curves vs jpegli/mozjpeg across DICOM + standard; per-modality medical check; gate default change on no perceptual regression
+
+### WS5 — Stretch / deferred
+- [ ] **Metal hot path** — only if profiling shows a GPU-amenable bottleneck Accelerate misses (still hard to validate bit-exactly)
+- [ ] DocC catalog; sign + notarize JLILab as a distributable, double-clickable `.app`
+
+### Sequencing & risks
+M1 WS1 (trustworthy baselines) → M2 WS4 (quality, highest value) → M3 WS2 + WS3 (speed, profile-guided) → M4 lock regression baselines + docs + tag 0.2.0.
+Top risk: **measurement** — fix WS1 first (a 100× phantom was just observed). Quality-default changes can regress specific medical modalities (gate per-modality). Perf refactors risk bit-exactness (FNV/checksum gates every change).
 
 ## Completed
 
@@ -26,15 +84,10 @@ _Last updated: 2026-05-29 (table-driven 8-bit-lookahead Huffman decode — ~15�
 
 ## Remaining
 
-> Honest status (2026-05-29): **every large-effort, marginal/niche, and
-> formerly-deferred item below is now done and CI-green** — lossless+near-lossless,
-> jpegli perceptual quantizer, 1/2 & 1/4 scaled decode, ICC/Exif metadata,
-> progressive+restart, multi-threaded encode, float32 input, XYB color
-> (experimental), and now **table-driven 8-bit-lookahead Huffman decode**. The
-> only non-release item left is the **Metal hot path** — and that stays deferred
-> on purpose: it's marginal over the Accelerate AMX/GPU GEMM and can't be
-> validated bit-exactly. The codec is feature-complete; the next deliberate step
-> is **Tier 4 release** prep when you're ready.
+> Honest status (2026-05-29): the 0.1.x feature set below is **all done, CI-green,
+> and shipped in 0.1.0**. Forward work now lives in the **0.2.0 optimization plan
+> above** (encode/decode speed + jpegli-parity quality). The Metal hot path stays
+> deferred unless profiling justifies it (WS5).
 
 ### Completed large efforts
 - [x] **Lossless JPEG (SOF3)** — true lossless (predictive, no DCT/quant), the medical-archival item
@@ -60,5 +113,5 @@ _Last updated: 2026-05-29 (table-driven 8-bit-lookahead Huffman decode — ~15�
 - [ ] Metal hot path · marginal over Accelerate (already AMX/GPU-accelerated GEMM)
 
 ### Tier 4 — release (final state)
-- [ ] Tag release (Version Bump → Release GitHub Actions; currently `0.1.0`, untagged)
+- [x] **Tag release — `v0.1.0` shipped** (2026-05-29): annotated tag on the CI-green HEAD → `release.yml` validated (build+test on macos-26), created the GitHub Release with auto-changelog, notified Swift Package Index. All jobs green.
 - [~] DocC API documentation — library overview rewritten accurately (real feature set, DocC `## Topics`, usage examples; dropped the old overstated "35% / NEON-SSE / Metal" claims) and stale public-API doc/defaults corrected. Remaining: a `.docc` catalog + `swift-docc-plugin` for `swift package generate-documentation` (couldn't add it here — this machine's git `safe.bareRepository=explicit` blocks SwiftPM fetching the plugin; add in an unrestricted env / Xcode).
