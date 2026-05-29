@@ -63,7 +63,10 @@ struct PerceptualQuantTests {
             rgb[i * 3 + 2] = UInt8((i * 3) & 0xFF)
         }
         let img = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
+        // perceptualQuantTables is the default since 0.2.0, so pin it off to get
+        // the Annex-K path for the comparison.
         var ak = JLIEncoderConfiguration.default; ak.quality = 90; ak.chromaSubsampling = .yuv444
+        ak.perceptualQuantTables = false
         var pq = ak; pq.perceptualQuantTables = true
         let akBytes = try JLIEncoder().encode(img, configuration: ak)
         let pqBytes = try JLIEncoder().encode(img, configuration: pq)

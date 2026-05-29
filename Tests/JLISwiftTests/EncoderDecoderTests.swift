@@ -728,7 +728,11 @@ struct EncoderDecoderTests {
         }
         let img = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
         var off = JLIEncoderConfiguration.default
-        off.chromaSubsampling = .yuv444; off.quality = 85
+        // Exercise the adaptive field against the Annex-K path: under the new
+        // perceptual-table default the field is effectively inert (it barely
+        // shifts the trellis λ when the quant steps already come from the
+        // perceptual model), so pin perceptual off to isolate the field's effect.
+        off.chromaSubsampling = .yuv444; off.quality = 85; off.perceptualQuantTables = false
         var on = off; on.adaptiveQuantField = true
 
         let jOff = try JLIEncoder().encode(img, configuration: off)

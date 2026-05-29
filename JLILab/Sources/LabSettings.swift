@@ -58,7 +58,7 @@ struct LabSettings: Equatable, Sendable {
     var optimiseHuffman: Bool = true
     var adaptiveQuantization: Bool = true
     var adaptiveQuantField: Bool = false
-    var perceptualQuantTables: Bool = false
+    var perceptualQuantTables: Bool = true   // matches the library default since 0.2.0
     var restartInterval: Int = 0
 
     // Lossless controls.

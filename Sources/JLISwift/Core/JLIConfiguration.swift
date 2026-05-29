@@ -146,14 +146,17 @@ public struct JLIEncoderConfiguration: Sendable {
     /// ``Quantization/perceptualQuantTable(distance:chroma:isYUV420:)``). When no
     /// explicit distance is set, ``quality`` is mapped to a distance first.
     /// Applies to the YCbCr DCT path (baseline/progressive, 8-bit); ignored for
-    /// lossless and 12-bit. Defaults to `false` (the Annex K path) — opt in for
-    /// jpegli-style perceptual rate allocation.
+    /// lossless and 12-bit. **Default `true`** since 0.2.0 — a butteraugli RD
+    /// sweep over the DICOM corpus (CT/MR/XA) showed perceptual tables clearly
+    /// beat Annex K at matched bytes on the default 4:2:0 (e.g. CT q90: ba 1.20
+    /// vs 1.82 at equal size; XA q90: smaller *and* better). Set `false` for the
+    /// legacy Annex-K rate allocation.
     public var perceptualQuantTables: Bool
 
     /// A sensible default configuration: quality 90, YCbCr, 4:2:0 subsampling,
-    /// baseline (non-progressive) with optimized Huffman + adaptive quantization.
-    /// Progressive is opt-in — it's a multi-pass encode and most callers want the
-    /// faster baseline path by default.
+    /// baseline (non-progressive) with optimized Huffman, trellis quantization,
+    /// and jpegli perceptual quant tables. Progressive is opt-in — it's a
+    /// multi-pass encode and most callers want the faster baseline path.
     public static let `default` = JLIEncoderConfiguration(
         quality: 90.0,
         distance: nil,
@@ -169,7 +172,7 @@ public struct JLIEncoderConfiguration: Sendable {
         optimiseHuffman: true,
         adaptiveQuantization: true,
         adaptiveQuantField: false,
-        perceptualQuantTables: false
+        perceptualQuantTables: true
     )
 
     /// Creates an encoder configuration.
@@ -201,7 +204,7 @@ public struct JLIEncoderConfiguration: Sendable {
         optimiseHuffman: Bool = true,
         adaptiveQuantization: Bool = true,
         adaptiveQuantField: Bool = false,
-        perceptualQuantTables: Bool = false
+        perceptualQuantTables: Bool = true
     ) {
         self.quality = quality
         self.distance = distance

@@ -49,8 +49,8 @@ release-measured + regression-baselined; byte/bit-identical gates; fuzz still th
 - *Validate:* bit-identical across suite + cross-codec + fuzz
 
 ### WS4 — Quality-per-byte / jpegli parity (P1; biggest user-visible win)
-- [ ] Butteraugli/SSIMULACRA2 **RD-curve the corpus**: perceptual quant + adaptive field on/off, 4:4:4 vs 4:2:0 → pick new **defaults** (no medical regression)
-- [ ] Complete the jpegli **adaptive-quant field** (~560-line psychovisual model + per-block **zero-bias / dead-zone**)
+- [x] **RD-curve the corpus → new default = perceptual quant tables.** `JLIBench --rd-matrix` (butteraugli × config × quality on the DICOM corpus) showed perceptual-420 clearly beats Annex-K-420 on every medical image at matched bytes — **CT q90: ba 1.20 vs 1.82** (equal size); **XA q90: 58 KB/1.56 vs 76 KB/2.02** (smaller *and* better); **MR q90: 30.6 KB/1.25 vs 30.9 KB/1.50**. Flipped `perceptualQuantTables` default → `true` (4:2:0 kept; adaptive-field kept opt-in — the sweep showed it's **near-inert under perceptual tables**). Only the synthetic gradient regressed (degenerate). Full suite green (2 default-assuming tests updated). Still behind jpegli (CT q90 ba 0.95) — closes most of the Annex-K→jpegli gap.
+- [ ] Complete the jpegli **adaptive-quant field** (~560-line psychovisual model + per-block **zero-bias / dead-zone**) — now the main remaining jpegli gap (the current simplified λ-field barely moves output once perceptual tables are on)
 - [ ] jpegli **4:2:0 chroma** handling (`k420Rescale`) so 4:2:0 stops being the weak spot
 - [ ] Re-evaluate **XYB** now the perceptual machinery is mature
 - *Validate:* RD curves vs jpegli/mozjpeg across DICOM + standard; per-modality medical check; gate default change on no perceptual regression

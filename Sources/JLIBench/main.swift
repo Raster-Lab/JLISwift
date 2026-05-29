@@ -4,6 +4,66 @@
 import Foundation
 import JLISwift
 
+// MARK: - WS4 RD-matrix (quality-per-byte: which JLISwift config should be default?)
+
+/// Encodes a config matrix × quality sweep on the DICOM corpus + a synthetic
+/// anchor and reports butteraugli (lower better) vs bytes, so the 0.2.0
+/// defaults decision (perceptual / adaptive-field / subsampling) is data-driven.
+func runRDMatrix(root: String) {
+    var images: [(name: String, rgb: [UInt8], w: Int, h: Int)] = [
+        ("gradient-512", TestImages.gradient(name: "g", size: 512).rgb, 512, 512)
+    ]
+    for c in DICOMCorpus.load(rootDir: root, perModality: 1)
+    where c.width * c.height <= 1_200_000 {   // skip huge plates to bound runtime
+        images.append((c.id, c.rgb, c.width, c.height))
+    }
+
+    func make(_ perceptual: Bool, _ aqf: Bool, _ sub: JLIChromaSubsampling, _ q: Int) -> JLIEncoderConfiguration {
+        var c = JLIEncoderConfiguration.default
+        c.quality = Double(q); c.chromaSubsampling = sub
+        c.perceptualQuantTables = perceptual; c.adaptiveQuantField = aqf
+        return c
+    }
+    let configs: [(String, (Int) -> JLIEncoderConfiguration)] = [
+        ("annexK-420   ", { make(false, false, .yuv420, $0) }),
+        ("perceptual-420", { make(true,  false, .yuv420, $0) }),
+        ("annexK-444   ", { make(false, false, .yuv444, $0) }),
+        ("perceptual-444", { make(true,  false, .yuv444, $0) }),
+        ("percept+aqf-444", { make(true,  true,  .yuv444, $0) }),
+    ]
+    let refs: [(String, CLICodec)] = [("jpegli       ", ReferenceCodecs.jpegli()),
+                                      ("mozjpeg      ", ReferenceCodecs.mozjpeg())]
+    let qualities = [60, 78, 90]
+
+    print("\n=== WS4 RD matrix (butteraugli ↓ vs bytes) — \(images.count) images ===")
+    guard Butteraugli.isAvailable else { print("butteraugli_main not found — cannot run"); return }
+    for img in images {
+        print("\n# \(img.name)  \(img.w)×\(img.h)")
+        print(String(format: "  %-16@ %4@ %9@ %7@ %9@", "config" as NSString, "q" as NSString,
+                     "bytes" as NSString, "bpp" as NSString, "b-augli" as NSString))
+        func row(_ name: String, _ q: Int, _ bytes: Int, _ dec: [UInt8]) {
+            let ba = Butteraugli.distance(reference: img.rgb, distorted: dec, width: img.w, height: img.h) ?? -1
+            let bpp = Double(bytes * 8) / Double(img.w * img.h)
+            print(String(format: "  %-16@ %4d %9d %7.3f %9.4f", name as NSString, q, bytes, bpp, ba))
+        }
+        for (cname, cmake) in configs {
+            for q in qualities {
+                guard let image = try? JLIImage(width: img.w, height: img.h, pixelFormat: .uint8, colorModel: .rgb, data: img.rgb),
+                      let jpeg = try? JLIEncoder().encode(image, configuration: cmake(q)),
+                      let d = try? JLIDecoder().decode(from: jpeg) else { continue }
+                row(cname, q, jpeg.count, d.data)
+            }
+        }
+        for (rname, codec) in refs where codec.enabled {
+            for q in qualities {
+                guard let jpeg = try? codec.encode(rgb: img.rgb, width: img.w, height: img.h, quality: q),
+                      let dec = try? codec.decode(jpeg: jpeg) else { continue }
+                row(rname, q, jpeg.count, dec.rgb)
+            }
+        }
+    }
+}
+
 // MARK: - CLI
 
 struct BenchOptions {
@@ -79,6 +139,13 @@ func printHelp() {
     """)
 }
 
+if CommandLine.arguments.contains("--rd-matrix") {
+    var root = "Sources/LocalDatasets/medical-dicom-organized"
+    if let i = CommandLine.arguments.firstIndex(of: "--dicom-root"), i + 1 < CommandLine.arguments.count {
+        root = CommandLine.arguments[i + 1]
+    }
+    runRDMatrix(root: root); exit(0)
+}
 let opts = parseArgs(CommandLine.arguments)
 if opts.rebuildCache { DICOMCorpus.clearCache() }
 
