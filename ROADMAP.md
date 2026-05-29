@@ -43,8 +43,9 @@ release-measured + regression-baselined; byte/bit-identical gates; fuzz still th
 - [ ] Optional **"fast" preset** (skip trellis + optimized-Huffman) for latency-critical use (~trellis is 22%)
 - *Validate:* FNV byte-identical vs serial; bench timing regression baseline (`--save-baseline`)
 
-### WS3 — Decode speed (P1; real ~7× gap; table-driven Huffman already landed)
-- [ ] Profile decode (IDCT vs color vs entropy)
+### WS3 — Decode speed (P1; table-driven Huffman already landed)
+- [x] **Profiled** (`JLIBench --profile-decode` + `sample`, release 1024²). Dominant cost: **`ChromaSampling.upsample` (1134 samples, ~3× the next item)** — per-pixel array subscripting (copy-on-write checks on every write) + recomputing the x-mapping per pixel. Then inverse color (already optimized) + `Array.init`/COW churn.
+- [x] **Optimized chroma upsample**: precompute the column x-mapping once (identical every row) + raw-pointer source/dest planes (no per-element COW) + uninitialized output. **Byte-identical** (same bilinear formula/order; 164 tests + cross-codec). **~12–19% faster decode** @1024² (gradient 26.1→21.1, checker 24.6→20.6, noise 47.4→41.6 ms).
 - [ ] Fuse dequant + IDCT; ensure the batched Accelerate IDCT path for all block counts
 - [ ] Parallelize MCU decode across restart intervals (independent segments)
 - [ ] Decode into a contiguous coefficient plane (kill per-block `[Int32]` churn)

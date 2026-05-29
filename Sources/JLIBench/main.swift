@@ -87,6 +87,27 @@ func runProfileEncode(size: Int) {
     _ = loop(checker, seconds: 10.0)
 }
 
+/// Tight decode loop for profiling (run `sample <pid>` while it spins).
+func runProfileDecode(size: Int) {
+    let cfg = JLIEncoderConfiguration.default
+    print("PID \(ProcessInfo.processInfo.processIdentifier) — profiling \(size)×\(size) decode (.default)")
+    var sustained = [UInt8]()
+    for ti in TestImages.make(size: size) {
+        let image = try! JLIImage(width: ti.width, height: ti.height,
+                                  pixelFormat: .uint8, colorModel: .rgb, data: ti.rgb)
+        let jpeg = try! JLIEncoder().encode(image, configuration: cfg)
+        for _ in 0..<3 { _ = try! JLIDecoder().decode(from: jpeg) }  // warm
+        var n = 0; let t0 = Date(); let deadline = t0.addingTimeInterval(2.0)
+        while Date() < deadline { _ = try! JLIDecoder().decode(from: jpeg); n += 1 }
+        print(String(format: "  %-14@ %6.2f ms/decode (%d runs)", ti.name as NSString,
+                     Date().timeIntervalSince(t0) * 1000 / Double(max(1, n)), n))
+        if ti.name.contains("checker") { sustained = jpeg }
+    }
+    print("sustaining checker decode ~10s — run: sample \(ProcessInfo.processInfo.processIdentifier) 5")
+    let deadline = Date().addingTimeInterval(10)
+    while Date() < deadline { _ = try! JLIDecoder().decode(from: sustained) }
+}
+
 // MARK: - CLI
 
 struct BenchOptions {
@@ -165,6 +186,10 @@ func printHelp() {
 if let i = CommandLine.arguments.firstIndex(of: "--profile-encode") {
     let size = (i + 1 < CommandLine.arguments.count ? Int(CommandLine.arguments[i + 1]) : nil) ?? 1024
     runProfileEncode(size: size); exit(0)
+}
+if let i = CommandLine.arguments.firstIndex(of: "--profile-decode") {
+    let size = (i + 1 < CommandLine.arguments.count ? Int(CommandLine.arguments[i + 1]) : nil) ?? 1024
+    runProfileDecode(size: size); exit(0)
 }
 if CommandLine.arguments.contains("--rd-matrix") {
     var root = "Sources/LocalDatasets/medical-dicom-organized"
