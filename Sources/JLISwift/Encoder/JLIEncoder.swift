@@ -298,7 +298,8 @@ public struct JLIEncoder: Sendable {
         let yQuant = quantizePlane(
             yPlane, planeWidth: width, planeHeight: height,
             blocksH: yBlocksPerRow, blocksV: yBlocksPerCol,
-            invQuant: lumInv, levelShift: levelShift, scratch: &dctScratch, rdo: lumRDO
+            invQuant: lumInv, levelShift: levelShift, scratch: &dctScratch, rdo: lumRDO,
+            adaptiveField: configuration.adaptiveQuantField
         )
         let cbQuant: [Int32]
         let crQuant: [Int32]
@@ -696,7 +697,8 @@ public struct JLIEncoder: Sendable {
                                scratch: &scratch, rdo: rdo(qt[0], StandardHuffmanTables.acChrominance))
         let qy = quantizePlane(yP, planeWidth: w, planeHeight: h, blocksH: blocksH, blocksV: blocksV,
                                invQuant: qt[1].map { 1.0 / Float($0) }, levelShift: levelShift,
-                               scratch: &scratch, rdo: rdo(qt[1], StandardHuffmanTables.acLuminance))
+                               scratch: &scratch, rdo: rdo(qt[1], StandardHuffmanTables.acLuminance),
+                               adaptiveField: configuration.adaptiveQuantField)
         let qb = quantizePlane(bP, planeWidth: w, planeHeight: h, blocksH: blocksH, blocksV: blocksV,
                                invQuant: qt[2].map { 1.0 / Float($0) }, levelShift: levelShift,
                                scratch: &scratch, rdo: rdo(qt[2], StandardHuffmanTables.acChrominance))
@@ -797,7 +799,7 @@ public struct JLIEncoder: Sendable {
         _ plane: [Float], planeWidth: Int, planeHeight: Int,
         blocksH: Int, blocksV: Int,
         invQuant: [Float], levelShift: Float, scratch: inout [Float],
-        rdo: RDOContext? = nil
+        rdo: RDOContext? = nil, adaptiveField: Bool = false
     ) -> [Int32] {
         let n = blocksH * blocksV
         var blockBuf = [Float](repeating: 0, count: n * 64)
@@ -815,10 +817,40 @@ public struct JLIEncoder: Sendable {
         AccelerateDSP.quantizeBatch(
             dctBuf, invTable: invQuant, into: &quant, blockCount: n
         )
-        if let rdo = rdo {
+        if var rdo = rdo {
+            // Adaptive quant is luma-only (like jpegli) — modulating chroma λ
+            // hurts subsampled (4:2:0) output. The caller gates `adaptiveField`.
+            if adaptiveField {
+                rdo.lambdaField = adaptiveLambdaField(dctBuf: dctBuf, blockCount: n)
+            }
             applyTrellisQuantization(dctBuf: dctBuf, quant: &quant, blockCount: n, rdo: rdo)
         }
         return quant
+    }
+
+    /// Per-block λ multiplier from AC energy (visual-masking proxy): a block's
+    /// `Σ AC²` relative to the plane mean, shaped sublinearly and clamped. Busy
+    /// blocks (high energy) → multiplier > 1 (quantize harder, masked); flat
+    /// blocks → < 1 (preserve smooth detail, where banding shows).
+    private func adaptiveLambdaField(dctBuf: [Float], blockCount n: Int) -> [Float] {
+        var energy = [Float](repeating: 0, count: n)
+        var mean = 0.0
+        dctBuf.withUnsafeBufferPointer { buf in
+            let d = buf.baseAddress!
+            for b in 0..<n {
+                let base = b * 64
+                var e: Float = 0
+                for k in 1..<64 { let v = d[base + k]; e += v * v }
+                energy[b] = e; mean += Double(e)
+            }
+        }
+        mean = max(mean / Double(max(1, n)), 1e-6)
+        var field = [Float](repeating: 1, count: n)
+        for b in 0..<n {
+            let r = Double(energy[b]) / mean
+            field[b] = Float(min(max(pow(r, 0.4), 0.7), 1.8))
+        }
+        return field
     }
 
     /// Rate-distortion context for trellis-style quantization. `quantTable` is
@@ -829,6 +861,10 @@ public struct JLIEncoder: Sendable {
         let quantTable: [Int]
         let acTable: HuffmanTable
         let lambda: Double
+        /// Optional per-block λ multiplier (adaptive quantization): busier blocks
+        /// get a larger multiplier (visual masking hides their quantization), flat
+        /// blocks a smaller one (preserve smooth detail). `nil` ⇒ uniform λ.
+        var lambdaField: [Float]? = nil
     }
 
     /// Trellis quantization: for each block, a Viterbi DP chooses, for every
@@ -962,6 +998,8 @@ public struct JLIEncoder: Sendable {
 
         for b in blocks {
             let base = b * 64
+            // Per-block λ for adaptive quantization (uniform when no field).
+            let blockLambda = lambda * Double(rdo.lambdaField?[b] ?? 1.0)
             var m = 0
             for z in 1..<64 {
                 let q = quant[base + zz[z]]
@@ -1002,13 +1040,13 @@ public struct JLIEncoder: Sendable {
             for i in 0..<m {
                 for v in 0..<vCount[i] {
                     let s = i * 2 + v
-                    let keepBits = lambda * Double(symbolBits(run: nz[i] - 1, size: vSize[s]))
+                    let keepBits = blockLambda * Double(symbolBits(run: nz[i] - 1, size: vSize[s]))
                     var best = cumDrop[i] + keepBits + vDist[s]   // j = -1 (start)
                     var bestPrev = -1
                     for j in 0..<i {
                         let between = cumDrop[i] - cumDrop[j + 1]
                         let run = nz[i] - nz[j] - 1
-                        let rate = lambda * Double(symbolBits(run: run, size: vSize[s]))
+                        let rate = blockLambda * Double(symbolBits(run: run, size: vSize[s]))
                         for vj in 0..<vCount[j] {
                             let cost = dp[j * 2 + vj] + between + rate + vDist[s]
                             if cost < best { best = cost; bestPrev = j * 2 + vj }
@@ -1020,11 +1058,11 @@ public struct JLIEncoder: Sendable {
             }
 
             // Final: last-kept (i, v) + EOB (unless at position 63), or keep nothing.
-            var bestCost = cumDrop[m] + lambda * Double(eobLen)
+            var bestCost = cumDrop[m] + blockLambda * Double(eobLen)
             var bestState = -1
             for i in 0..<m {
                 let afterDrop = cumDrop[m] - cumDrop[i + 1]
-                let eobCost = nz[i] < 63 ? lambda * Double(eobLen) : 0.0
+                let eobCost = nz[i] < 63 ? blockLambda * Double(eobLen) : 0.0
                 for v in 0..<vCount[i] {
                     let cost = dp[i * 2 + v] + afterDrop + eobCost
                     if cost < bestCost { bestCost = cost; bestState = i * 2 + v }

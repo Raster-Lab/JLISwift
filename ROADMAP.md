@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-29 (XYB color implemented end-to-end & validated — transform + CoreGraphics-validated ICC + encode/decode; experimental/opt-in, honest caveats below). Earlier 2026-05-28: lossless+near-lossless, scaled decode, multi-threaded trellis+AC-count, jpegli quantizer, ICC/Exif, progressive+restart, fuzzing._
+_Last updated: 2026-05-29 (adaptive-quant field `adaptiveQuantField`, opt-in — ~5–8% butteraugli win on 4:4:4; XYB color implemented end-to-end & validated — transform + CoreGraphics-validated ICC + encode/decode; experimental/opt-in, honest caveats below). Earlier 2026-05-28: lossless+near-lossless, scaled decode, multi-threaded trellis+AC-count, jpegli quantizer, ICC/Exif, progressive+restart, fuzzing._
 
 ## Completed
 
@@ -43,6 +43,7 @@ _Last updated: 2026-05-29 (XYB color implemented end-to-end & validated — tran
   - bit-exact (and bounded-exact for near-lossless), cross-validated vs libjpeg-turbo both directions (we read theirs; djpeg reads ours)
 
 ### Large efforts (high value, but multi-stage)
+- [x] **Adaptive quantization field** · `adaptiveQuantField` (opt-in, default off) — spatially varies the trellis RDO λ per 8×8 **luma** block by a visual-masking proxy (block AC energy): busy/masked blocks quantized harder, smooth blocks (banding-prone) preserved. **Validated** (butteraugli): ~5–8% lower distance at matched bytes on detailed **4:4:4** content; slightly *worse* on 4:2:0 at low quality (chroma loss dominates), hence opt-in. (Full jpegli parity would need its ~560-line psychovisual field + per-block zero-bias application — much larger; this captures the core lever decodably with a single quant table.)
 - [x] **jpegli-style quantizer** · `perceptualQuantTables` (opt-in, 8-bit YCbCr) — faithful port of libjxl jpegli's perceptual model: per-coefficient base matrices + non-linear distance scaling (`DistanceToScale`), not a matrix swap. **Validated** (butteraugli, out-of-band): distance calibration tracks target (d=1.0→ba≈1.19, d=1.9→ba≈1.86); better quality-per-byte at high-quality 4:4:4, mixed at low quality / 4:2:0 — the "uncertain payoff without XYB" prediction, now quantified. Default stays Annex-K; 12-bit/lossless unaffected.
 
 ### Marginal / niche (safe, bounded, lower value)

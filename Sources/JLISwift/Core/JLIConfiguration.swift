@@ -128,6 +128,16 @@ public struct JLIEncoderConfiguration: Sendable {
     /// are quantized more aggressively. This is a core jpegli improvement.
     public var adaptiveQuantization: Bool
 
+    /// Spatial adaptive quantization (experimental): modulate the trellis
+    /// rate-distortion λ per 8×8 luma block by a visual-masking proxy (the block's
+    /// AC energy), so busy/masked blocks are quantized harder and smooth blocks
+    /// (where banding shows) are preserved. Requires ``adaptiveQuantization``
+    /// (the trellis). Default `false`: it improves perceptual quality-per-byte on
+    /// detailed / 4:4:4 content (~5–8% lower butteraugli at mid/low quality in
+    /// testing) but can slightly increase 4:2:0 size at low quality, so it's
+    /// opt-in rather than on by default.
+    public var adaptiveQuantField: Bool
+
     /// Derive the quantization tables from jpegli's perceptual model instead of
     /// scaling the ITU-T Annex K tables by an IJG quality factor.
     ///
@@ -158,6 +168,7 @@ public struct JLIEncoderConfiguration: Sendable {
         losslessPointTransform: 0,
         optimiseHuffman: true,
         adaptiveQuantization: true,
+        adaptiveQuantField: false,
         perceptualQuantTables: false
     )
 
@@ -185,6 +196,7 @@ public struct JLIEncoderConfiguration: Sendable {
         losslessPointTransform: Int = 0,
         optimiseHuffman: Bool = true,
         adaptiveQuantization: Bool = true,
+        adaptiveQuantField: Bool = false,
         perceptualQuantTables: Bool = false
     ) {
         self.quality = quality
@@ -200,6 +212,7 @@ public struct JLIEncoderConfiguration: Sendable {
         self.losslessPointTransform = losslessPointTransform
         self.optimiseHuffman = optimiseHuffman
         self.adaptiveQuantization = adaptiveQuantization
+        self.adaptiveQuantField = adaptiveQuantField
         self.perceptualQuantTables = perceptualQuantTables
     }
 }

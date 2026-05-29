@@ -707,4 +707,39 @@ struct EncoderDecoderTests {
         let span = Int(dec12.max()!) - Int(dec12.min()!)
         #expect(span >= 40, "12-bit reconstructed span \(span) too small — detail lost")
     }
+
+    @Test("Adaptive quant field changes the output and round-trips (4:4:4)")
+    func adaptiveQuantField() throws {
+        // Smooth left half + busy right half — the content adaptive quant targets.
+        let w = 96, h = 96
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 3
+                if x < w / 2 {
+                    let v = 40 + x * 120 / w
+                    rgb[i] = UInt8(v); rgb[i + 1] = UInt8(v); rgb[i + 2] = UInt8(min(255, v + 20))
+                } else {
+                    rgb[i] = UInt8((x ^ y) & 0xFF)
+                    rgb[i + 1] = UInt8((x &* 5 &+ y &* 3) & 0xFF)
+                    rgb[i + 2] = UInt8((x &+ y &* 7) & 0xFF)
+                }
+            }
+        }
+        let img = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
+        var off = JLIEncoderConfiguration.default
+        off.chromaSubsampling = .yuv444; off.quality = 85
+        var on = off; on.adaptiveQuantField = true
+
+        let jOff = try JLIEncoder().encode(img, configuration: off)
+        let jOn = try JLIEncoder().encode(img, configuration: on)
+        #expect(jOn != jOff, "adaptiveQuantField should change the encoded output")
+
+        // Both must round-trip to a valid full-size RGB image (no corruption).
+        for jpeg in [jOff, jOn] {
+            let dec = try JLIDecoder().decode(from: jpeg)
+            #expect(dec.width == w && dec.height == h && dec.colorModel == .rgb)
+            #expect(dec.data.count == w * h * 3)
+        }
+    }
 }
