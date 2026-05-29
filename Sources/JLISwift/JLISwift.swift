@@ -84,5 +84,5 @@
 /// - ``JLIError``
 public enum JLISwift {
     /// The current library version.
-    public static let version = "0.2.0"
+    public static let version = "0.3.0"
 }
