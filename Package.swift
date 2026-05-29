@@ -17,6 +17,10 @@ let package = Package(
             name: "JLISwift",
             targets: ["JLISwift"]
         ),
+        .library(
+            name: "JLIDICOM",
+            targets: ["JLIDICOM"]
+        ),
         .executable(
             name: "JLIBench",
             targets: ["JLIBench"]
@@ -26,9 +30,12 @@ let package = Package(
         .target(
             name: "JLISwift"
         ),
+        .target(
+            name: "JLIDICOM"
+        ),
         .executableTarget(
             name: "JLIBench",
-            dependencies: ["JLISwift"]
+            dependencies: ["JLISwift", "JLIDICOM"]
         ),
         .testTarget(
             name: "JLISwiftTests",

@@ -2,6 +2,7 @@
 // Copyright 2024 Raster Lab. All rights reserved.
 
 import Foundation
+import JLIDICOM
 
 /// A DICOM image loaded and converted to 8-bit RGB so it slots into the
 /// existing `Codec` API.

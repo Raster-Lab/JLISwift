@@ -1,0 +1,48 @@
+name: JLILab
+
+options:
+  bundleIdPrefix: in.raster
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+packages:
+  JLISwift:
+    path: ..
+
+targets:
+  JLILab:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+    dependencies:
+      - package: JLISwift
+        product: JLISwift
+      - package: JLISwift
+        product: JLIDICOM
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: in.raster.JLILab
+        PRODUCT_NAME: JLILab
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: JLISwift Medical Image Lab
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        INFOPLIST_KEY_NSHumanReadableCopyright: Copyright © 2024 Raster Lab
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: YES
+        COMBINE_HIDPI_IMAGES: YES
+
+schemes:
+  JLILab:
+    build:
+      targets:
+        JLILab: all
+    run:
+      config: Debug
+    archive:
+      config: Release

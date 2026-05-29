@@ -3,52 +3,48 @@
 
 import Foundation
 
-/// Result of parsing a DICOM file into something usable for JPEG benchmarking.
+/// Result of parsing a DICOM file into something usable for JPEG work.
 ///
 /// Most clinical modalities (CT, MR, DX, MG) store 16-bit grayscale with a
 /// window/level pair. This struct keeps the raw pixels at their native bit
-/// depth plus enough metadata to render them as 8-bit for the codec test.
-struct DICOMImage {
-    let width: Int
-    let height: Int
+/// depth plus enough metadata to render them as 8- or 12-bit for the codec.
+public struct DICOMImage: Sendable {
+    public let width: Int
+    public let height: Int
     /// 1 for monochrome, 3 for RGB.
-    let samplesPerPixel: Int
+    public let samplesPerPixel: Int
     /// 8 or 16 (we ignore the rare 12-bit packed case).
-    let bitsAllocated: Int
+    public let bitsAllocated: Int
     /// Effective dynamic range — `bitsStored ≤ bitsAllocated`.
-    let bitsStored: Int
+    public let bitsStored: Int
     /// 0 = unsigned, 1 = signed two's-complement.
-    let pixelRepresentation: Int
+    public let pixelRepresentation: Int
     /// `MONOCHROME1` (zero = white, inverted), `MONOCHROME2` (zero = black,
     /// the usual case), `RGB`, `YBR_FULL_422`, etc.
-    let photometric: String
+    public let photometric: String
     /// Window center (DICOM tag (0028,1050)) if present. Used to render
-    /// signed/wide-range pixels into 8-bit for the benchmark.
-    let windowCenter: Double?
+    /// signed/wide-range pixels into 8-bit.
+    public let windowCenter: Double?
     /// Window width (DICOM tag (0028,1051)) if present.
-    let windowWidth: Double?
+    public let windowWidth: Double?
     /// Raw pixel bytes exactly as they appeared in (7FE0,0010).
-    let pixelData: [UInt8]
+    public let pixelData: [UInt8]
     /// Transfer Syntax UID — recorded so we can skip files we can't decode.
-    let transferSyntax: String
+    public let transferSyntax: String
 
-    /// Renders the image as 8-bit interleaved RGB (gray replicated to 3 channels)
-    /// so it fits the existing `Codec` API. Uses window/level when present,
-    /// otherwise auto-min/max across the pixel data.
-    ///
-    /// `MONOCHROME1` is inverted (DICOM spec — 0 = white). For signed
-    /// 16-bit pixels we interpret as Int16 first, then map [low, high] → [0, 255].
-    func toRGB8() -> [UInt8] {
+    /// Renders the image as 8-bit interleaved RGB (gray replicated to 3 channels).
+    /// Uses window/level when present, otherwise auto-min/max across the pixel data.
+    /// `MONOCHROME1` is inverted (DICOM spec — 0 = white). For signed 16-bit pixels
+    /// we interpret as Int16 first, then map [low, high] → [0, 255].
+    public func toRGB8() -> [UInt8] {
         let pixelCount = width * height * samplesPerPixel
         if samplesPerPixel == 3 && bitsAllocated == 8 {
-            // Already 8-bit RGB — just copy.
             var out = [UInt8](repeating: 0, count: width * height * 3)
             let n = min(pixelCount, pixelData.count)
             for i in 0..<n { out[i] = pixelData[i] }
             return out
         }
 
-        // Decode to a flat Double array so windowing is uniform.
         let intensities = decodeIntensities()
         let (low, high) = windowRange(intensities: intensities)
         let span = max(1e-9, high - low)
@@ -72,11 +68,11 @@ struct DICOMImage {
         return rgb
     }
 
-    /// Renders the image as 12-bit grayscale (samples 0–4095) for the
-    /// high-precision bench. Uses the same window/level as ``toRGB8()`` so the
-    /// 8-bit and 12-bit views show the same clinical content — just at 16× the
-    /// tonal resolution. `MONOCHROME1` is inverted as in the 8-bit path.
-    func toGray12() -> [UInt16] {
+    /// Renders the image as 12-bit grayscale (samples 0–4095), using the same
+    /// window/level as ``toRGB8()`` so the 8-bit and 12-bit views show the same
+    /// clinical content — just at 16× the tonal resolution. `MONOCHROME1` is
+    /// inverted as in the 8-bit path.
+    public func toGray12() -> [UInt16] {
         let intensities = decodeIntensities()
         let (low, high) = windowRange(intensities: intensities)
         let span = max(1e-9, high - low)
@@ -105,7 +101,6 @@ struct DICOMImage {
                 for i in 0..<n { out[i] = Double(pixelData[i]) }
             }
         } else {
-            // 16-bit little-endian.
             let n = min(pixelCount, pixelData.count / 2)
             pixelData.withUnsafeBufferPointer { buf in
                 let p = buf.baseAddress!
@@ -121,12 +116,11 @@ struct DICOMImage {
     }
 
     /// Returns the (low, high) intensity range for windowing. Uses (WindowCenter,
-    /// WindowWidth) if the DICOM provided them; otherwise scans the array.
+    /// WindowWidth) if present; otherwise scans the array for min/max.
     private func windowRange(intensities: [Double]) -> (Double, Double) {
         if let wc = windowCenter, let ww = windowWidth, ww > 0 {
             return (wc - ww / 2, wc + ww / 2)
         }
-        // Fall back to actual min/max.
         var lo = Double.infinity, hi = -Double.infinity
         for v in intensities {
             if v < lo { lo = v }
@@ -137,14 +131,14 @@ struct DICOMImage {
     }
 }
 
-enum DICOMError: Error, CustomStringConvertible {
+public enum DICOMError: Error, CustomStringConvertible {
     case notDICOM
     case truncated
     case unsupportedTransferSyntax(String)
     case missingPixelData
     case invalidGeometry
 
-    var description: String {
+    public var description: String {
         switch self {
         case .notDICOM: return "not a DICOM file (missing DICM magic)"
         case .truncated: return "DICOM file truncated"
@@ -159,9 +153,8 @@ enum DICOMError: Error, CustomStringConvertible {
 /// Minimal DICOM parser — handles the two uncompressed Little Endian transfer
 /// syntaxes (Implicit VR `1.2.840.10008.1.2` and Explicit VR `1.2.840.10008.1.2.1`).
 /// These cover essentially all uncompressed clinical CT/MR/DX/MG. Compressed
-/// syntaxes (JPEG/JPEG-LS/J2K embedded in DICOM, RLE) throw — the bench corpus
-/// loader catches and skips those files.
-enum DICOMReader {
+/// syntaxes (JPEG/JPEG-LS/J2K embedded in DICOM, RLE) throw.
+public enum DICOMReader {
 
     /// Group/element pair packed into a UInt32 (group << 16 | element).
     typealias Tag = UInt32
@@ -171,7 +164,6 @@ enum DICOMReader {
         (UInt32(group) << 16) | UInt32(element)
     }
 
-    // The handful of tags we actually look up.
     static let tagRows                  = tag(0x0028, 0x0010)
     static let tagColumns               = tag(0x0028, 0x0011)
     static let tagBitsAllocated         = tag(0x0028, 0x0100)
@@ -186,7 +178,12 @@ enum DICOMReader {
     static let tagItem                  = tag(0xFFFE, 0xE000)
     static let tagSequenceDelim         = tag(0xFFFE, 0xE0DD)
 
-    static func read(_ data: [UInt8]) throws -> DICOMImage {
+    /// Convenience: read and parse a DICOM file at `url`.
+    public static func read(contentsOf url: URL) throws -> DICOMImage {
+        try read([UInt8](Data(contentsOf: url)))
+    }
+
+    public static func read(_ data: [UInt8]) throws -> DICOMImage {
         guard data.count >= 132 else { throw DICOMError.truncated }
         // DICM magic at byte 128 (after 128-byte preamble).
         guard data[128] == 0x44, data[129] == 0x49,
@@ -213,7 +210,6 @@ enum DICOMReader {
             datasetStart = next
         }
 
-        // Validate transfer syntax. We accept only the two uncompressed LE syntaxes.
         let isImplicit: Bool
         switch transferSyntax {
         case "1.2.840.10008.1.2":   isImplicit = true   // Implicit VR Little Endian
@@ -222,7 +218,6 @@ enum DICOMReader {
             throw DICOMError.unsupportedTransferSyntax(transferSyntax)
         }
 
-        // Walk the dataset, collecting just the tags we care about.
         var rows = 0, cols = 0, bitsAllocated = 0, bitsStored = 0
         var pixelRep = 0, samplesPerPixel = 1
         var photometric = "MONOCHROME2"
@@ -252,8 +247,6 @@ enum DICOMReader {
             case tagWindowCenter:        windowCenter = readDecimalString(data, range: parsed.valueRange)
             case tagWindowWidth:         windowWidth = readDecimalString(data, range: parsed.valueRange)
             case tagPixelData:
-                // For uncompressed transfer syntaxes the pixel data is a single
-                // contiguous chunk in the value field.
                 pixelData = Array(data[parsed.valueRange])
             default: break
             }
@@ -280,15 +273,12 @@ enum DICOMReader {
 
     // MARK: - Element readers
 
-    /// Explicit VR Little Endian element header. Returns the tag, the (possibly nil)
-    /// VR string, the byte range of the value field, and the cursor advance.
     private static func readExplicitVR(
         _ data: [UInt8], at offset: Int
     ) throws -> (group: UInt16, element: UInt16, vr: String?, valueRange: Range<Int>, next: Int) {
         guard offset + 8 <= data.count else { throw DICOMError.truncated }
         let group   = UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
         let element = UInt16(data[offset + 2]) | (UInt16(data[offset + 3]) << 8)
-        // Item/SequenceDelim use Implicit-style 4-byte length even in Explicit VR.
         if group == 0xFFFE {
             let length = UInt32(data[offset + 4])
                 | (UInt32(data[offset + 5]) << 8)
@@ -301,7 +291,6 @@ enum DICOMReader {
 
         let vr = String(bytes: [data[offset + 4], data[offset + 5]], encoding: .ascii) ?? "  "
 
-        // OB/OW/OF/OD/SQ/UN/UT use a 2-byte reserved field then 4-byte length.
         let bigLengthVRs: Set<String> = ["OB", "OW", "OF", "OD", "SQ", "UN", "UT"]
         if bigLengthVRs.contains(vr) {
             guard offset + 12 <= data.count else { throw DICOMError.truncated }
@@ -311,17 +300,12 @@ enum DICOMReader {
                 | (UInt32(data[offset + 11]) << 24)
             let valStart = offset + 12
             if length == 0xFFFFFFFF {
-                // Undefined length (sequence/encapsulated PixelData). For uncompressed
-                // syntaxes we only see this on SQ — bail to the next element via item walk.
-                // We treat the value range as empty and skip — calling code uses tag to
-                // decide whether it matters.
                 return (group, element, vr, valStart..<valStart, valStart)
             }
             let valEnd = valStart + Int(length)
             guard valEnd <= data.count else { throw DICOMError.truncated }
             return (group, element, vr, valStart..<valEnd, valEnd)
         } else {
-            // 2-byte length follows VR.
             let length = UInt16(data[offset + 6]) | (UInt16(data[offset + 7]) << 8)
             let valStart = offset + 8
             let valEnd = valStart + Int(length)
@@ -330,7 +314,6 @@ enum DICOMReader {
         }
     }
 
-    /// Implicit VR Little Endian element header.
     private static func readImplicitVR(
         _ data: [UInt8], at offset: Int
     ) throws -> (group: UInt16, element: UInt16, vr: String?, valueRange: Range<Int>, next: Int) {
@@ -343,20 +326,11 @@ enum DICOMReader {
             | (UInt32(data[offset + 7]) << 24)
         let valStart = offset + 8
         if length == 0xFFFFFFFF {
-            // Undefined length — treat as empty value and continue at valStart so
-            // the next element is parsed at the items. Our test corpus shouldn't
-            // hit this for uncompressed pixel data.
             return (group, element, nil, valStart..<valStart, valStart)
         }
         let valEnd = valStart + Int(length)
         guard valEnd <= data.count else { throw DICOMError.truncated }
         return (group, element, nil, valStart..<valEnd, valEnd)
-    }
-
-    private static func readTag(_ data: [UInt8], at offset: Int) -> Tag {
-        let group = UInt32(data[offset]) | (UInt32(data[offset + 1]) << 8)
-        let element = UInt32(data[offset + 2]) | (UInt32(data[offset + 3]) << 8)
-        return (group << 16) | element
     }
 
     // MARK: - Value readers
@@ -372,7 +346,6 @@ enum DICOMReader {
     }
 
     private static func readUIString(_ data: [UInt8], range: Range<Int>) -> String {
-        // UI = Unique Identifier — ASCII digits and dots, may be padded with 0x00.
         var bytes = Array(data[range])
         while let last = bytes.last, last == 0x00 || last == 0x20 { bytes.removeLast() }
         return String(bytes: bytes, encoding: .ascii) ?? ""
@@ -381,7 +354,6 @@ enum DICOMReader {
     private static func readDecimalString(_ data: [UInt8], range: Range<Int>) -> Double? {
         let s = readString(data, range: range)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        // Multi-value strings use "\" as separator (e.g. "40\80"). Take the first.
         let first = s.split(separator: "\\").first.map(String.init) ?? s
         return Double(first.trimmingCharacters(in: .whitespacesAndNewlines))
     }
