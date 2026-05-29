@@ -185,9 +185,12 @@ private struct MetricsView: View {
                     row("PSNR", out.psnr.isInfinite ? "∞ (bit-exact)" : String(format: "%.2f dB", out.psnr))
                     row("Max abs error", "\(out.maxAbsError)")
                     if let ba = out.butteraugli {
-                        row("Butteraugli", String(format: "%.4f", ba))
+                        row("Butteraugli ↓", String(format: "%.4f", ba))
                     } else if model.settings.mode == .rgb8 && !model.butteraugliAvailable {
-                        row("Butteraugli", "n/a (install jpeg-xl)")
+                        row("Butteraugli ↓", "n/a (install jpeg-xl)")
+                    }
+                    if let s2 = out.ssimulacra2 {
+                        row("SSIMULACRA2 ↑", String(format: "%.2f", s2))
                     }
                     row("Encode", String(format: "%.1f ms", out.encodeMs))
                     row("Decode", String(format: "%.1f ms", out.decodeMs))
@@ -283,7 +286,18 @@ private struct CrossCodecSheet: View {
             if let r = model.crossReport {
                 Text("8-bit RGB · \(r.width)×\(r.height) · quality \(r.quality)")
                     .font(.caption).foregroundStyle(.secondary)
+                #if DEBUG
+                Label("Debug build — encode times are ~100× slower than Release and not representative. Build the Release scheme for a real speed comparison.",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                #endif
                 comparisonTable(r)
+                if r.rows.contains(where: { $0.spawnCorrected }) {
+                    Text("Enc ms for shell-out codecs (libjpeg-turbo/mozjpeg/jpegli) is spawn-corrected (wall − 8×8 baseline). The fair in-process speed comparison is JLISwift vs ImageIO. PSNR/SSIM2/butteraugli are build-independent. b-augli: lower better; SSIM2: higher better.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 Divider()
                 Text("Interoperability (encode → decode across codecs)").font(.headline)
                 interopList(r)
@@ -294,32 +308,34 @@ private struct CrossCodecSheet: View {
             Spacer(minLength: 0)
         }
         .padding(20)
-        .frame(width: 640, height: 520)
+        .frame(width: 720, height: 560)
     }
 
     private func comparisonTable(_ r: CrossCodecReport) -> some View {
         VStack(spacing: 0) {
             HStack {
-                cell("Codec", 150, .leading).bold()
-                cell("Size", 80).bold(); cell("Ratio", 60).bold()
-                cell("PSNR", 80).bold(); cell("b-augli", 70).bold(); cell("Enc ms", 70).bold()
+                cell("Codec", 130, .leading).bold()
+                cell("Size", 72).bold(); cell("Ratio", 54).bold()
+                cell("PSNR", 62).bold(); cell("b-augli", 64).bold()
+                cell("SSIM2", 60).bold(); cell("Enc ms", 64).bold()
             }.font(.caption).foregroundStyle(.secondary)
             Divider()
             ForEach(r.rows) { row in
                 HStack {
-                    cell(row.name, 150, .leading)
+                    cell(row.name, 130, .leading)
                     if !row.available {
                         Text("not installed").font(.caption).foregroundStyle(.tertiary)
-                            .frame(width: 360, alignment: .leading)
+                            .frame(width: 376, alignment: .leading)
                     } else if let err = row.error {
                         Text(err).font(.caption).foregroundStyle(.orange)
-                            .frame(width: 360, alignment: .leading).lineLimit(1)
+                            .frame(width: 376, alignment: .leading).lineLimit(1)
                     } else {
-                        cell(byteString(row.encodedBytes), 80)
-                        cell(String(format: "%.1f×", row.ratio), 60)
-                        cell(row.psnr.isInfinite ? "∞" : String(format: "%.1f", row.psnr), 80)
-                        cell(row.butteraugli.map { String(format: "%.3f", $0) } ?? "–", 70)
-                        cell(String(format: "%.0f", row.encodeMs), 70)
+                        cell(byteString(row.encodedBytes), 72)
+                        cell(String(format: "%.1f×", row.ratio), 54)
+                        cell(row.psnr.isInfinite ? "∞" : String(format: "%.1f", row.psnr), 62)
+                        cell(row.butteraugli.map { String(format: "%.3f", $0) } ?? "–", 64)
+                        cell(row.ssimulacra2.map { String(format: "%.1f", $0) } ?? "–", 60)
+                        cell(row.spawnCorrected ? String(format: "%.0f*", row.encodeMs) : String(format: "%.0f", row.encodeMs), 64)
                     }
                 }
                 .font(.callout.monospacedDigit())

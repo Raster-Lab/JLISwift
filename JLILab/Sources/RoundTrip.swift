@@ -19,7 +19,8 @@ struct RoundTripOutput: Sendable {
     var compressionRatio: Double
     var psnr: Double           // dB; .infinity when bit-exact
     var maxAbsError: Int
-    var butteraugli: Double?
+    var butteraugli: Double?    // lower is better
+    var ssimulacra2: Double?    // higher is better (100 = identical)
     var encodeMs: Double
     var decodeMs: Double
     var summary: String
@@ -57,13 +58,14 @@ enum RoundTripEngine {
         let psnr = Metrics.psnr8(rgb, decodedRGB8)
         let maxErr = Metrics.maxAbs8(rgb, decodedRGB8)
         let ba = Butteraugli.distance(reference: rgb, distorted: decodedRGB8, width: w, height: h)
+        let s2 = Ssimulacra2.score(reference: rgb, distorted: decodedRGB8, width: w, height: h)
 
         return RoundTripOutput(
             width: w, height: h, encoded: encoded, decodedRGB8: decodedRGB8,
             encodedBytes: encoded.count,
             bpp: Double(encoded.count * 8) / Double(w * h),
             compressionRatio: Double(w * h * 3) / Double(max(1, encoded.count)),
-            psnr: psnr, maxAbsError: maxErr, butteraugli: ba,
+            psnr: psnr, maxAbsError: maxErr, butteraugli: ba, ssimulacra2: s2,
             encodeMs: encodeMs, decodeMs: decodeMs,
             summary: summary(settings: settings, channels: "RGB")
         )
@@ -97,7 +99,7 @@ enum RoundTripEngine {
             encodedBytes: encoded.count,
             bpp: Double(encoded.count * 8) / Double(w * h),
             compressionRatio: Double(w * h * 2) / Double(max(1, encoded.count)),
-            psnr: psnr, maxAbsError: maxErr, butteraugli: nil,
+            psnr: psnr, maxAbsError: maxErr, butteraugli: nil, ssimulacra2: nil,
             encodeMs: encodeMs, decodeMs: decodeMs,
             summary: summary(settings: settings, channels: "12-bit gray")
         )

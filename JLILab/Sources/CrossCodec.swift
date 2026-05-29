@@ -19,7 +19,11 @@ struct CrossCodecRow: Sendable, Identifiable {
     var ratio: Double = 0
     var psnr: Double = 0
     var butteraugli: Double?
+    var ssimulacra2: Double?
     var encodeMs: Double = 0
+    /// True when `encodeMs` was corrected by subtracting measured process-spawn
+    /// overhead (shell-out codecs) so it's comparable to in-process timings.
+    var spawnCorrected = false
 }
 
 /// One interoperability check: encode with codec A, decode with codec B, and
@@ -44,9 +48,13 @@ struct CrossCodecReport: Sendable {
 protocol LabCodec: Sendable {
     var name: String { get }
     var available: Bool { get }
+    /// True for shell-out codecs, whose wall-clock encode time is dominated by
+    /// process-spawn overhead and so must be spawn-corrected to be comparable.
+    var isExternal: Bool { get }
     func encode(rgb: [UInt8], width: Int, height: Int, quality: Int) throws -> [UInt8]
     func decode(_ jpeg: [UInt8]) throws -> (rgb: [UInt8], width: Int, height: Int)
 }
+extension LabCodec { var isExternal: Bool { false } }
 
 /// JLISwift itself, encoding 8-bit RGB at a comparison quality while keeping the
 /// lab's other choices (subsampling, progressive, trellis, perceptual tables).
@@ -141,6 +149,7 @@ struct CLILabCodec: LabCodec {
     let decoderPath: String?
     let encoderArgs: @Sendable (Int) -> [String]
     var available: Bool { encoderPath != nil && decoderPath != nil }
+    var isExternal: Bool { true }
 
     func encode(rgb: [UInt8], width: Int, height: Int, quality: Int) throws -> [UInt8] {
         guard let path = encoderPath else { throw LabCodecError.message("\(name) not installed") }
@@ -244,23 +253,41 @@ enum CrossCodecRunner {
         let jpegli = CLILabCodec.jpegli()
         let codecs: [LabCodec] = [jli, imageIO, turbo, moz, jpegli]
 
+        // Tiny image to estimate per-codec process-spawn overhead (the actual
+        // encode of 8×8 is negligible, so its wall time ≈ spawn + pipe cost).
+        let tiny = [UInt8](repeating: 128, count: 8 * 8 * 3)
+
         var rows: [CrossCodecRow] = []
         for c in codecs {
             guard c.available else { rows.append(CrossCodecRow(name: c.name, available: false)); continue }
             do {
                 let t0 = Date()
                 let jpeg = try c.encode(rgb: rgb8, width: width, height: height, quality: quality)
-                let encMs = Date().timeIntervalSince(t0) * 1000
+                let wallMs = Date().timeIntervalSince(t0) * 1000
+
+                var encMs = wallMs
+                var corrected = false
+                if c.isExternal {
+                    let s0 = Date()
+                    _ = try? c.encode(rgb: tiny, width: 8, height: 8, quality: quality)
+                    let spawnMs = Date().timeIntervalSince(s0) * 1000
+                    encMs = max(0.05, wallMs - spawnMs)
+                    corrected = true
+                }
+
                 let dec = try c.decode(jpeg)
                 let cmp = min(rgb8.count, dec.rgb.count)
                 let psnr = Metrics.psnr8(Array(rgb8.prefix(cmp)), Array(dec.rgb.prefix(cmp)))
-                let ba = (dec.width == width && dec.height == height)
-                    ? Butteraugli.distance(reference: rgb8, distorted: dec.rgb, width: width, height: height) : nil
+                let sameDims = dec.width == width && dec.height == height
+                let ba = sameDims ? Butteraugli.distance(reference: rgb8, distorted: dec.rgb, width: width, height: height) : nil
+                let s2 = sameDims ? Ssimulacra2.score(reference: rgb8, distorted: dec.rgb, width: width, height: height) : nil
+
                 var row = CrossCodecRow(name: c.name, available: true)
                 row.encodedBytes = jpeg.count
                 row.bpp = Double(jpeg.count * 8) / Double(width * height)
                 row.ratio = Double(width * height * 3) / Double(max(1, jpeg.count))
-                row.psnr = psnr; row.butteraugli = ba; row.encodeMs = encMs
+                row.psnr = psnr; row.butteraugli = ba; row.ssimulacra2 = s2
+                row.encodeMs = encMs; row.spawnCorrected = corrected
                 rows.append(row)
             } catch {
                 rows.append(CrossCodecRow(name: c.name, available: true, error: describe(error)))

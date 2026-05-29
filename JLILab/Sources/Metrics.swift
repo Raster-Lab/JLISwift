@@ -96,3 +96,53 @@ enum Butteraugli {
         try data.write(to: URL(fileURLWithPath: path))
     }
 }
+
+/// SSIMULACRA 2 perceptual quality score via libjxl's `ssimulacra2`. Unlike
+/// butteraugli, **higher is better**: 100 = identical, ~90 = very high quality,
+/// ~70 = high, ~50 = medium, ~30 = low. `nil` when the tool isn't installed.
+enum Ssimulacra2 {
+    static let binaryPath: String? = {
+        let candidates = [
+            "/opt/homebrew/bin/ssimulacra2",
+            "/opt/homebrew/opt/jpeg-xl/bin/ssimulacra2",
+            "/usr/local/bin/ssimulacra2",
+            ProcessInfo.processInfo.environment["JLI_SSIMULACRA2_BIN"] ?? "",
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }()
+
+    static var isAvailable: Bool { binaryPath != nil }
+
+    static func score(reference: [UInt8], distorted: [UInt8], width: Int, height: Int) -> Double? {
+        guard let bin = binaryPath else { return nil }
+        guard reference.count == width * height * 3,
+              distorted.count == width * height * 3 else { return nil }
+
+        let tmp = NSTemporaryDirectory()
+        let token = UUID().uuidString
+        let refPath = "\(tmp)jlilab-s2ref-\(token).ppm"
+        let distPath = "\(tmp)jlilab-s2dist-\(token).ppm"
+        defer {
+            try? FileManager.default.removeItem(atPath: refPath)
+            try? FileManager.default.removeItem(atPath: distPath)
+        }
+        func writePPM(_ rgb: [UInt8], to path: String) throws {
+            var d = Data("P6\n\(width) \(height)\n255\n".utf8); d.append(contentsOf: rgb)
+            try d.write(to: URL(fileURLWithPath: path))
+        }
+        do { try writePPM(reference, to: refPath); try writePPM(distorted, to: distPath) } catch { return nil }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: bin)
+        proc.arguments = [refPath, distPath]
+        let out = Pipe(); proc.standardOutput = out; proc.standardError = Pipe()
+        do { try proc.run() } catch { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return nil }
+        let text = String(data: data, encoding: .utf8) ?? ""
+        guard let first = text.split(separator: "\n").first,
+              let value = Double(first.trimmingCharacters(in: .whitespaces)) else { return nil }
+        return value
+    }
+}
