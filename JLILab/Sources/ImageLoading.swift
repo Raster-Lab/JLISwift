@@ -19,7 +19,33 @@ struct SourceImage: Sendable {
     var gray12: [UInt16]?
     var kind: String
 
+    /// Retained for monochrome DICOM sources so the viewer can re-window
+    /// interactively without re-reading the file. `nil` for standard images.
+    var dicom: DICOMImage?
+    /// Full real-world intensity range (slider bounds) and the file's default
+    /// window/level. Meaningful only when `dicom != nil`.
+    var intensityRange: ClosedRange<Double> = 0...0
+    var defaultCenter: Double = 0
+    var defaultWidth: Double = 0
+
     var hasHighBitDepth: Bool { gray12 != nil }
+    /// Whether interactive window/level applies (monochrome DICOM only).
+    var isWindowable: Bool { dicom != nil }
+    /// CT stores Hounsfield units, so the named bone/lung/soft-tissue presets are
+    /// only clinically meaningful here.
+    var isCT: Bool { dicom?.modality == "CT" }
+
+    /// Returns a copy re-rendered at the given window/level. The window is baked
+    /// into both the 8-bit and 12-bit buffers (matching how the source was first
+    /// loaded), so the codec re-encodes exactly what the viewer shows. No-op for
+    /// non-DICOM sources.
+    func windowed(center: Double, width: Double) -> SourceImage {
+        guard let d = dicom else { return self }
+        var copy = self
+        copy.rgb8 = d.render8bit(windowCenter: center, windowWidth: width)
+        if gray12 != nil { copy.gray12 = d.render12bit(windowCenter: center, windowWidth: width) }
+        return copy
+    }
 }
 
 enum LoadError: Error, CustomStringConvertible {
@@ -62,9 +88,16 @@ enum ImageLoader {
         let mono = dicom.photometric.hasPrefix("MONOCHROME")
         let gray12: [UInt16]? = mono ? dicom.toGray12() : nil
         let kind = "DICOM · \(dicom.bitsStored)-bit \(dicom.photometric) · \(dicom.width)×\(dicom.height)"
+        let (lo, hi) = dicom.intensityRange()
+        let (center, width) = dicom.windowDefaults()
         return SourceImage(
             url: url, width: dicom.width, height: dicom.height,
-            rgb8: rgb8, gray12: gray12, kind: kind
+            rgb8: rgb8, gray12: gray12, kind: kind,
+            // Window/level only applies to monochrome sources; leave RGB DICOM
+            // un-windowable so the sidebar sliders stay hidden.
+            dicom: mono ? dicom : nil,
+            intensityRange: lo...max(lo, hi),
+            defaultCenter: center, defaultWidth: width
         )
     }
 

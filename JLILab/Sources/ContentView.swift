@@ -35,6 +35,17 @@ struct ContentView: View {
         .sheet(isPresented: $model.showCrossSheet) { CrossCodecSheet(model: model) }
         .sheet(isPresented: $model.showRDSheet) { RDCurveSheet(model: model) }
         .frame(minWidth: 900, minHeight: 560)
+        .task { openLaunchArgumentFileIfPresent() }
+    }
+
+    /// Opens a file path passed on the command line (e.g. launching the binary with
+    /// a path argument) so the lab can be scripted or pointed at a specific file.
+    private func openLaunchArgumentFileIfPresent() {
+        guard model.source == nil else { return }
+        for arg in CommandLine.arguments.dropFirst() where !arg.hasPrefix("-") {
+            let url = URL(fileURLWithPath: arg)
+            if FileManager.default.fileExists(atPath: url.path) { model.open(url: url); break }
+        }
     }
 
     private func openFile() {
@@ -63,6 +74,22 @@ struct ContentView: View {
 
 // MARK: - Controls
 
+/// Standard CT window/level presets, in Hounsfield units. Only offered for CT,
+/// where pixel intensities are HU after the Modality LUT.
+private struct WindowPreset: Identifiable {
+    let name: String
+    let center: Double
+    let width: Double
+    var id: String { name }
+
+    static let ctPresets: [WindowPreset] = [
+        .init(name: "Soft", center: 40, width: 400),
+        .init(name: "Lung", center: -600, width: 1500),
+        .init(name: "Bone", center: 300, width: 1500),
+        .init(name: "Brain", center: 40, width: 80),
+    ]
+}
+
 private struct ControlsSidebar: View {
     @Bindable var model: AppModel
 
@@ -78,12 +105,81 @@ private struct ControlsSidebar: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
+                windowSection
                 pipelineSection
                 if model.settings.lossless { losslessSection } else { lossySection }
                 Divider()
                 MetricsView(model: model)
             }
             .padding(16)
+        }
+    }
+
+    /// Window/level controls — shown only for monochrome DICOM. Dragging a slider
+    /// re-windows the source (8- and 12-bit) and re-runs the round-trip. Named
+    /// presets appear for CT, where pixels are in Hounsfield units.
+    @ViewBuilder private var windowSection: some View {
+        if let src = model.source, src.isWindowable {
+            GroupBox("Window / Level") {
+                VStack(alignment: .leading, spacing: 8) {
+                    windowSlider("Center", value: windowBinding(\.windowCenter), range: centerRange(src))
+                    windowSlider("Width", value: windowBinding(\.windowWidth), range: widthRange(src))
+                    if src.isCT {
+                        HStack(spacing: 6) {
+                            ForEach(WindowPreset.ctPresets) { p in
+                                Button(p.name) {
+                                    model.windowCenter = p.center
+                                    model.windowWidth = p.width
+                                    model.applyWindow()
+                                }
+                                .buttonStyle(.bordered).controlSize(.small)
+                            }
+                        }
+                    }
+                    HStack {
+                        Button("Reset") { model.resetWindow() }.controlSize(.small)
+                        Spacer()
+                        Text(src.isCT ? "Hounsfield units (CT)" : "scanner units")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    }
+                }.padding(6)
+            }
+        }
+    }
+
+    /// A `Binding` over a window property that re-windows + re-encodes on every
+    /// change, so the viewer tracks the slider live.
+    private func windowBinding(_ keyPath: ReferenceWritableKeyPath<AppModel, Double>) -> Binding<Double> {
+        Binding(
+            get: { model[keyPath: keyPath] },
+            set: { model[keyPath: keyPath] = $0; model.applyWindow() }
+        )
+    }
+
+    private func centerRange(_ src: SourceImage) -> ClosedRange<Double> {
+        // CT center lives in a clinical Hounsfield band; ignore the very low
+        // out-of-FOV padding floor (often −8192) so the slider isn't mostly dead
+        // travel. Other modalities use their actual intensity range.
+        if src.isCT { return -1024...max(src.intensityRange.upperBound, 1024) }
+        let lo = src.intensityRange.lowerBound
+        let hi = src.intensityRange.upperBound
+        return hi > lo ? lo...hi : (lo - 1)...(lo + 1)
+    }
+
+    private func widthRange(_ src: SourceImage) -> ClosedRange<Double> {
+        if src.isCT { return 1...max(src.defaultWidth, 4000) }
+        let hi = max(src.defaultWidth, src.intensityRange.upperBound - src.intensityRange.lowerBound, 2)
+        return 1...hi
+    }
+
+    private func windowSlider(_ title: String, value: Binding<Double>, range: ClosedRange<Double>) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text(String(format: "%.0f", value.wrappedValue)).monospacedDigit().foregroundStyle(.secondary)
+            }
+            Slider(value: value, in: range)
         }
     }
 

@@ -21,7 +21,8 @@ _Last updated: 2026-05-29 — **0.2.0 RELEASED** (tagged `v0.2.0`, GitHub Releas
 ### WS-B — JLILab distribution (P1)
 - [x] **Sign/notarize/DMG scaffolding**: `JLILab/scripts/package.sh` (archive → Developer-ID export → `notarytool --wait` → staple → DMG) + `ExportOptions.plist`; hardened runtime already on, non-sandboxed (so it reads user files + shells out to butteraugli/cjpeg). *The notarize step needs your Apple Developer identity + a stored `notarytool` keychain profile — everything else is ready.*
 - [x] **Batch metrics**: `JLIBench --batch <dir> [out.csv]` recursively round-trips every `.dcm` (JLISwift default) → CSV (path, dims, bytes, bpp, ratio, PSNR, butteraugli, enc/dec ms). Validated on the corpus.
-- [ ] Remaining QoL (in-app): DICOM window/level controls, save/load presets, export comparison report.
+- [x] **Interactive DICOM window/level**: library API (`DICOMImage.render8bit/render12bit(windowCenter:windowWidth:)`, `windowDefaults()`, `intensityRange()`, + parsed `modality`) with unit tests; JLILab sidebar sliders re-window the 8-/12-bit source and re-run the round-trip live, with **CT Hounsfield presets** (Soft/Lung/Bone/Brain — gated on `modality == "CT"`). Also added a launch-arg file-open so the app can be scripted/pointed at a file. Validated on real CT + MR corpus files (modality parse, slider ranges, luma response).
+- [ ] Remaining QoL (in-app): save/load presets, export comparison report.
 
 ### WS-C — Targeted performance (P2, diminishing returns)
 - [ ] Parallelize inverse color conversion + per-component decode (byte-identical, `concurrentPerform`).

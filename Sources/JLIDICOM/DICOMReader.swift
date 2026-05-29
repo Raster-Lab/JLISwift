@@ -22,6 +22,10 @@ public struct DICOMImage: Sendable {
     /// `MONOCHROME1` (zero = white, inverted), `MONOCHROME2` (zero = black,
     /// the usual case), `RGB`, `YBR_FULL_422`, etc.
     public let photometric: String
+    /// Modality (DICOM tag (0008,0060)): `CT`, `MR`, `DX`, `MG`, … or empty when
+    /// absent. CT stores Hounsfield units, so named window presets (bone/lung/…)
+    /// only make clinical sense there.
+    public let modality: String
     /// Window center (DICOM tag (0028,1050)) if present. Used to render
     /// signed/wide-range pixels into 8-bit.
     public let windowCenter: Double?
@@ -39,35 +43,57 @@ public struct DICOMImage: Sendable {
     /// Transfer Syntax UID — recorded so we can skip files we can't decode.
     public let transferSyntax: String
 
-    /// Renders the image as 8-bit interleaved RGB (gray replicated to 3 channels).
-    /// Uses window/level when present, otherwise auto-min/max across the pixel data.
-    /// `MONOCHROME1` is inverted (DICOM spec — 0 = white). For signed 16-bit pixels
-    /// we interpret as Int16 first, then map [low, high] → [0, 255].
-    public func toRGB8() -> [UInt8] {
-        let pixelCount = width * height * samplesPerPixel
+    /// Full range of decoded intensities after the Modality LUT — the real-world
+    /// min/max (e.g. Hounsfield for CT). Handy as the bounds for an interactive
+    /// window/level control. Returns `(0, 255)` for already-RGB photographic DICOM,
+    /// where windowing does not apply.
+    public func intensityRange() -> (lo: Double, hi: Double) {
+        if samplesPerPixel == 3 && bitsAllocated == 8 { return (0, 255) }
+        let intensities = decodeIntensities()
+        var lo = Double.infinity, hi = -Double.infinity
+        for v in intensities {
+            if v < lo { lo = v }
+            if v > hi { hi = v }
+        }
+        if !lo.isFinite || !hi.isFinite { return (0, 255) }
+        if lo == hi { return (lo - 1, hi + 1) }
+        return (lo, hi)
+    }
+
+    /// The window/level to show by default: the file's (WindowCenter, WindowWidth)
+    /// when present, otherwise centered on the full intensity range. Both values are
+    /// in real-world (post-rescale) units.
+    public func windowDefaults() -> (center: Double, width: Double) {
+        if let wc = windowCenter, let ww = windowWidth, ww > 0 {
+            return (wc, ww)
+        }
+        let (lo, hi) = intensityRange()
+        return ((lo + hi) / 2, max(1, hi - lo))
+    }
+
+    /// Renders the image as 8-bit interleaved RGB (gray replicated to 3 channels)
+    /// using the given window/level (real-world units): `[center − width/2, center +
+    /// width/2]` maps to `[0, 255]`. `MONOCHROME1` is inverted (DICOM spec — 0 =
+    /// white). Already-RGB 8-bit photographic DICOM ignores the window and is copied
+    /// through unchanged.
+    public func render8bit(windowCenter center: Double, windowWidth width: Double) -> [UInt8] {
+        let pixelCount = self.width * self.height * samplesPerPixel
         if samplesPerPixel == 3 && bitsAllocated == 8 {
-            var out = [UInt8](repeating: 0, count: width * height * 3)
+            var out = [UInt8](repeating: 0, count: self.width * self.height * 3)
             let n = min(pixelCount, pixelData.count)
             for i in 0..<n { out[i] = pixelData[i] }
             return out
         }
-
         let intensities = decodeIntensities()
-        let (low, high) = windowRange(intensities: intensities)
-        let span = max(1e-9, high - low)
+        let low = center - width / 2
+        let span = max(1e-9, width)
         let invert = (photometric == "MONOCHROME1")
-
-        var gray = [UInt8](repeating: 0, count: width * height)
-        for i in 0..<min(gray.count, intensities.count) {
+        var rgb = [UInt8](repeating: 0, count: self.width * self.height * 3)
+        for i in 0..<min(self.width * self.height, intensities.count) {
             var v = (intensities[i] - low) / span
             if v < 0 { v = 0 } else if v > 1 { v = 1 }
             if invert { v = 1 - v }
-            gray[i] = UInt8(v * 255.0 + 0.5)
-        }
-
-        var rgb = [UInt8](repeating: 0, count: width * height * 3)
-        for i in 0..<gray.count {
-            let g = gray[i]
+            let g = UInt8(v * 255.0 + 0.5)
             rgb[i * 3]     = g
             rgb[i * 3 + 1] = g
             rgb[i * 3 + 2] = g
@@ -75,16 +101,23 @@ public struct DICOMImage: Sendable {
         return rgb
     }
 
-    /// Renders the image as 12-bit grayscale (samples 0–4095), using the same
-    /// window/level as ``toRGB8()`` so the 8-bit and 12-bit views show the same
-    /// clinical content — just at 16× the tonal resolution. `MONOCHROME1` is
-    /// inverted as in the 8-bit path.
-    public func toGray12() -> [UInt16] {
+    /// Renders the image as 8-bit interleaved RGB using the file's default window
+    /// (or auto min/max when none is stored). Convenience over ``render8bit``.
+    public func toRGB8() -> [UInt8] {
+        let (c, w) = windowDefaults()
+        return render8bit(windowCenter: c, windowWidth: w)
+    }
+
+    /// Renders the image as 12-bit grayscale (samples 0–4095) using the given
+    /// window/level — the 12-bit counterpart to ``render8bit(windowCenter:windowWidth:)``,
+    /// so the two views show the same clinical content at 16× the tonal resolution.
+    /// `MONOCHROME1` is inverted as in the 8-bit path.
+    public func render12bit(windowCenter center: Double, windowWidth width: Double) -> [UInt16] {
         let intensities = decodeIntensities()
-        let (low, high) = windowRange(intensities: intensities)
-        let span = max(1e-9, high - low)
+        let low = center - width / 2
+        let span = max(1e-9, width)
         let invert = (photometric == "MONOCHROME1")
-        var gray = [UInt16](repeating: 0, count: width * height)
+        var gray = [UInt16](repeating: 0, count: self.width * self.height)
         for i in 0..<min(gray.count, intensities.count) {
             var v = (intensities[i] - low) / span
             if v < 0 { v = 0 } else if v > 1 { v = 1 }
@@ -92,6 +125,13 @@ public struct DICOMImage: Sendable {
             gray[i] = UInt16(v * 4095.0 + 0.5)
         }
         return gray
+    }
+
+    /// Renders the image as 12-bit grayscale using the file's default window.
+    /// Convenience over ``render12bit``.
+    public func toGray12() -> [UInt16] {
+        let (c, w) = windowDefaults()
+        return render12bit(windowCenter: c, windowWidth: w)
     }
 
     /// Native intensities as Double, honoring `bitsAllocated` + `pixelRepresentation`.
@@ -125,21 +165,6 @@ public struct DICOMImage: Sendable {
             for i in 0..<out.count { out[i] = out[i] * rescaleSlope + rescaleIntercept }
         }
         return out
-    }
-
-    /// Returns the (low, high) intensity range for windowing. Uses (WindowCenter,
-    /// WindowWidth) if present; otherwise scans the array for min/max.
-    private func windowRange(intensities: [Double]) -> (Double, Double) {
-        if let wc = windowCenter, let ww = windowWidth, ww > 0 {
-            return (wc - ww / 2, wc + ww / 2)
-        }
-        var lo = Double.infinity, hi = -Double.infinity
-        for v in intensities {
-            if v < lo { lo = v }
-            if v > hi { hi = v }
-        }
-        if lo == hi { return (lo - 1, hi + 1) }
-        return (lo, hi)
     }
 }
 
@@ -183,6 +208,7 @@ public enum DICOMReader {
     static let tagPixelRepresentation   = tag(0x0028, 0x0103)
     static let tagSamplesPerPixel       = tag(0x0028, 0x0002)
     static let tagPhotometric           = tag(0x0028, 0x0004)
+    static let tagModality              = tag(0x0008, 0x0060)
     static let tagWindowCenter          = tag(0x0028, 0x1050)
     static let tagWindowWidth           = tag(0x0028, 0x1051)
     static let tagRescaleIntercept      = tag(0x0028, 0x1052)
@@ -235,6 +261,7 @@ public enum DICOMReader {
         var rows = 0, cols = 0, bitsAllocated = 0, bitsStored = 0
         var pixelRep = 0, samplesPerPixel = 1
         var photometric = "MONOCHROME2"
+        var modality = ""
         var windowCenter: Double? = nil
         var windowWidth: Double? = nil
         var rescaleSlope: Double? = nil
@@ -260,6 +287,7 @@ public enum DICOMReader {
             case tagPixelRepresentation: pixelRep = Int(readUInt16(data, range: parsed.valueRange))
             case tagSamplesPerPixel:     samplesPerPixel = Int(readUInt16(data, range: parsed.valueRange))
             case tagPhotometric:         photometric = readString(data, range: parsed.valueRange)
+            case tagModality:            modality = readString(data, range: parsed.valueRange)
             case tagWindowCenter:        windowCenter = readDecimalString(data, range: parsed.valueRange)
             case tagWindowWidth:         windowWidth = readDecimalString(data, range: parsed.valueRange)
             case tagRescaleIntercept:    rescaleIntercept = readDecimalString(data, range: parsed.valueRange)
@@ -283,6 +311,7 @@ public enum DICOMReader {
             bitsStored: bitsStored == 0 ? bitsAllocated : bitsStored,
             pixelRepresentation: pixelRep,
             photometric: photometric.trimmingCharacters(in: .whitespacesAndNewlines),
+            modality: modality.trimmingCharacters(in: .whitespacesAndNewlines),
             windowCenter: windowCenter, windowWidth: windowWidth,
             rescaleSlope: rescaleSlope ?? 1.0,
             rescaleIntercept: rescaleIntercept ?? 0.0,

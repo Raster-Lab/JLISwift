@@ -36,6 +36,12 @@ final class AppModel {
     var viewMode: ViewMode = .sideBySide
     var diffAmplification: Double = 10
 
+    // Window/level (monochrome DICOM only). Bound to the sidebar sliders; changing
+    // them re-windows the source and re-runs the round-trip via `applyWindow()`.
+    // In real-world units (e.g. Hounsfield for CT).
+    var windowCenter: Double = 0
+    var windowWidth: Double = 1
+
     // Derived, rendered on the main actor from Sendable buffers.
     var originalImage: CGImage?
     var decodedImage: CGImage?
@@ -62,6 +68,8 @@ final class AppModel {
         do {
             let src = try ImageLoader.load(url: url)
             source = src
+            windowCenter = src.defaultCenter
+            windowWidth = max(1, src.defaultWidth)
             if src.gray12 == nil && settings.mode == .gray12 { settings.mode = .rgb8 }
             originalImage = Render.cgImage(rgb8: src.rgb8, width: src.width, height: src.height)
             statusMessage = src.kind
@@ -107,6 +115,26 @@ final class AppModel {
                 self.errorMessage = message
             }
         }
+    }
+
+    /// Re-renders the source at the current window/level (baking it into both the
+    /// 8- and 12-bit buffers) and re-runs the round-trip. The encode itself is
+    /// debounced inside `run()`, so dragging a slider stays responsive. No-op for
+    /// non-windowable sources.
+    func applyWindow() {
+        guard let src = source, src.isWindowable else { return }
+        let windowed = src.windowed(center: windowCenter, width: windowWidth)
+        source = windowed
+        originalImage = Render.cgImage(rgb8: windowed.rgb8, width: windowed.width, height: windowed.height)
+        run()
+    }
+
+    /// Restores the file's stored (or auto) default window/level.
+    func resetWindow() {
+        guard let src = source, src.isWindowable else { return }
+        windowCenter = src.defaultCenter
+        windowWidth = max(1, src.defaultWidth)
+        applyWindow()
     }
 
     /// Runs the loaded image (as 8-bit RGB, at the current quality) through

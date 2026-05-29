@@ -103,4 +103,60 @@ struct DICOMReaderTests {
         #expect(rgb[0] == 0)        // min → black
         #expect(rgb[9] == 255)      // max → white
     }
+
+    @Test("render8bit re-maps an explicit window/level")
+    func explicitWindow() throws {
+        var b = DICOMBuilder()
+        b.us(0x0028, 0x0002, 1)
+        b.str(0x0028, 0x0004, "CS", "MONOCHROME2")
+        b.us(0x0028, 0x0010, 1)
+        b.us(0x0028, 0x0011, 4)
+        b.us(0x0028, 0x0100, 16)
+        b.us(0x0028, 0x0101, 16)
+        b.us(0x0028, 0x0103, 0)
+        b.ow(0x7FE0, 0x0010, [0, 100, 200, 300])   // no window/rescale tags
+
+        let img = try DICOMReader.read(b.bytes())
+
+        // Full range and the window derived from it when none is stored.
+        let (lo, hi) = img.intensityRange()
+        #expect(lo == 0 && hi == 300)
+        let (c, w) = img.windowDefaults()
+        #expect(c == 150 && w == 300)
+
+        // Wide window [0,300]: monotonic ramp, endpoints hit black/white.
+        let wide = img.render8bit(windowCenter: 150, windowWidth: 300)
+        #expect(wide[0] == 0)        // 0   → black
+        #expect(wide[9] == 255)      // 300 → white
+        #expect(wide[3] > wide[0] && wide[6] > wide[3] && wide[9] > wide[6])
+
+        // Narrow window centered at 200, width 100 → [150,250]: values below the
+        // window clamp to black, the center sits mid-gray. Proves the window remaps.
+        let narrow = img.render8bit(windowCenter: 200, windowWidth: 100)
+        #expect(narrow[0] == 0)                       // 0   below window → black
+        #expect(narrow[3] == 0)                       // 100 below window → black
+        #expect(narrow[6] > 100 && narrow[6] < 160)   // 200 at center → ~mid gray
+        #expect(narrow[9] == 255)                     // 300 above window → white
+    }
+
+    @Test("windowDefaults prefers the stored WindowCenter/WindowWidth")
+    func storedWindowDefaults() throws {
+        var b = DICOMBuilder()
+        b.us(0x0028, 0x0002, 1)
+        b.str(0x0028, 0x0004, "CS", "MONOCHROME2")
+        b.us(0x0028, 0x0010, 1)
+        b.us(0x0028, 0x0011, 4)
+        b.us(0x0028, 0x0100, 16)
+        b.us(0x0028, 0x0101, 16)
+        b.us(0x0028, 0x0103, 0)
+        b.str(0x0028, 0x1050, "DS", "200")    // WindowCenter
+        b.str(0x0028, 0x1051, "DS", "100")    // WindowWidth
+        b.ow(0x7FE0, 0x0010, [0, 100, 200, 300])
+
+        let img = try DICOMReader.read(b.bytes())
+        let (c, w) = img.windowDefaults()
+        #expect(c == 200 && w == 100)
+        // toRGB8() must apply that stored window — identical to render8bit(200,100).
+        #expect(img.toRGB8() == img.render8bit(windowCenter: 200, windowWidth: 100))
+    }
 }
