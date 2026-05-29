@@ -677,14 +677,29 @@ public struct JLIEncoder: Sendable {
         let blockCount = blocksH * blocksV
         var scratch = [Float](repeating: 0, count: blockCount * 64)
         let levelShift: Float = 128
-        // DCT + quantize each XYB plane (exact round-to-nearest; no trellis — the
-        // perceptual allocation already lives in the XYB tables).
+        // DCT + quantize each XYB plane. Trellis (RDO) is gated by
+        // `adaptiveQuantization` like the YCbCr path — without it XYB competes
+        // against trellis-on YCbCr one-handed. Per-channel λ scales with the
+        // channel's own mean AC quant step²; the AC rate model uses the standard
+        // table for the channel's Huffman set (Y→luma, X/B→chroma).
+        func meanACSq(_ table: [Int]) -> Double {
+            var sum = 0.0
+            for i in 1..<64 { sum += Double(table[i]) * Double(table[i]) }
+            return sum / 63.0
+        }
+        let useRDO = configuration.adaptiveQuantization
+        func rdo(_ table: [Int], _ ac: HuffmanTable) -> RDOContext? {
+            useRDO ? RDOContext(quantTable: table, acTable: ac, lambda: JLIEncoder.rdoLambdaK * meanACSq(table)) : nil
+        }
         let qx = quantizePlane(xP, planeWidth: w, planeHeight: h, blocksH: blocksH, blocksV: blocksV,
-                               invQuant: qt[0].map { 1.0 / Float($0) }, levelShift: levelShift, scratch: &scratch)
+                               invQuant: qt[0].map { 1.0 / Float($0) }, levelShift: levelShift,
+                               scratch: &scratch, rdo: rdo(qt[0], StandardHuffmanTables.acChrominance))
         let qy = quantizePlane(yP, planeWidth: w, planeHeight: h, blocksH: blocksH, blocksV: blocksV,
-                               invQuant: qt[1].map { 1.0 / Float($0) }, levelShift: levelShift, scratch: &scratch)
+                               invQuant: qt[1].map { 1.0 / Float($0) }, levelShift: levelShift,
+                               scratch: &scratch, rdo: rdo(qt[1], StandardHuffmanTables.acLuminance))
         let qb = quantizePlane(bP, planeWidth: w, planeHeight: h, blocksH: blocksH, blocksV: blocksV,
-                               invQuant: qt[2].map { 1.0 / Float($0) }, levelShift: levelShift, scratch: &scratch)
+                               invQuant: qt[2].map { 1.0 / Float($0) }, levelShift: levelShift,
+                               scratch: &scratch, rdo: rdo(qt[2], StandardHuffmanTables.acChrominance))
         let planes = [qx, qy, qb]
 
         // Huffman: set 0 serves Y (the luma-like channel), set 1 serves X and B.
