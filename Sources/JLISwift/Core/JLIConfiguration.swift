@@ -153,6 +153,14 @@ public struct JLIEncoderConfiguration: Sendable {
     /// legacy Annex-K rate allocation.
     public var perceptualQuantTables: Bool
 
+    /// **Experimental (0.3.0, opt-in).** Use jpegli's adaptive-quantization path:
+    /// a per-8×8-block visual-masking field drives a per-coefficient zero-bias
+    /// (dead-zone), quantizing busy/masked blocks harder and preserving smooth
+    /// ones. Replaces trellis for the 8-bit YCbCr DCT components when set; decode
+    /// is unaffected (standard single quant table). Default `false` while it's
+    /// RD-validated against the trellis default and jpegli.
+    public var jpegliAdaptiveQuant: Bool
+
     /// A sensible default configuration: quality 90, YCbCr, 4:2:0 subsampling,
     /// baseline (non-progressive) with optimized Huffman, trellis quantization,
     /// and jpegli perceptual quant tables. Progressive is opt-in — it's a
@@ -172,7 +180,8 @@ public struct JLIEncoderConfiguration: Sendable {
         optimiseHuffman: true,
         adaptiveQuantization: true,
         adaptiveQuantField: false,
-        perceptualQuantTables: true
+        perceptualQuantTables: true,
+        jpegliAdaptiveQuant: false
     )
 
     /// Creates an encoder configuration.
@@ -204,7 +213,8 @@ public struct JLIEncoderConfiguration: Sendable {
         optimiseHuffman: Bool = true,
         adaptiveQuantization: Bool = true,
         adaptiveQuantField: Bool = false,
-        perceptualQuantTables: Bool = true
+        perceptualQuantTables: Bool = true,
+        jpegliAdaptiveQuant: Bool = false
     ) {
         self.quality = quality
         self.distance = distance
@@ -221,6 +231,7 @@ public struct JLIEncoderConfiguration: Sendable {
         self.adaptiveQuantization = adaptiveQuantization
         self.adaptiveQuantField = adaptiveQuantField
         self.perceptualQuantTables = perceptualQuantTables
+        self.jpegliAdaptiveQuant = jpegliAdaptiveQuant
     }
 }
 

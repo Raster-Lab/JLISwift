@@ -18,18 +18,18 @@ func runRDMatrix(root: String) {
         images.append((c.id, c.rgb, c.width, c.height))
     }
 
-    func make(_ perceptual: Bool, _ aqf: Bool, _ sub: JLIChromaSubsampling, _ q: Int) -> JLIEncoderConfiguration {
+    func make(_ perceptual: Bool, _ jpegliAQ: Bool, _ sub: JLIChromaSubsampling, _ q: Int) -> JLIEncoderConfiguration {
         var c = JLIEncoderConfiguration.default
         c.quality = Double(q); c.chromaSubsampling = sub
-        c.perceptualQuantTables = perceptual; c.adaptiveQuantField = aqf
+        c.perceptualQuantTables = perceptual; c.jpegliAdaptiveQuant = jpegliAQ
         return c
     }
     let configs: [(String, (Int) -> JLIEncoderConfiguration)] = [
         ("annexK-420   ", { make(false, false, .yuv420, $0) }),
         ("perceptual-420", { make(true,  false, .yuv420, $0) }),
-        ("annexK-444   ", { make(false, false, .yuv444, $0) }),
+        ("jpegliAQ-420 ", { make(true,  true,  .yuv420, $0) }),
         ("perceptual-444", { make(true,  false, .yuv444, $0) }),
-        ("percept+aqf-444", { make(true,  true,  .yuv444, $0) }),
+        ("jpegliAQ-444 ", { make(true,  true,  .yuv444, $0) }),
     ]
     let refs: [(String, CLICodec)] = [("jpegli       ", ReferenceCodecs.jpegli()),
                                       ("mozjpeg      ", ReferenceCodecs.mozjpeg())]

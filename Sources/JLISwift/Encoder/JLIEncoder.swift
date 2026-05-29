@@ -261,6 +261,12 @@ public struct JLIEncoder: Sendable {
         let lumInv = lumQT.map { 1.0 / Float($0) }
         let chromInv = chromQT.map { 1.0 / Float($0) }
 
+        // jpegli adaptive-quant (field + zero-bias) path — opt-in, replaces
+        // trellis for the 8-bit YCbCr DCT components (WS-A / 0.3.0).
+        let jpegliAQ = configuration.jpegliAdaptiveQuant && precision == 8
+        let aqDistance = configuration.distance ?? Quantization.distanceForQuality(configuration.quality)
+        let yQuant01 = lumQT.count > 1 ? lumQT[1] : 16
+
         // Rate-distortion (EOB) optimization, gated by `adaptiveQuantization`.
         // 8-bit only: 12-bit is the medical-precision path where we deliberately
         // keep exact round-to-nearest rather than trade detail for bytes.
@@ -304,8 +310,10 @@ public struct JLIEncoder: Sendable {
         let yQuant = quantizePlane(
             yPlane, planeWidth: width, planeHeight: height,
             blocksH: yBlocksPerRow, blocksV: yBlocksPerCol,
-            invQuant: lumInv, levelShift: levelShift, scratch: &dctScratch, rdo: lumRDO,
-            adaptiveField: configuration.adaptiveQuantField
+            invQuant: lumInv, levelShift: levelShift, scratch: &dctScratch,
+            rdo: jpegliAQ ? nil : lumRDO,
+            adaptiveField: configuration.adaptiveQuantField,
+            jpegli: jpegliAQ ? JpegliAQ(component: 0, distance: aqDistance, yQuant01: yQuant01) : nil
         )
         let cbQuant: [Int32]
         let crQuant: [Int32]
@@ -315,12 +323,16 @@ public struct JLIEncoder: Sendable {
             cbQuant = quantizePlane(
                 cbPlane, planeWidth: cbWidth, planeHeight: cbHeight,
                 blocksH: mcuCountH, blocksV: mcuCountV,
-                invQuant: chromInv, levelShift: levelShift, scratch: &dctScratch, rdo: chrRDO
+                invQuant: chromInv, levelShift: levelShift, scratch: &dctScratch,
+                rdo: jpegliAQ ? nil : chrRDO,
+                jpegli: jpegliAQ ? JpegliAQ(component: 1, distance: aqDistance, yQuant01: yQuant01) : nil
             )
             crQuant = quantizePlane(
                 crPlane, planeWidth: crWidth, planeHeight: crHeight,
                 blocksH: mcuCountH, blocksV: mcuCountV,
-                invQuant: chromInv, levelShift: levelShift, scratch: &dctScratch, rdo: chrRDO
+                invQuant: chromInv, levelShift: levelShift, scratch: &dctScratch,
+                rdo: jpegliAQ ? nil : chrRDO,
+                jpegli: jpegliAQ ? JpegliAQ(component: 2, distance: aqDistance, yQuant01: yQuant01) : nil
             )
         }
 
@@ -824,7 +836,8 @@ public struct JLIEncoder: Sendable {
         _ plane: [Float], planeWidth: Int, planeHeight: Int,
         blocksH: Int, blocksV: Int,
         invQuant: [Float], levelShift: Float, scratch: inout [Float],
-        rdo: RDOContext? = nil, adaptiveField: Bool = false
+        rdo: RDOContext? = nil, adaptiveField: Bool = false,
+        jpegli: JpegliAQ? = nil
     ) -> [Int32] {
         let n = blocksH * blocksV
         // These three n·64 buffers are each fully overwritten downstream
@@ -842,6 +855,16 @@ public struct JLIEncoder: Sendable {
         AccelerateDSP.forwardDCTBatch(
             blockBuf, into: &dctBuf, scratch: &scratch, blockCount: n
         )
+
+        // jpegli adaptive path: per-block masking field + per-coefficient
+        // zero-bias (dead-zone) instead of trellis. Opt-in (WS-A / 0.3.0).
+        if let j = jpegli {
+            return quantizeZeroBias(
+                dctBuf: dctBuf, blockCount: n, invQuant: invQuant,
+                plane: plane, planeWidth: planeWidth, planeHeight: planeHeight,
+                blocksH: blocksH, blocksV: blocksV, jpegli: j
+            )
+        }
 
         var quant = [Int32](unsafeUninitializedCapacity: n * 64) { _, c in c = n * 64 }
         AccelerateDSP.quantizeBatch(
@@ -862,6 +885,50 @@ public struct JLIEncoder: Sendable {
     /// `Σ AC²` relative to the plane mean, shaped sublinearly and clamped. Busy
     /// blocks (high energy) → multiplier > 1 (quantize harder, masked); flat
     /// blocks → < 1 (preserve smooth detail, where banding shows).
+    /// Parameters for the jpegli adaptive (field + zero-bias) quant path.
+    struct JpegliAQ { let component: Int; let distance: Double; let yQuant01: Int }
+
+    /// Quantizes via jpegli's masking field + per-coefficient zero-bias
+    /// (dead-zone), no trellis: `qval = dct·invQuant`; an AC coefficient survives
+    /// iff `|qval| ≥ offset[k] + aq_strength·mul[k]`, else snaps to 0. DC always
+    /// kept (its threshold is 0).
+    private func quantizeZeroBias(
+        dctBuf: [Float], blockCount n: Int, invQuant: [Float],
+        plane: [Float], planeWidth: Int, planeHeight: Int,
+        blocksH: Int, blocksV: Int, jpegli j: JpegliAQ
+    ) -> [Int32] {
+        let field = JLIAdaptiveQuant.computeField(
+            plane: plane, planeWidth: planeWidth, planeHeight: planeHeight,
+            blocksH: blocksH, blocksV: blocksV, yQuant01: j.yQuant01)
+        let (zbOffset, zbMul) = JLIAdaptiveQuant.zeroBias(distance: j.distance, component: j.component)
+        var quant = [Int32](unsafeUninitializedCapacity: n * 64) { _, c in c = n * 64 }
+        dctBuf.withUnsafeBufferPointer { db in
+            invQuant.withUnsafeBufferPointer { iq in
+                zbOffset.withUnsafeBufferPointer { zo in
+                    zbMul.withUnsafeBufferPointer { zm in
+                        field.withUnsafeBufferPointer { fb in
+                            quant.withUnsafeMutableBufferPointer { qb in
+                                let d = db.baseAddress!, q = qb.baseAddress!
+                                let inv = iq.baseAddress!, off = zo.baseAddress!, mul = zm.baseAddress!
+                                for b in 0..<n {
+                                    let base = b * 64
+                                    let aq = fb[b]
+                                    for k in 0..<64 {
+                                        let qval = d[base + k] * inv[k]
+                                        let thr = off[k] + mul[k] * aq
+                                        q[base + k] = abs(qval) >= thr
+                                            ? Int32(qval.rounded(.toNearestOrEven)) : 0
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return quant
+    }
+
     private func adaptiveLambdaField(dctBuf: [Float], blockCount n: Int) -> [Float] {
         var energy = [Float](repeating: 0, count: n)
         var mean = 0.0

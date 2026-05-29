@@ -29,7 +29,7 @@ struct AdaptiveQuantFieldTests {
         }
 
         let field = JLIAdaptiveQuant.computeField(
-            plane: plane, width: w, height: h, blocksH: bw, blocksV: bh, yQuant01: 16
+            plane: plane, planeWidth: w, planeHeight: h, blocksH: bw, blocksV: bh, yQuant01: 16
         )
         #expect(field.count == bw * bh)
         #expect(field.allSatisfy { $0.isFinite && $0 >= 0 }, "field must be finite and non-negative")
@@ -49,13 +49,38 @@ struct AdaptiveQuantFieldTests {
                 "busy blocks should quantize harder: busy \(busyAvg) vs smooth \(smoothAvg)")
     }
 
+    @Test("jpegli adaptive-quant path encodes → decodes with sane quality")
+    func jpegliPathRoundTrip() throws {
+        let w = 64, h = 64
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 3
+                let v = UInt8((x + y) * 255 / (w + h - 2))
+                rgb[i] = v; rgb[i + 1] = UInt8(255 - Int(v)); rgb[i + 2] = v / 2
+            }
+        }
+        let img = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
+        var cfg = JLIEncoderConfiguration.default
+        cfg.quality = 90; cfg.chromaSubsampling = .yuv444
+        cfg.jpegliAdaptiveQuant = true
+        let jpeg = try JLIEncoder().encode(img, configuration: cfg)
+        #expect(jpeg.first == 0xFF && jpeg.dropFirst().first == 0xD8)   // valid SOI
+        let dec = try JLIDecoder().decode(from: jpeg)
+        #expect(dec.width == w && dec.height == h && dec.colorModel == .rgb)
+        var sse = 0.0
+        for i in 0..<min(rgb.count, dec.data.count) { let d = Double(rgb[i]) - Double(dec.data[i]); sse += d * d }
+        let psnr = 10 * log10(255 * 255 / (sse / Double(rgb.count)))
+        #expect(psnr > 30, "jpegli-AQ q90 round-trip PSNR \(psnr) too low")
+    }
+
     @Test("Uniform plane yields a roughly uniform, finite field")
     func uniformField() {
         let bw = 6, bh = 6
         let w = bw * 8, h = bh * 8
         let plane = [Float](repeating: 128, count: w * h)
         let field = JLIAdaptiveQuant.computeField(
-            plane: plane, width: w, height: h, blocksH: bw, blocksV: bh, yQuant01: 16
+            plane: plane, planeWidth: w, planeHeight: h, blocksH: bw, blocksV: bh, yQuant01: 16
         )
         #expect(field.allSatisfy { $0.isFinite && $0 >= 0 })
         let mn = field.min() ?? 0, mx = field.max() ?? 0

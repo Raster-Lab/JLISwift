@@ -11,10 +11,10 @@ _Last updated: 2026-05-29 — **0.2.0 RELEASED** (tagged `v0.2.0`, GitHub Releas
 **Goals:** match jpegli on butteraugli-at-matched-bytes across the DICOM corpus (today behind ~0.25 ba — CT q90 ours 1.20 vs jpegli 0.95) with **no medical regression**; ship a **signed/notarized JLILab.app** (+ DMG). Discipline unchanged: RD-validated quality, byte-identical (or explicitly re-validated) perf, CI-green.
 
 ### WS-A — Full jpegli adaptive-quant field (P1, headline quality)
-The current `adaptiveQuantField` is near-inert under perceptual tables; the real lever is jpegli's psychovisual field + dead-zone.
-- [ ] Port libjxl `adaptive_quantization.cc`: pre-blur, `ComputeMask`, gamma + HF modulation, erosion → per-8×8-block quant-field (FastLog2/Pow2 helpers).
-- [ ] Apply as **per-block zero-bias / dead-zone** in quantization (decodable with a single quant table — how jpegli stays standard-JPEG).
-- [ ] RD-validate (`--rd-matrix`, butteraugli + SSIMULACRA2) vs jpegli/mozjpeg across the corpus → decide default-on; replace the simplified λ-field. *Risk: large/intricate port; residual gap may be partly XYB → WS-E.*
+- [x] **Ported** libjxl `adaptive_quantization.cc` (faithful scalar): pre-erosion → fuzzy erosion → mask/HF/gamma per-block modulations → `aq_strength`. Operates on the block-padded luma grid (edge-replicated). Sanity-tested.
+- [x] **Per-coefficient zero-bias (dead-zone)** + opt-in quant path `jpegliAdaptiveQuant` (replaces trellis for 8-bit YCbCr when set; decode unaffected). Zero-bias tables ported from `quant.cc`.
+- [~] **RD-measured (`--rd-matrix`, butteraugli) — first cut does NOT close the gap.** vs `perceptual-420` (the 0.2.0 default) it makes files *smaller* but butteraugli is mixed (CT q90 1.16 vs 1.20 slightly better; MR 1.59 vs 1.25 worse; XA ~wash) and still well behind jpegli (CT 0.95). The "smaller-but-worse" pattern points to a **quantized-value scale mismatch** (jpegli's DCT normalization differs → the 0.59-ish thresholds are mis-scaled) plus a **per-component field on chroma** (jpegli uses the luma-derived field for all channels). **Default stays `perceptual-420`; the path ships opt-in/experimental.**
+- [ ] **Calibration to close the gap (next):** match the dead-zone threshold scale to JLISwift's `dct·invQuant` units; feed the luma field to chroma blocks (mapped for subsampling); revisit luma input scaling; then re-RD vs jpegli. Residual gap may still be partly XYB → WS-E.
 
 ### WS-B — JLILab distribution (P1)
 - [ ] Sign + notarize (hardened runtime + entitlements) → DMG. *Needs the Apple Developer signing identity.*
