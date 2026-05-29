@@ -86,58 +86,78 @@ enum ColorConversion {
     }
 
     // MARK: - RGB ↔ XYB (JPEG XL Perceptual Color Space)
+    //
+    // Faithful port of libjxl v0.11.2 (`lib/jxl/enc_xyb.cc` +
+    // `lib/jxl/cms/opsin_params.h`, BSD/Apache-compatible). The pipeline is:
+    //   sRGB byte → [0,1] → linear (sRGB EOTF) → opsin absorbance (matrix + bias)
+    //   → cube-root − cbrt(bias) → XYB rotation (X=½(L−M), Y=½(L+M), B=S)
+    //   → ScaleXYB (per-channel scale/offset, B carries B−Y) → ×255 sample.
+    // For the standard SDR sRGB case jpegli uses intensity_target = 255, i.e.
+    // opsin `mul = 1`, so the absorbance matrix is used unscaled.
 
-    /// Converts an RGB pixel (linear, 0–255) to XYB.
-    ///
-    /// The XYB transform follows the JPEG XL specification:
-    /// 1. Linear RGB → LMS (cone response)
-    /// 2. Cube root transfer function
-    /// 3. LMS → XYB rotation
-    static func rgbToXYB(r: Float, g: Float, b: Float) -> (x: Float, y: Float, bOut: Float) {
-        // Linear RGB to LMS
-        let rLin = r / 255.0
-        let gLin = g / 255.0
-        let bLin = b / 255.0
+    /// Opsin absorbance matrix (linear RGB → LMS-ish mixed signal), rows sum to 1.
+    private static let opsinM: [[Float]] = [
+        [0.30, 0.622, 0.078],
+        [0.23, 0.692, 0.078],
+        [0.24342268924547819, 0.20476744424496821, 0.5518098665095536],
+    ]
+    /// Inverse of `opsinM` (libjxl `kDefaultInverseOpsinAbsorbanceMatrix`).
+    private static let opsinInvM: [[Float]] = [
+        [11.031566901960783, -9.866943921568629, -0.16462299647058826],
+        [-3.254147380392157, 4.418770392156863, -0.16462299647058826],
+        [-3.6588512862745097, 2.7129230470588235, 1.9459282392156863],
+    ]
+    private static let opsinBias: Float = 0.0037930732552754493
+    private static let opsinBiasCbrt: Float = cbrt(0.0037930732552754493)
+    /// `kScaledXYBOffset` / `kScaledXYBScale` — map XYB to the [0,1] sample range.
+    private static let xybOffset: [Float] = [0.015386134, 0.0, 0.27770459]
+    private static let xybScale: [Float] = [22.995788804, 1.183000077, 1.502141333]
 
-        let l = 0.3 * rLin + 0.622 * gLin + 0.078 * bLin
-        let m = 0.23 * rLin + 0.692 * gLin + 0.078 * bLin
-        let s = 0.24342268 * rLin + 0.20476744 * gLin + 0.55180988 * bLin
-
-        // Perceptual transfer function (cube root)
-        let lPrime = cbrt(max(0, l))
-        let mPrime = cbrt(max(0, m))
-        let sPrime = cbrt(max(0, s))
-
-        // LMS to XYB
-        let x = (lPrime - mPrime) * 0.5
-        let yOut = (lPrime + mPrime) * 0.5
-        let bChannel = sPrime
-
-        return (x, yOut, bChannel)
+    /// sRGB encoded [0,1] → linear [0,1] (IEC 61966-2-1 EOTF).
+    @inline(__always) static func srgbToLinear(_ c: Float) -> Float {
+        c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+    }
+    /// linear [0,1] → sRGB encoded [0,1] (OETF).
+    @inline(__always) static func linearToSRGB(_ c: Float) -> Float {
+        c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055
     }
 
-    /// Converts an XYB pixel back to RGB (0–255).
-    static func xybToRGB(x: Float, y: Float, bChannel: Float) -> (r: Float, g: Float, b: Float) {
-        // XYB to LMS
-        let lPrime = y + x
-        let mPrime = y - x
-        let sPrime = bChannel
+    /// Converts an sRGB pixel (0–255) to its three scaled-XYB samples (0–255,
+    /// unclamped). These are the values the encoder level-shifts and DCT-codes.
+    static func rgbToXYBSample(r: Float, g: Float, b: Float) -> (x: Float, y: Float, bOut: Float) {
+        let rl = srgbToLinear(r / 255.0), gl = srgbToLinear(g / 255.0), bl = srgbToLinear(b / 255.0)
+        let m0 = max(0, opsinM[0][0] * rl + opsinM[0][1] * gl + opsinM[0][2] * bl + opsinBias)
+        let m1 = max(0, opsinM[1][0] * rl + opsinM[1][1] * gl + opsinM[1][2] * bl + opsinBias)
+        let m2 = max(0, opsinM[2][0] * rl + opsinM[2][1] * gl + opsinM[2][2] * bl + opsinBias)
+        let lc = cbrt(m0) - opsinBiasCbrt
+        let mc = cbrt(m1) - opsinBiasCbrt
+        let sc = cbrt(m2) - opsinBiasCbrt
+        let capX = 0.5 * (lc - mc)
+        let capY = 0.5 * (lc + mc)
+        let capB = sc
+        let sX = (capX + xybOffset[0]) * xybScale[0]
+        let sY = (capY + xybOffset[1]) * xybScale[1]
+        let sB = (capB - capY + xybOffset[2]) * xybScale[2]   // B sample carries B−Y
+        return (sX * 255.0, sY * 255.0, sB * 255.0)
+    }
 
-        // Inverse transfer (cube)
-        let l = lPrime * lPrime * lPrime
-        let m = mPrime * mPrime * mPrime
-        let s = sPrime * sPrime * sPrime
-
-        // LMS to linear RGB (inverse of the forward matrix)
-        // Using the pseudo-inverse for the 3×3 matrix
-        let rLin =  5.3386859 * l - 4.2586608 * m - 0.0800251 * s
-        let gLin = -1.1252742 * l + 2.2135497 * m - 0.0882755 * s
-        let bLin =  0.0452064 * l - 0.2640891 * m + 1.2188827 * s
-
+    /// Inverts ``rgbToXYBSample`` — scaled-XYB samples (0–255) back to sRGB (0–255).
+    static func xybSampleToRGB(x sX: Float, y sY: Float, bChannel sB: Float) -> (r: Float, g: Float, b: Float) {
+        let capX = (sX / 255.0) / xybScale[0] - xybOffset[0]
+        let capY = (sY / 255.0) / xybScale[1] - xybOffset[1]
+        let capB = (sB / 255.0) / xybScale[2] - xybOffset[2] + capY
+        let lc = capY + capX, mc = capY - capX, sc = capB
+        let e0 = lc + opsinBiasCbrt, e1 = mc + opsinBiasCbrt, e2 = sc + opsinBiasCbrt
+        let m0 = e0 * e0 * e0 - opsinBias       // undo cube-root, then subtract bias
+        let m1 = e1 * e1 * e1 - opsinBias
+        let m2 = e2 * e2 * e2 - opsinBias
+        let rl = opsinInvM[0][0] * m0 + opsinInvM[0][1] * m1 + opsinInvM[0][2] * m2
+        let gl = opsinInvM[1][0] * m0 + opsinInvM[1][1] * m1 + opsinInvM[1][2] * m2
+        let bl = opsinInvM[2][0] * m0 + opsinInvM[2][1] * m1 + opsinInvM[2][2] * m2
         return (
-            max(0, min(255, rLin * 255.0)),
-            max(0, min(255, gLin * 255.0)),
-            max(0, min(255, bLin * 255.0))
+            max(0, min(255, linearToSRGB(rl) * 255.0)),
+            max(0, min(255, linearToSRGB(gl) * 255.0)),
+            max(0, min(255, linearToSRGB(bl) * 255.0))
         )
     }
 }

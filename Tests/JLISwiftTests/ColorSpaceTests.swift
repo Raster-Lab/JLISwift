@@ -88,14 +88,40 @@ struct ColorSpaceTests {
 
     // MARK: - XYB
 
-    @Test("RGB → XYB → RGB round-trips within tolerance")
+    @Test("sRGB → scaled-XYB → sRGB round-trips near-exactly (exact opsin inverse)")
     func xybRoundTrip() {
-        let (x, y, b) = ColorConversion.rgbToXYB(r: 128, g: 100, b: 200)
-        let (rr, gg, bb) = ColorConversion.xybToRGB(x: x, y: y, bChannel: b)
-        // XYB uses approximate inverse matrix; tolerance reflects this
-        #expect(abs(rr - 128) < 30.0)
-        #expect(abs(gg - 100) < 30.0)
-        #expect(abs(bb - 200) < 30.0)
+        // The transform is analytically invertible (real opsin matrix + its exact
+        // inverse, sRGB EOTF/OETF, cube-root/cube). Feeding the float samples
+        // straight back must recover the input to float precision — no 8-bit
+        // quantization is involved here (that's the encode path's concern).
+        var maxErr: Float = 0
+        for r in stride(from: 0, through: 255, by: 17) {
+            for g in stride(from: 0, through: 255, by: 17) {
+                for b in stride(from: 0, through: 255, by: 51) {
+                    let (sx, sy, sb) = ColorConversion.rgbToXYBSample(
+                        r: Float(r), g: Float(g), b: Float(b))
+                    let (rr, gg, bb) = ColorConversion.xybSampleToRGB(x: sx, y: sy, bChannel: sb)
+                    maxErr = max(maxErr, abs(rr - Float(r)))
+                    maxErr = max(maxErr, abs(gg - Float(g)))
+                    maxErr = max(maxErr, abs(bb - Float(b)))
+                }
+            }
+        }
+        #expect(maxErr < 0.5, "XYB round-trip not invertible (max err \(maxErr))")
+    }
+
+    @Test("XYB samples have the expected structure (neutral gray ⇒ X≈mid, B−Y≈mid)")
+    func xybNeutralStructure() {
+        // For a neutral gray, L==M==S, so X=0 (before offset) and B−Y=0; the
+        // offsets place X and the B sample near a constant, while Y tracks luma.
+        let darkY = ColorConversion.rgbToXYBSample(r: 32, g: 32, b: 32).y
+        let midY = ColorConversion.rgbToXYBSample(r: 128, g: 128, b: 128).y
+        let brightY = ColorConversion.rgbToXYBSample(r: 224, g: 224, b: 224).y
+        #expect(darkY < midY && midY < brightY, "Y must increase with luma")
+        // Neutral grays share the same X and B samples (chroma-free).
+        let x1 = ColorConversion.rgbToXYBSample(r: 64, g: 64, b: 64).x
+        let x2 = ColorConversion.rgbToXYBSample(r: 192, g: 192, b: 192).x
+        #expect(abs(x1 - x2) < 0.5, "neutral grays must share the X sample")
     }
 
     // MARK: - Chroma Sampling
