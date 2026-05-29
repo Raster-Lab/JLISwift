@@ -119,6 +119,19 @@ public struct JLIEncoder: Sendable {
                                       precision: llPrecision, isGrayscale: isGrayscale)
         }
 
+        // XYB perceptual color (SOF0): RGB → XYB samples → perceptual quant, 4:4:4,
+        // with an embedded ICC so standard ICC-aware decoders display correct
+        // color. 8-bit color only (the XYB sample scaling is calibrated for 8-bit).
+        if configuration.colorSpace == .xyb && !isGrayscale && precision == 8 {
+            guard image.colorModel == .rgb || image.colorModel == .rgba else {
+                throw JLIError.unsupportedColorSpaceConversion(
+                    from: "\(image.colorModel)", to: "XYB JPEG (use RGB/RGBA input)")
+            }
+            let distance = configuration.distance
+                ?? Quantization.distanceForQuality(configuration.quality)
+            return try encodeXYB(image, configuration: configuration, distance: distance)
+        }
+
         // 12-bit color is supported for RGB/RGBA input. Pre-converted 12-bit
         // YCbCr input isn't — the direct-extract path below assumes 8-bit samples.
         if precision > 8 && !isGrayscale && image.colorModel == .yCbCr {
@@ -626,6 +639,110 @@ public struct JLIEncoder: Sendable {
                         bw.writeBits(HuffmanEncoder.additionalBits(for: d, category: cat), count: cat)
                     }
                 }
+            }
+        }
+        bw.flush()
+        mw.writeEntropyData(bw.data)
+        mw.writeEOI()
+        return mw.data
+    }
+
+    /// Encodes 8-bit RGB(A) as an XYB-color JPEG: each pixel → scaled-XYB samples
+    /// (``ColorConversion/rgbToXYBSample(r:g:b:)``), three full-resolution (4:4:4)
+    /// components quantized with the jpegli XYB tables, plus an embedded ICC
+    /// profile (``XYBICCProfile``) and Adobe APP14 transform=0 so ICC-aware
+    /// decoders reconstruct correct color. Component order is X, Y, B to match the
+    /// profile's input channels. Baseline allows only two Huffman tables, so the
+    /// luma-like Y channel uses table set 0 and X/B share set 1.
+    private func encodeXYB(
+        _ image: JLIImage, configuration: JLIEncoderConfiguration, distance: Double
+    ) throws -> [UInt8] {
+        let w = image.width, h = image.height
+        let srcCC = image.colorModel.componentCount
+        let count = w * h
+        var xP = [Float](repeating: 0, count: count)
+        var yP = [Float](repeating: 0, count: count)
+        var bP = [Float](repeating: 0, count: count)
+        for i in 0..<count {
+            let s = i * srcCC
+            let xyb = ColorConversion.rgbToXYBSample(
+                r: Float(image.data[s]), g: Float(image.data[s + 1]), b: Float(image.data[s + 2]))
+            xP[i] = xyb.x; yP[i] = xyb.y; bP[i] = xyb.bOut
+        }
+
+        let qt = [Quantization.perceptualQuantTableXYB(distance: distance, channel: 0),
+                  Quantization.perceptualQuantTableXYB(distance: distance, channel: 1),
+                  Quantization.perceptualQuantTableXYB(distance: distance, channel: 2)]
+        let blocksH = (w + 7) / 8, blocksV = (h + 7) / 8
+        let blockCount = blocksH * blocksV
+        var scratch = [Float](repeating: 0, count: blockCount * 64)
+        let levelShift: Float = 128
+        // DCT + quantize each XYB plane (exact round-to-nearest; no trellis — the
+        // perceptual allocation already lives in the XYB tables).
+        let qx = quantizePlane(xP, planeWidth: w, planeHeight: h, blocksH: blocksH, blocksV: blocksV,
+                               invQuant: qt[0].map { 1.0 / Float($0) }, levelShift: levelShift, scratch: &scratch)
+        let qy = quantizePlane(yP, planeWidth: w, planeHeight: h, blocksH: blocksH, blocksV: blocksV,
+                               invQuant: qt[1].map { 1.0 / Float($0) }, levelShift: levelShift, scratch: &scratch)
+        let qb = quantizePlane(bP, planeWidth: w, planeHeight: h, blocksH: blocksH, blocksV: blocksV,
+                               invQuant: qt[2].map { 1.0 / Float($0) }, levelShift: levelShift, scratch: &scratch)
+        let planes = [qx, qy, qb]
+
+        // Huffman: set 0 serves Y (the luma-like channel), set 1 serves X and B.
+        // `huffSet[c]` is the table set for component c (order X, Y, B).
+        let huffSet = [1, 0, 1]
+        let dcTable: [HuffmanTable], acTable: [HuffmanTable]   // indexed by set (0,1)
+        if configuration.optimiseHuffman {
+            var dcF = [[Int]](repeating: [Int](repeating: 0, count: 256), count: 2)
+            var prev = [Int32](repeating: 0, count: 3)
+            for i in 0..<blockCount {
+                for c in 0..<3 {
+                    let dc = planes[c][i * 64]
+                    HuffmanEncoder.countDC(dc - prev[c], freq: &dcF[huffSet[c]])
+                    prev[c] = dc
+                }
+            }
+            var acF = [[Int]](repeating: [Int](repeating: 0, count: 256), count: 2)
+            for c in 0..<3 {
+                let f = JLIEncoder.parallelACFreqs(planes[c], blockCount: blockCount)
+                for k in 0..<256 { acF[huffSet[c]][k] += f[k] }
+            }
+            dcTable = [HuffmanTableBuilder.build(frequencies: dcF[0], fallback: StandardHuffmanTables.dcLuminance),
+                       HuffmanTableBuilder.build(frequencies: dcF[1], fallback: StandardHuffmanTables.dcChrominance)]
+            acTable = [HuffmanTableBuilder.build(frequencies: acF[0], fallback: StandardHuffmanTables.acLuminance),
+                       HuffmanTableBuilder.build(frequencies: acF[1], fallback: StandardHuffmanTables.acChrominance)]
+        } else {
+            dcTable = [StandardHuffmanTables.dcLuminance, StandardHuffmanTables.dcChrominance]
+            acTable = [StandardHuffmanTables.acLuminance, StandardHuffmanTables.acChrominance]
+        }
+
+        // Emit. Markers: SOI, APP14 transform=0 (direct components, not YCbCr),
+        // APP2 XYB ICC, 3 DQT, SOF0, DHT (2 sets), SOS (X,Y,B), entropy, EOI.
+        var mw = MarkerWriter()
+        mw.writeSOI()
+        mw.writeAPP14(transform: 0)
+        mw.writeAPP2ICC(XYBICCProfile.data)
+        if let exif = image.exif { mw.writeAPP1Exif(exif) }
+        mw.writeDQT(tables: [(0, zigzagQuantTable(qt[0])), (1, zigzagQuantTable(qt[1])), (2, zigzagQuantTable(qt[2]))])
+        mw.writeSOF(progressive: false, precision: 8, width: w, height: h,
+                    components: [(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 2)])
+        mw.writeDHT(tables: [
+            (0, 0, dcTable[0].bits, dcTable[0].values), (1, 0, acTable[0].bits, acTable[0].values),
+            (0, 1, dcTable[1].bits, dcTable[1].values), (1, 1, acTable[1].bits, acTable[1].values),
+        ])
+        mw.writeSOS(components: [
+            (selector: 1, dcTableId: huffSet[0], acTableId: huffSet[0]),
+            (selector: 2, dcTableId: huffSet[1], acTableId: huffSet[1]),
+            (selector: 3, dcTableId: huffSet[2], acTableId: huffSet[2]),
+        ])
+
+        var bw = BitWriter(estimatedMaxSize: w * h * 3 + 4096)
+        var prev = [Int32](repeating: 0, count: 3)
+        var zz = [Int32](repeating: 0, count: 64)
+        for i in 0..<blockCount {
+            for c in 0..<3 {
+                prev[c] = emitBlock(quantized: planes[c], blockIndex: i, prevDC: prev[c],
+                                    dcTable: dcTable[huffSet[c]], acTable: acTable[huffSet[c]],
+                                    zigzagBuf: &zz, writer: &bw)
             }
         }
         bw.flush()

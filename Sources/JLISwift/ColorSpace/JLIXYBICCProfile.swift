@@ -122,7 +122,7 @@ enum XYBICCProfile {
         patchU32(0, at: 0, in: &header)                       // size (filled later)
         for (i, c) in "jxl ".utf8.enumerated() { header[4 + i] = c }
         patchU32(0x04400000, at: 8, in: &header)
-        for (i, c) in "scnr".utf8.enumerated() { header[12 + i] = c }   // XYB → scanner
+        for (i, c) in "scnr".utf8.enumerated() { header[12 + i] = c }   // XYB → input/scanner class (libjxl)
         for (i, c) in "RGB ".utf8.enumerated() { header[16 + i] = c }
         for (i, c) in "XYZ ".utf8.enumerated() { header[20 + i] = c }
         // date/time placeholder (2019-12-01) — matches libjxl

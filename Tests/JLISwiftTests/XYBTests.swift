@@ -47,4 +47,38 @@ struct XYBTests {
         }
         #expect(maxErr < 2.0, "XYB ICC transform disagrees with our inverse (max err \(maxErr))")
     }
+
+    @Test("XYB encode → our decode round-trips, and embeds the XYB ICC + APP14")
+    func encodeDecodeRoundTrip() throws {
+        let w = 64, h = 48
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 3      // smooth gradients, mid-range
+                rgb[i] = UInt8(40 + x * 150 / w)
+                rgb[i + 1] = UInt8(50 + y * 150 / h)
+                rgb[i + 2] = UInt8(60 + (x + y) * 120 / (w + h))
+            }
+        }
+        let img = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
+        var cfg = JLIEncoderConfiguration.default
+        cfg.quality = 95; cfg.colorSpace = .xyb
+        let jpeg = try JLIEncoder().encode(img, configuration: cfg)
+
+        // It must carry the XYB ICC (APP2) and an Adobe APP14 (transform=0).
+        let dec = try JLIDecoder().decode(from: jpeg)
+        #expect(dec.iccProfile == XYBICCProfile.data, "XYB JPEG must embed the XYB ICC")
+        #expect(dec.width == w && dec.height == h && dec.colorModel == .rgb)
+
+        // Our decoder inverts XYB; round-trip error is bounded (lossy DCT + the
+        // nonlinear XYB inverse, so judge by mean, with a loose max).
+        var sumErr = 0.0, maxErr = 0
+        for i in 0..<rgb.count {
+            let e = abs(Int(dec.data[i]) - Int(rgb[i]))
+            sumErr += Double(e); maxErr = max(maxErr, e)
+        }
+        let meanErr = sumErr / Double(rgb.count)
+        #expect(meanErr < 4.0, "XYB round-trip mean error \(meanErr) too high")
+        #expect(maxErr < 40, "XYB round-trip max error \(maxErr) too high")
+    }
 }

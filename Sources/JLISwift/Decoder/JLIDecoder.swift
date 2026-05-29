@@ -404,6 +404,27 @@ public struct JLIDecoder: Sendable {
                 outputData = plane.data.map { UInt8(clamping: Int($0.rounded())) }
             }
             outputColorModel = configuration.outputColorModel ?? .grayscale
+        } else if numComponents == 3 && !isExtendedPrecision
+                    && parsed.iccProfile == XYBICCProfile.data {
+            // XYB color: the three full-resolution planes are scaled-XYB samples
+            // (4:4:4). Invert the XYB transform per pixel to recover sRGB. (The
+            // embedded ICC also lets non-XYB-aware decoders display it.)
+            func trim(_ p: (data: [Float], width: Int, height: Int)) -> [Float] {
+                if p.width == outW && p.height == outH { return p.data }
+                var t = [Float](repeating: 0, count: outW * outH)
+                for y in 0..<outH { for x in 0..<outW { t[y * outW + x] = p.data[y * p.width + x] } }
+                return t
+            }
+            let xs = trim(componentPlanes[0]), ys = trim(componentPlanes[1]), bs = trim(componentPlanes[2])
+            var rgb = [UInt8](repeating: 0, count: outW * outH * 3)
+            for i in 0..<(outW * outH) {
+                let (r, g, b) = ColorConversion.xybSampleToRGB(x: xs[i], y: ys[i], bChannel: bs[i])
+                rgb[i * 3] = UInt8(clamping: Int(r.rounded()))
+                rgb[i * 3 + 1] = UInt8(clamping: Int(g.rounded()))
+                rgb[i * 3 + 2] = UInt8(clamping: Int(b.rounded()))
+            }
+            outputData = rgb
+            outputColorModel = configuration.outputColorModel ?? .rgb
         } else {
             // YCbCr → RGB
             let yPlane = componentPlanes[0]

@@ -37,10 +37,21 @@ public enum JLIEncodingColorSpace: Sendable {
     /// Standard YCbCr encoding (default, maximum compatibility).
     case yCbCr
 
-    /// XYB perceptual color space (from JPEG XL).
+    /// XYB perceptual color space (from JPEG XL). **Experimental; 8-bit RGB only.**
     ///
-    /// Produces an ICC-tagged JPEG that standard decoders can display, while
-    /// jpegli-aware decoders can exploit the perceptual quantization for better quality.
+    /// Encodes the image in the XYB perceptual space (full-resolution / 4:4:4) and
+    /// embeds an ICC profile (a faithful port of libjxl's XYB profile) so that
+    /// ICC-aware decoders applying the embedded A2B profile reconstruct correct
+    /// color — verified: the profile transforms XYB→sRGB matching our inverse to
+    /// <0.3/255 (`CGColorSpace`). ``JLIDecoder`` detects the profile and inverts
+    /// XYB directly.
+    ///
+    /// Caveats worth knowing: Apple's *image-render* color pipeline (Preview,
+    /// `CGContext` drawing, `sips`) does **not** apply CLUT-based A2B profiles, so
+    /// it misrenders XYB JPEGs even though the profile is correct — on Apple,
+    /// decode with this library. And in current tuning the size/quality is roughly
+    /// at parity with tuned 4:4:4 YCbCr rather than a clear win. Prefer ``yCbCr``
+    /// unless you specifically want XYB.
     case xyb
 }
 
