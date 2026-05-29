@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-29 — **0.1.0 released** (tagged `v0.1.0`, GitHub Release live) + **JLILab** macOS round-trip/cross-codec lab shipped. Focus is now the **0.2.0 optimization release** (plan below). Earlier this milestone: table-driven 8-bit-lookahead Huffman decode (~15–19% faster, bit-identical, A/B-proven); float32 input; adaptive-quant field (opt-in); XYB color (experimental); and 2026-05-28: lossless+near-lossless, scaled decode, multi-threaded trellis+AC-count, jpegli quantizer, ICC/Exif, progressive+restart, fuzzing._
+_Last updated: 2026-05-29 — **tagging 0.2.0**: jpegli perceptual-quant default (data-driven medical quality win — CT q90 ba 1.20 vs 1.82 at equal bytes), **~15–16% faster encode** + **~26–43% faster decode** (byte-identical: uninitialized buffers, COW removal, raw-pointer color/upsample, parallel chroma upsample), the **JLILab** macOS lab (DICOM/standard round-trip + cross-codec + RD curves), and measurement tooling (`--profile-encode/-decode`, `--rd-matrix`, SSIMULACRA2). Prior 0.1.0: table-driven Huffman decode, float32 input, adaptive-quant field, XYB (experimental), lossless+near-lossless, scaled decode, multi-threaded trellis, jpegli quantizer, ICC/Exif, progressive+restart, fuzzing._
 
 ## 0.2.0 — Optimization release plan (active, 2026-05-29)
 
