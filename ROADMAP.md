@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-29 (float32 input; DocC overview rewrite; adaptive-quant field `adaptiveQuantField`, opt-in — ~5–8% butteraugli win on 4:4:4; XYB color implemented end-to-end & validated — transform + CoreGraphics-validated ICC + encode/decode; experimental/opt-in, honest caveats below). Earlier 2026-05-28: lossless+near-lossless, scaled decode, multi-threaded trellis+AC-count, jpegli quantizer, ICC/Exif, progressive+restart, fuzzing._
+_Last updated: 2026-05-29 (table-driven 8-bit-lookahead Huffman decode — ~15–19% faster decode on entropy-heavy content, bit-identical, A/B-proven; float32 input; DocC overview rewrite; adaptive-quant field `adaptiveQuantField`, opt-in — ~5–8% butteraugli win on 4:4:4; XYB color implemented end-to-end & validated — transform + CoreGraphics-validated ICC + encode/decode; experimental/opt-in, honest caveats below). Earlier 2026-05-28: lossless+near-lossless, scaled decode, multi-threaded trellis+AC-count, jpegli quantizer, ICC/Exif, progressive+restart, fuzzing._
 
 ## Completed
 
@@ -26,14 +26,15 @@ _Last updated: 2026-05-29 (float32 input; DocC overview rewrite; adaptive-quant 
 
 ## Remaining
 
-> Honest status (2026-05-28): **every large-effort and marginal/niche item below
-> is now done and CI-green** — lossless+near-lossless, jpegli perceptual
-> quantizer, 1/2 & 1/4 scaled decode, ICC/Exif metadata, progressive+restart,
-> multi-threaded encode. What remains is only the **Deferred** tier (genuinely
-> risky / unvalidatable without a reference — best left for a supervised session),
-> `float32` *input* (needs an API decision on what range it represents), and
-> **Tier 4 release**. The codec is feature-complete; next deliberate step is
-> release prep when you're ready.
+> Honest status (2026-05-29): **every large-effort, marginal/niche, and
+> formerly-deferred item below is now done and CI-green** — lossless+near-lossless,
+> jpegli perceptual quantizer, 1/2 & 1/4 scaled decode, ICC/Exif metadata,
+> progressive+restart, multi-threaded encode, float32 input, XYB color
+> (experimental), and now **table-driven 8-bit-lookahead Huffman decode**. The
+> only non-release item left is the **Metal hot path** — and that stays deferred
+> on purpose: it's marginal over the Accelerate AMX/GPU GEMM and can't be
+> validated bit-exactly. The codec is feature-complete; the next deliberate step
+> is **Tier 4 release** prep when you're ready.
 
 ### Completed large efforts
 - [x] **Lossless JPEG (SOF3)** — true lossless (predictive, no DCT/quant), the medical-archival item
@@ -55,7 +56,7 @@ _Last updated: 2026-05-29 (float32 input; DocC overview rewrite; adaptive-quant 
 
 ### Formerly deferred — now addressed
 - [x] XYB color · **implemented & validated end-to-end (experimental).** (1) Correct XYB transform (faithful libjxl opsin port), round-trips <0.5/255. (2) XYB **ICC generator** (libjxl `MaybeCreateProfileImpl` port: mAB tag w/ 2×2×2 CLUT + cube-root curves + matrix) — `CGColorSpace` accepts it and Apple's CMS transforms XYB→sRGB matching our inverse to **0.28/255**. (3) **Encode** (`colorSpace = .xyb`): RGB→XYB 3 planes, `kBaseQuantMatrixXYB`+`kGlobalScaleXYB` tables, 4:4:4, APP2 ICC + APP14; **decode** detects the ICC and inverts XYB. YCbCr path byte-identical. **Honest findings (the "uncertain payoff" was real):** color is provably correct, but (a) Apple's *image-render* CMS (Preview/CGContext/sips) doesn't apply CLUT-A2B profiles, so it misrenders XYB JPEGs even though the profile is correct — on Apple, decode with this library; (b) ImageIO *does* decode the right samples + attach the ICC (verified), so spec-compliant CLUT-aware decoders render correctly; (c) size/quality ≈ parity with tuned 4:4:4 YCbCr in current tuning, not a clear win. Shipped opt-in/experimental; default stays YCbCr.
-- [ ] Table-driven Huffman decode · ~2–3 ms · conflicts with the restart decode path (buffered bytes vs byte alignment)
+- [x] **Table-driven Huffman decode** · 8-bit lookahead (libjpeg's `HUFF_LOOKAHEAD`) added to `HuffmanTable`; `decodeSymbol` resolves ≤8-bit codes from the table in O(1) and **falls back to the bit-by-bit walk** for >8-bit codes and any byte near a marker/EOF. That fallback is what dissolves the old "conflicts with the restart path" worry — the lookahead never buffers across a marker (`fillBuffer` stops at `0xFF`-not-`00`), so restart/align handling is untouched. **Bit-identical by construction** (prefix-free property) and **proven** by a direct fast-vs-slow A/B over 1000 random streams (incl. injected stuffing + marker-like bytes) plus the full round-trip/cross-codec/fuzz suite. **Measured (release, 1024²):** ~15–19% faster *total* decode on entropy-heavy content (texture 45.4→38.4 ms, noise 56.2→45.8 ms; the entropy stage itself ~40% faster), ~0% change on trivially-compressible images where IDCT/color dominate. No regression, no new error surface.
 - [ ] Metal hot path · marginal over Accelerate (already AMX/GPU-accelerated GEMM)
 
 ### Tier 4 — release (final state)

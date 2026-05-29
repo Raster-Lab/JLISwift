@@ -22,6 +22,19 @@ struct HuffmanTable {
     /// Ordered symbol values.
     let values: [UInt8]
 
+    /// Lookahead decode tables, indexed by the next 8 bits of the stream.
+    /// `lookaheadLength[i]` is the bit length (1–8) of the code whose canonical
+    /// prefix matches the top bits of `i`, or 0 when the code is longer than 8
+    /// bits (no ≤8-bit code is a prefix of `i`). `lookaheadSymbol[i]` is the
+    /// decoded symbol when the length is non-zero. This is the standard
+    /// table-driven fast path (libjpeg's `HUFF_LOOKAHEAD = 8`): one buffered
+    /// byte resolves the common short codes in O(1), and the prefix-free
+    /// property guarantees the result is identical to walking the code
+    /// bit-by-bit. Codes >8 bits and any byte near a marker fall back to the
+    /// bit-by-bit reader, so error/restart handling is unchanged.
+    let lookaheadLength: [UInt8]
+    let lookaheadSymbol: [UInt8]
+
     /// Builds a Huffman table from JPEG-standard bits and values arrays.
     ///
     /// - Parameters:
@@ -35,6 +48,8 @@ struct HuffmanTable {
         var maxC = [Int32](repeating: -1, count: 17)
         var minC = [Int32](repeating: -1, count: 17)
         var vPtr = [Int](repeating: 0, count: 17)
+        var laLen = [UInt8](repeating: 0, count: 256)
+        var laSym = [UInt8](repeating: 0, count: 256)
 
         // Wider than the 16-bit codes it produces so canonical-code generation
         // can't overflow on a malformed BITS array — a complete length-16 code
@@ -51,6 +66,17 @@ struct HuffmanTable {
                 for _ in 0..<count where valueIndex < values.count {
                     let symbol = values[valueIndex]
                     encoding[Int(symbol)] = (UInt16(truncatingIfNeeded: code), UInt8(bitLength))
+                    // Fill every 8-bit lookahead slot whose top `bitLength` bits
+                    // equal this code. A canonical code of length ≤8 is < 256,
+                    // so `code << (8 - bitLength)` and its run stay in 0...255.
+                    if bitLength <= 8 {
+                        let shift = 8 - bitLength
+                        let start = Int(code << shift)
+                        for k in start..<(start + (1 << shift)) {
+                            laLen[k] = UInt8(bitLength)
+                            laSym[k] = symbol
+                        }
+                    }
                     valueIndex += 1
                     code += 1
                 }
@@ -63,6 +89,8 @@ struct HuffmanTable {
         self.maxCode = maxC
         self.minCode = minC
         self.valPtr = vPtr
+        self.lookaheadLength = laLen
+        self.lookaheadSymbol = laSym
     }
 }
 
@@ -328,6 +356,22 @@ enum HuffmanDecoder {
 
     /// Decodes a single Huffman symbol from the bit stream.
     static func decodeSymbol(from reader: inout BitReader, table: HuffmanTable) throws -> UInt8 {
+        // Fast path: resolve short (≤8-bit) codes from an 8-bit lookahead table.
+        // Falls through to the bit-by-bit walk for long codes and any byte near
+        // a marker / end of data, so all error and restart handling is unchanged.
+        if let symbol = reader.fastDecodeSymbol(table) { return symbol }
+        return try decodeSymbolBitByBit(from: &reader, table: table)
+    }
+
+    /// Bit-by-bit Huffman symbol decode: reads one bit at a time, comparing the
+    /// accumulated code against `maxCode` at each length (ITU-T T.81 F.2.2.3).
+    /// This is the reference/fallback path — it owns all long-code (>8-bit),
+    /// marker, EOF, and malformed-table handling. ``decodeSymbol(from:table:)``
+    /// only short-circuits to the lookahead table when it can prove the result
+    /// is identical to this walk.
+    static func decodeSymbolBitByBit(
+        from reader: inout BitReader, table: HuffmanTable
+    ) throws -> UInt8 {
         var code: Int32 = 0
 
         for bitLength in 1...16 {

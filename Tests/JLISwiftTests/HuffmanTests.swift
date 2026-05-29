@@ -236,6 +236,88 @@ struct HuffmanTests {
         #expect(decoded == 1)
     }
 
+    // MARK: - Table-driven fast-path (8-bit lookahead) equivalence
+
+    /// The lookahead table must resolve exactly the ≤8-bit codes and defer
+    /// (length 0) for every prefix that begins a longer code — otherwise the
+    /// fast path could short-circuit a code it shouldn't.
+    @Test("Lookahead table resolves short codes and defers long ones")
+    func lookaheadTableStructure() {
+        let t = StandardHuffmanTables.acLuminance  // codes span 2…16 bits
+        // Rebuild symbol→(canonical code, length) from the (bits, values) layout.
+        var code = 0, idx = 0
+        var covered = Set<Int>()
+        for len in 1...16 {
+            for _ in 0..<Int(t.bits[len - 1]) {
+                if len <= 8 {
+                    let block = 1 << (8 - len)
+                    let start = code << (8 - len)
+                    for k in start..<(start + block) {
+                        #expect(t.lookaheadLength[k] == UInt8(len))
+                        #expect(t.lookaheadSymbol[k] == t.values[idx])
+                        covered.insert(k)
+                    }
+                }
+                idx += 1; code += 1
+            }
+            code <<= 1
+        }
+        // Prefixes not owned by any ≤8-bit code must defer to the bit-by-bit walk.
+        for k in 0..<256 where !covered.contains(k) {
+            #expect(t.lookaheadLength[k] == 0)
+        }
+    }
+
+    /// Direct proof that the fast path is bit-for-bit the bit-by-bit walk: decode
+    /// the same random streams with each path on independent (value-copied)
+    /// readers and require the full symbol sequences to match. Streams include
+    /// injected `0xFF 0x00` stuffing and bare `0xFF` (marker-like) bytes, so this
+    /// exercises the short-code fast path, the >8-bit fallback, the stuffing
+    /// branch, and marker/EOF deferral all at once. `decodeSymbolBitByBit` is the
+    /// reference oracle.
+    @Test("Fast-path decode is bit-identical to bit-by-bit over random streams")
+    func fastPathEquivalence() {
+        let tables = [
+            StandardHuffmanTables.acLuminance,
+            StandardHuffmanTables.acChrominance,
+            StandardHuffmanTables.dcLuminance,
+            StandardHuffmanTables.dcChrominance,
+        ]
+        var state: UInt64 = 0x9E37_79B9_7F4A_7C15
+        func next() -> UInt8 {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17
+            return UInt8(truncatingIfNeeded: state)
+        }
+        func decodeAll(_ reader: BitReader, _ table: HuffmanTable, slow: Bool) -> [UInt8] {
+            var r = reader
+            var out = [UInt8]()
+            for _ in 0..<256 {
+                let sym: UInt8?
+                if slow { sym = try? HuffmanDecoder.decodeSymbolBitByBit(from: &r, table: table) }
+                else { sym = try? HuffmanDecoder.decodeSymbol(from: &r, table: table) }
+                guard let s = sym else { break }
+                out.append(s)
+            }
+            return out
+        }
+        for table in tables {
+            for _ in 0..<250 {
+                var data = [UInt8]()
+                let target = 6 + Int(next()) % 64
+                while data.count < target {
+                    let b = next()
+                    if (b & 0x0F) == 0 { data.append(0xFF); data.append(0x00) }  // stuffing
+                    else { data.append(b) }
+                }
+                let reader = BitReader(data: data)
+                let fast = decodeAll(reader, table, slow: false)
+                let slow = decodeAll(reader, table, slow: true)
+                #expect(fast == slow,
+                    "fast/slow diverged: \(table.values.count)-sym table, \(data.count) bytes")
+            }
+        }
+    }
+
     @Test("Empty frequencies fall back to the standard table")
     func optimalTableEmptyFallback() {
         let freq = [Int](repeating: 0, count: 256)

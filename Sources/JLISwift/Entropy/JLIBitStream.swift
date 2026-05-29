@@ -142,6 +142,50 @@ struct BitReader {
         return value
     }
 
+    /// Table-driven fast path for short (≤8-bit) Huffman codes.
+    ///
+    /// Best-effort fills the buffer to 8 bits (without throwing), peeks the top
+    /// byte, and — if it resolves to a complete ≤8-bit code in `table` — consumes
+    /// exactly that code's bits and returns its symbol. Returns `nil` (consuming
+    /// nothing) when the code is longer than 8 bits or when 8 bits can't be
+    /// safely buffered (a marker or end-of-data is within reach). In every
+    /// `nil` case the caller falls back to the throwing bit-by-bit reader, which
+    /// is the sole owner of long-code, marker, EOF, and malformed-table handling.
+    /// Because the lookahead table is derived from the same canonical codes and
+    /// the prefix-free property holds, a non-`nil` result is bit-for-bit what the
+    /// bit-by-bit walk would have produced.
+    mutating func fastDecodeSymbol(_ table: HuffmanTable) -> UInt8? {
+        if bitsAvailable < 8 { fillBuffer(upTo: 8) }
+        guard bitsAvailable >= 8 else { return nil }
+        let peek = Int((bitBuffer >> (bitsAvailable - 8)) & 0xFF)
+        let len = table.lookaheadLength[peek]
+        guard len != 0 else { return nil }
+        bitsAvailable -= Int(len)
+        return table.lookaheadSymbol[peek]
+    }
+
+    /// Best-effort buffer fill used only by ``fastDecodeSymbol(_:)``. Loads whole
+    /// bytes (resolving `0xFF 0x00` stuffing exactly as ``loadByte()`` does) until
+    /// at least `target` bits are buffered, but **stops without throwing** when it
+    /// reaches a marker (`0xFF` not followed by `0x00`) or the end of the data —
+    /// it never advances past a marker. `target` is ≤8 and entry `bitsAvailable`
+    /// is ≤7, so at most one byte is loaded and `bitBuffer` stays within 32 bits.
+    private mutating func fillBuffer(upTo target: Int) {
+        while bitsAvailable < target {
+            guard byteOffset < data.count else { return }
+            let byte = data[byteOffset]
+            if byte == 0xFF {
+                guard byteOffset + 1 < data.count else { return }
+                if data[byteOffset + 1] != 0x00 { return }  // marker — leave for slow path
+                byteOffset += 2                               // consume the stuffed 0xFF 0x00
+            } else {
+                byteOffset += 1
+            }
+            bitBuffer = (bitBuffer << 8) | UInt32(byte)
+            bitsAvailable += 8
+        }
+    }
+
     /// Loads the next byte from the data, handling byte stuffing.
     private mutating func loadByte() throws {
         guard byteOffset < data.count else {

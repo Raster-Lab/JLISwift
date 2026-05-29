@@ -294,9 +294,8 @@ JLISwift's direction is feature parity with [jpegli](https://github.com/google/j
 Remaining (deferred — low/uncertain value or out of scope for now):
 
 1. **Metal hot path** — actually invoke the existing `JLIMetalPipeline` kernels; marginal over the Accelerate AMX/GPU GEMM, and hard to validate bit-exactly.
-2. **Table-driven (multi-bit) Huffman decode** — ~2–3 ms; conflicts with the restart/byte-alignment path, risky against the fuzz-hardened decoder.
 
-Done since 0.1 — all cross-validated against libjpeg-turbo / mozjpeg / ImageIO (and Apple CoreGraphics for XYB color) with PSNR + butteraugli, regression-tracked: spec fixes (byte-unstuffing, DRI/RST, SOF1); Accelerate-backed batched DCT; **optimized Huffman tables**; **12/16-bit** and **float32** input; **distance parameter**; **trellis quantization**; **jpegli perceptual quant tables** + **spatial adaptive-quant field**; **progressive (SOF2)** decode + encode **with restart markers**; **lossless (SOF3)** + **near-lossless**; **reduced-scale decode** (1/2, 1/4, 1/8); **ICC / Exif** metadata; **XYB** color encode/decode (experimental); **multi-threaded** trellis + Huffman-counting encode; and **fuzz-hardened decoding** (throws, never traps).
+Done since 0.1 — all cross-validated against libjpeg-turbo / mozjpeg / ImageIO (and Apple CoreGraphics for XYB color) with PSNR + butteraugli, regression-tracked: spec fixes (byte-unstuffing, DRI/RST, SOF1); Accelerate-backed batched DCT; **optimized Huffman tables**; **table-driven (8-bit lookahead) Huffman decode** (~15–19% faster decode on entropy-heavy content, bit-identical, bit-by-bit fallback at markers/long codes); **12/16-bit** and **float32** input; **distance parameter**; **trellis quantization**; **jpegli perceptual quant tables** + **spatial adaptive-quant field**; **progressive (SOF2)** decode + encode **with restart markers**; **lossless (SOF3)** + **near-lossless**; **reduced-scale decode** (1/2, 1/4, 1/8); **ICC / Exif** metadata; **XYB** color encode/decode (experimental); **multi-threaded** trellis + Huffman-counting encode; and **fuzz-hardened decoding** (throws, never traps).
 
 ## Requirements
 
