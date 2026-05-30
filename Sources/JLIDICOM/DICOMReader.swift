@@ -96,8 +96,9 @@ public struct DICOMImage: Sendable {
             let px = self.width * self.height
             var out = [UInt8](repeating: 0, count: px * 3)
             let n = min(pixelCount, pixelData.count)
+            // De-interleave to pixel-order (R/Y, G/Cb, B/Cr) honoring planar config.
             if planarConfiguration == 1 {
-                // Plane-interleaved (R…R G…G B…B) → pixel-interleaved (RGB RGB…).
+                // Plane-interleaved (C0…C0 C1…C1 C2…C2) → pixel-interleaved.
                 for c in 0..<3 {
                     let base = c * px
                     for i in 0..<px where base + i < n {
@@ -106,6 +107,17 @@ public struct DICOMImage: Sendable {
                 }
             } else {
                 for i in 0..<n { out[i] = pixelData[i] }
+            }
+            // YBR (YCbCr) photometric interpretations carry luma/chroma, not RGB —
+            // convert in place with the full-range BT.601 inverse. YBR_FULL_422 is
+            // the same color math at full resolution here, because an encapsulated
+            // JPEG is already chroma-upsampled by the time we see its samples.
+            if Self.isYBR(photometric) {
+                for i in 0..<px {
+                    let (r, g, b) = Self.ybrFullToRGB(
+                        y: out[i * 3], cb: out[i * 3 + 1], cr: out[i * 3 + 2])
+                    out[i * 3] = r; out[i * 3 + 1] = g; out[i * 3 + 2] = b
+                }
             }
             return out
         }
@@ -205,6 +217,30 @@ public struct DICOMImage: Sendable {
             for i in 0..<out.count { out[i] = out[i] * rescaleSlope + rescaleIntercept }
         }
         return out
+    }
+
+    /// True for the YCbCr-family photometric interpretations whose samples are
+    /// luma/chroma, not RGB, and so need a color transform before display:
+    /// `YBR_FULL` and `YBR_FULL_422` (full-range). (`YBR_ICT`/`YBR_RCT` are
+    /// JPEG-2000-internal and not produced by this reader; `YBR_PARTIAL_*` —
+    /// video-range — is rare in practice and intentionally not auto-converted.)
+    static func isYBR(_ photometric: String) -> Bool {
+        photometric == "YBR_FULL" || photometric == "YBR_FULL_422"
+    }
+
+    /// Full-range (DICOM YBR_FULL) YCbCr → RGB, the inverse of the JFIF/BT.601
+    /// forward transform, with 8-bit chroma centered at 128. Matches the
+    /// convention an encapsulated JPEG decode produces.
+    @inline(__always)
+    static func ybrFullToRGB(y: UInt8, cb: UInt8, cr: UInt8) -> (UInt8, UInt8, UInt8) {
+        let Y = Double(y), Cb = Double(cb) - 128.0, Cr = Double(cr) - 128.0
+        let r = Y + 1.402 * Cr
+        let g = Y - 0.344136 * Cb - 0.714136 * Cr
+        let b = Y + 1.772 * Cb
+        @inline(__always) func clamp(_ v: Double) -> UInt8 {
+            v <= 0 ? 0 : (v >= 255 ? 255 : UInt8(v + 0.5))
+        }
+        return (clamp(r), clamp(g), clamp(b))
     }
 }
 
