@@ -32,6 +32,35 @@ jobs:
       - name: Test
         run: swift test --parallel
 
+      # Medical verification-evidence gate (WS-M1). Runs the safety-critical
+      # suites on their own, un-parallelized, so the CONFORMANCE / MANIFEST
+      # records print to the CI log as an archived, quotable evidence trail —
+      # bit-exact lossless + cross-validation + near-lossless bound + signed
+      # handling + encapsulation (Conformance), the frozen content-addressed
+      # corpus with its drift guard (RegressionCorpus), the ISO/IEC 10918-2
+      # Annex A IDCT accuracy (IDCTConformance), and fail-safe-on-malformed
+      # for both the JPEG and DICOM parsers (Fuzz). A hard gate: no `|| true`.
+      - name: Medical conformance evidence
+        run: |
+          swift test --no-parallel \
+            --filter ConformanceEvidenceTests \
+            --filter RegressionCorpusTests \
+            --filter IDCTConformanceTests \
+            --filter DICOMFuzzTests \
+            --filter FuzzTests \
+            --filter MedicalSafetyTests \
+            --filter DICOMWriterTests 2>&1 | tee medical-evidence.log
+          echo "::group::Conformance evidence record"
+          grep -E 'CONFORMANCE|MANIFEST|IDCT-CONFORMANCE' medical-evidence.log || true
+          echo "::endgroup::"
+
+      - name: Upload medical evidence log
+        uses: actions/upload-artifact@v4
+        with:
+          name: medical-evidence-log
+          path: medical-evidence.log
+        if: always()
+
       - name: Test with coverage
         run: swift test --enable-code-coverage
 
