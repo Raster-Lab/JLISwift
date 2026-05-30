@@ -71,11 +71,14 @@ WS-A's opt-in field has landed; the remaining 0.3.0 work is **WS-B** (ship the s
 
 *Result: full suite 215 tests / 25 suites green; single-frame real files still bit-exact (no regression). The one remaining WS-M2 item is the optional signed-lossy stretch.*
 
-### WS-M3 — Regulatory scaffolding (P1 — draft, not certification)
-- [ ] **Intended-use / indications statement** + **software safety classification** rationale (codec feeding a diagnostic viewer ≈ IEC 62304 Class B/C) — a short controlled doc.
-- [ ] **DICOM Conformance Statement (draft, PS3.2 shape)** — transfer syntaxes actually supported (read/write), SOP classes, pixel-module attributes honored, explicit list of what is *not* supported. Must match the code (CI could even check the claimed TS list against `encapsulatedTransferSyntaxes`).
-- [ ] **ISO 14971 risk-file skeleton** — hazard table for codec-specific harms (silent pixel corruption, lossy-as-lossless, photometric inversion, signed/unsigned confusion, dropped frames, decompression-bomb DoS) mapped to the controls **already in code** (provenance flags, bomb cap, fail-safe guards, bit-exact tests) + the residual gaps.
-- [ ] **Traceability seed** — a lightweight requirements→test matrix for the safety-critical claims (bit-exact lossless, fail-safe decode, IDCT conformance), so the existing tests become *traced* evidence.
+### WS-M3 — Regulatory scaffolding (P1 — draft, not certification) ✅ DONE
+All four drafts live in [docs/regulatory/](docs/regulatory/) ([index](docs/regulatory/README.md)), grounded in the actual code (every cited test name + code symbol verified to exist) and framed explicitly as drafts that confer no regulatory status.
+- [x] **Intended-use / safety classification** ([SOFTWARE_SAFETY_CLASSIFICATION.md](docs/regulatory/SOFTWARE_SAFETY_CLASSIFICATION.md)) — draft intended-use statement, IEC 62304 Class A/B/C rationale (codec in a diagnostic path ≈ B/C), SOUP inventory (note: the *shipping* library has no third-party deps, only Apple frameworks), CDSCO/FDA/MDR pointers.
+- [x] **DICOM Conformance Statement** ([DICOM_CONFORMANCE_STATEMENT.md](docs/regulatory/DICOM_CONFORMANCE_STATEMENT.md)) — PS3.2-shaped: read/write transfer syntaxes (the 4 encapsulated JPEG + 2 native), Secondary Capture SOP, pixel-module attributes honored, fail-safe behavior, and an explicit NOT-supported list. Matches the code.
+- [x] **ISO 14971 risk-file skeleton** ([RISK_MANAGEMENT_SKELETON.md](docs/regulatory/RISK_MANAGEMENT_SKELETON.md)) — 10 codec/container hazards (H-01…H-10) mapped to the controls already in code (provenance flags, bomb cap, fail-safe guards, sign-extension, YBR/MONO1, frame integrity) + residual gaps; severity without probability (honest — needs intended use + field data).
+- [x] **Traceability seed** ([TRACEABILITY.md](docs/regulatory/TRACEABILITY.md)) — 17 safety-critical requirements (SR-01…SR-17) → verifying CI-gated test → risk-control hazard ID, turning the suite into traced evidence.
+
+*Result: regulatory on-ramp in place; 215 tests / 25 suites still green (docs-only change). Remaining for an actual claim is the 0.5.0+ process program below.*
 
 ### WS-M4 — Quality & perf (P2 — re-prioritized, still tracked)
 - [ ] **jpegli MR gap** (was the 0.4.0 headline): build a **field oracle** (instrument `cjpegli` to dump `quant_field`), diff vs ours, fix the luma field's response shape on smooth content. *Upside, not a blocker — the perceptual default already banked the headline medical quality win.*

@@ -126,6 +126,16 @@ Release build succeeded (`swift build -c release` → "Build complete!", `JLIBen
 
 ## 8. Regulatory readiness
 
+> **Update (0.4.0 / WS-M3):** *draft* regulatory scaffolding now exists in
+> [docs/regulatory/](docs/regulatory/) — a DICOM Conformance Statement, an
+> ISO 14971 risk-file skeleton, an intended-use + IEC 62304 classification
+> rationale, and a requirements→test traceability seed. These are drafts grounded
+> in the code (not certification), and they narrow the "*not started*" items below
+> to "*drafted, not validated/controlled*." Also note several framework items
+> below predate the engineering work and are now partly addressed — multi-frame,
+> encapsulated, and a DICOM writer all landed (see §1a) — though the broader
+> regulatory gap stands.
+
 **Overall: early.** Per framework, what's missing:
 
 - **DICOM PS3.5 + Conformance Statement** — narrow scope (uncompressed LE VR only); no published statement, no Big-Endian/multi-frame/encapsulated/RLE, no writer, no validation vs dcmtk/dciodvfy.
