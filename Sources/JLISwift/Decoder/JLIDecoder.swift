@@ -516,6 +516,13 @@ public struct JLIDecoder: Sendable {
         guard w >= 1, h >= 1, w <= 65535, h <= 65535 else {
             throw JLIError.decodingFailed("invalid lossless dimensions \(w)×\(h)")
         }
+        // Decompression-bomb guard: a tiny SOF can declare dimensions whose product
+        // would force a multi-gigabyte plane allocation (an uncatchable OOM trap).
+        // Cap total samples before allocating. See `maxDecodablePixels`.
+        guard w * h <= JLIDecoder.maxDecodablePixels else {
+            throw JLIError.decodingFailed(
+                "lossless image too large: \(w)×\(h) exceeds \(JLIDecoder.maxDecodablePixels)-pixel limit")
+        }
         let nc = frame.components.count
         guard nc == 1 || nc == 3 else {
             throw JLIError.unsupportedJPEGFeature("lossless \(nc)-component (only 1 or 3)")
@@ -528,6 +535,13 @@ public struct JLIDecoder: Sendable {
         let pt = scan.header.successiveApproxLow         // point transform
         guard (1...7).contains(predictor) else {
             throw JLIError.decodingFailed("invalid lossless predictor \(predictor)")
+        }
+        // The point transform shifts the initial predictor by `precision-1-pt`; a
+        // pt ≥ precision yields a negative shift count, which traps at runtime.
+        // T.81 also constrains Pt < P for lossless. Reject out-of-range values
+        // (a 4-bit Al field can carry 0–15) with a thrown error, never a trap.
+        guard pt >= 0, pt < precision else {
+            throw JLIError.decodingFailed("invalid lossless point transform \(pt) for precision \(precision)")
         }
         let dcTables = prepareDCTables(scan.dcTables)
         let tables = frame.components.map { fc -> HuffmanTable in
@@ -645,6 +659,15 @@ public struct JLIDecoder: Sendable {
         return tables
     }
 
+    /// Absolute upper bound on the number of samples (width × height) the decoder
+    /// will allocate planes for, regardless of the per-dimension 65535 cap. This is
+    /// a decompression-bomb / denial-of-service guard: a tiny crafted header must
+    /// not be able to force a multi-gigabyte allocation (an uncatchable OOM trap).
+    /// 268,435,456 (2^28 ≈ 268 MP) comfortably exceeds any diagnostic radiology
+    /// image (mammography ~24 MP, large DX ~16 MP) while blocking the 4.29e9-pixel
+    /// worst case the SOF fields would otherwise permit.
+    static let maxDecodablePixels = 1 << 28
+
     /// Rejects structurally-invalid frames that the decode pipeline cannot
     /// handle without trapping — malformed input (e.g. JPEG-in-DICOM from an
     /// untrusted source) must fail with a thrown ``JLIError``, never a crash.
@@ -660,6 +683,13 @@ public struct JLIDecoder: Sendable {
         guard frame.width >= 1, frame.height >= 1,
               frame.width <= 65535, frame.height <= 65535 else {
             throw JLIError.decodingFailed("invalid image dimensions \(frame.width)×\(frame.height)")
+        }
+        // Decompression-bomb guard: the 16-bit SOF fields permit up to ~4.29e9
+        // pixels, whose coefficient/scratch planes would OOM-trap from a ~20-byte
+        // header. Reject anything beyond `maxDecodablePixels` before allocating.
+        guard frame.width * frame.height <= JLIDecoder.maxDecodablePixels else {
+            throw JLIError.decodingFailed(
+                "image too large: \(frame.width)×\(frame.height) exceeds \(JLIDecoder.maxDecodablePixels)-pixel limit")
         }
         // Only grayscale (1) and YCbCr (3) layouts are decodable; the color path
         // assumes exactly three planes (Y, Cb, Cr).
