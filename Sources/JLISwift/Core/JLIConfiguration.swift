@@ -275,6 +275,15 @@ public struct JLIDecoderConfiguration: Sendable {
     ///
     /// When `nil`, the decoder selects the most appropriate format based on the
     /// JPEG's internal precision (8-bit input → `.uint8`, 10+ bit → `.uint16`).
+    ///
+    /// **`.float32` (decode):** the buffer holds 32-bit little-endian floats that
+    /// are the **raw reconstructed sample values** — e.g. `0…4095` for 12-bit data,
+    /// not normalized to `[0, 1]`. This is intentionally *asymmetric* to the
+    /// encoder's float32 *input* (which is normalized `[0, 1]`); decode float32 is
+    /// a zero-rounding passthrough of the reconstructed samples, so 12-bit values
+    /// are exact. Supported for **grayscale** and **XYB** output; the YCbCr→RGB
+    /// path and the lossless (SOF3) path reject `.float32` (use `.uint8`/`.uint16`,
+    /// which are already exact for lossless).
     public var outputPixelFormat: JLIPixelFormat?
 
     /// The desired output color model.

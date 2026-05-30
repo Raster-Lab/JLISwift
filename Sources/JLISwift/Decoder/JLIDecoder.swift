@@ -397,10 +397,21 @@ public struct JLIDecoder: Sendable {
         // samples); 8-bit stays uint8.
         let isExtendedPrecision = frame.precision > 8
 
+        // Float32 output: emit the reconstructed sample planes as 32-bit
+        // little-endian floats — the RAW sample values (e.g. 0…4095 for 12-bit),
+        // NOT normalized to [0,1] (that asymmetry vs the encoder's float32 *input*
+        // is intentional; see JLIDecoderConfiguration.outputPixelFormat). This is
+        // a zero-rounding passthrough of the same float planes the integer path
+        // rounds, so it never loses precision. Grayscale and XYB are supported;
+        // the YCbCr→RGB path is not (its integer helper does not expose floats).
+        let wantsFloat32 = configuration.outputPixelFormat == .float32
+
         if numComponents == 1 {
             // Grayscale
             let plane = componentPlanes[0]
-            if isExtendedPrecision {
+            if wantsFloat32 {
+                outputData = Self.floatsToLE(plane.data)
+            } else if isExtendedPrecision {
                 var bytes = [UInt8](repeating: 0, count: plane.data.count * 2)
                 for i in 0..<plane.data.count {
                     let v = UInt16(clamping: Int(plane.data[i].rounded()))
@@ -424,17 +435,34 @@ public struct JLIDecoder: Sendable {
                 return t
             }
             let xs = trim(componentPlanes[0]), ys = trim(componentPlanes[1]), bs = trim(componentPlanes[2])
-            var rgb = [UInt8](repeating: 0, count: outW * outH * 3)
-            for i in 0..<(outW * outH) {
-                let (r, g, b) = ColorConversion.xybSampleToRGB(x: xs[i], y: ys[i], bChannel: bs[i])
-                rgb[i * 3] = UInt8(clamping: Int(r.rounded()))
-                rgb[i * 3 + 1] = UInt8(clamping: Int(g.rounded()))
-                rgb[i * 3 + 2] = UInt8(clamping: Int(b.rounded()))
+            if wantsFloat32 {
+                var rgbF = [Float](repeating: 0, count: outW * outH * 3)
+                for i in 0..<(outW * outH) {
+                    let (r, g, b) = ColorConversion.xybSampleToRGB(x: xs[i], y: ys[i], bChannel: bs[i])
+                    rgbF[i * 3] = r; rgbF[i * 3 + 1] = g; rgbF[i * 3 + 2] = b
+                }
+                outputData = Self.floatsToLE(rgbF)
+            } else {
+                var rgb = [UInt8](repeating: 0, count: outW * outH * 3)
+                for i in 0..<(outW * outH) {
+                    let (r, g, b) = ColorConversion.xybSampleToRGB(x: xs[i], y: ys[i], bChannel: bs[i])
+                    rgb[i * 3] = UInt8(clamping: Int(r.rounded()))
+                    rgb[i * 3 + 1] = UInt8(clamping: Int(g.rounded()))
+                    rgb[i * 3 + 2] = UInt8(clamping: Int(b.rounded()))
+                }
+                outputData = rgb
             }
-            outputData = rgb
             outputColorModel = configuration.outputColorModel ?? .rgb
         } else {
             // YCbCr → RGB
+            guard !wantsFloat32 else {
+                // The YCbCr→RGB conversion runs through an integer-output vDSP
+                // helper; a float path here would duplicate that math and risk
+                // diverging from the integer path's rounding. Float32 decode is
+                // supported for grayscale and XYB only for now.
+                throw JLIError.unsupportedJPEGFeature(
+                    "float32 output for YCbCr color (supported for grayscale and XYB)")
+            }
             let yPlane = componentPlanes[0]
 
             // Upsample Cb and Cr to full resolution
@@ -511,6 +539,13 @@ public struct JLIDecoder: Sendable {
         let precision = frame.precision
         guard (2...16).contains(precision) else {
             throw JLIError.unsupportedJPEGFeature("lossless precision \(precision)")
+        }
+        // Lossless reconstructs exact integer samples; a float32 request here would
+        // only be a lossy-looking convenience cast and is rejected so callers get
+        // the bit-exact uint path (which already preserves every value exactly).
+        guard configuration.outputPixelFormat != .float32 else {
+            throw JLIError.unsupportedJPEGFeature(
+                "float32 output for lossless (use the bit-exact .uint8/.uint16 output)")
         }
         let w = frame.width, h = frame.height
         guard w >= 1, h >= 1, w <= 65535, h <= 65535 else {
@@ -648,6 +683,23 @@ public struct JLIDecoder: Sendable {
         if tables[0] == nil { tables[0] = StandardHuffmanTables.dcLuminance }
         if tables[1] == nil { tables[1] = StandardHuffmanTables.dcChrominance }
         return tables
+    }
+
+    /// Serializes a sample plane (already interleaved if multi-component) to a
+    /// 32-bit **little-endian** float byte buffer for `.float32` output — the raw
+    /// reconstructed sample values, with no rounding or normalization.
+    static func floatsToLE(_ values: [Float]) -> [UInt8] {
+        var out = [UInt8](repeating: 0, count: values.count * 4)
+        out.withUnsafeMutableBytes { dst in
+            for (i, v) in values.enumerated() {
+                let bits = v.bitPattern   // IEEE-754; store little-endian
+                dst[i * 4]     = UInt8(bits & 0xFF)
+                dst[i * 4 + 1] = UInt8((bits >> 8) & 0xFF)
+                dst[i * 4 + 2] = UInt8((bits >> 16) & 0xFF)
+                dst[i * 4 + 3] = UInt8((bits >> 24) & 0xFF)
+            }
+        }
+        return out
     }
 
     /// AC Huffman tables keyed by table id, with standard tables filled in for
