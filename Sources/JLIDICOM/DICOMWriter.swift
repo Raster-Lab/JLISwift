@@ -32,6 +32,7 @@ public enum DICOMWriter {
         public var windowCenter: Double?
         public var windowWidth: Double?
         public var modality: String?
+        public var numberOfFrames: Int        // ≥ 1; emitted as (0028,0008) when > 1
 
         public init(
             rows: Int, columns: Int,
@@ -41,7 +42,7 @@ public enum DICOMWriter {
             photometricInterpretation: String = "MONOCHROME2",
             rescaleSlope: Double? = nil, rescaleIntercept: Double? = nil,
             windowCenter: Double? = nil, windowWidth: Double? = nil,
-            modality: String? = nil
+            modality: String? = nil, numberOfFrames: Int = 1
         ) {
             self.rows = rows; self.columns = columns
             self.bitsAllocated = bitsAllocated; self.bitsStored = bitsStored; self.highBit = highBit
@@ -50,7 +51,7 @@ public enum DICOMWriter {
             self.photometricInterpretation = photometricInterpretation
             self.rescaleSlope = rescaleSlope; self.rescaleIntercept = rescaleIntercept
             self.windowCenter = windowCenter; self.windowWidth = windowWidth
-            self.modality = modality
+            self.modality = modality; self.numberOfFrames = max(1, numberOfFrames)
         }
     }
 
@@ -111,14 +112,29 @@ public enum DICOMWriter {
     }
 
     /// Writes an Explicit-VR-LE DICOM file whose PixelData is an *encapsulated*
-    /// JPEG stream (one frame, single fragment), tagging the transfer syntax so a
-    /// reader knows to JPEG-decode it. Use `jpegLosslessSV1` for SOF3 lossless
-    /// streams (diagnostic) or `jpegBaseline` for baseline lossy.
+    /// JPEG stream (single frame), tagging the transfer syntax so a reader knows
+    /// to JPEG-decode it. Use `jpegLosslessSV1` for SOF3 lossless streams
+    /// (diagnostic) or `jpegBaseline` for baseline lossy.
     public static func writeEncapsulatedJPEG(
         jpegStream: [UInt8], module: PixelModule, transferSyntax: String,
         sopInstanceUID: String? = nil, studyUID: String? = nil, seriesUID: String? = nil
     ) throws -> [UInt8] {
-        try validate(module: module, pixelByteCount: nil)        // pixel bytes are compressed
+        try writeEncapsulatedFrames(jpegFrames: [jpegStream], module: module,
+                                    transferSyntax: transferSyntax,
+                                    sopInstanceUID: sopInstanceUID, studyUID: studyUID, seriesUID: seriesUID)
+    }
+
+    /// Writes an encapsulated DICOM with one JPEG stream per frame (a Basic Offset
+    /// Table maps frames → fragments). `module.numberOfFrames` is set to the frame
+    /// count. Each frame is one fragment.
+    public static func writeEncapsulatedFrames(
+        jpegFrames: [[UInt8]], module: PixelModule, transferSyntax: String,
+        sopInstanceUID: String? = nil, studyUID: String? = nil, seriesUID: String? = nil
+    ) throws -> [UInt8] {
+        guard !jpegFrames.isEmpty else { throw WriteError.invalidPixelModule("no frames") }
+        var m = module
+        m.numberOfFrames = jpegFrames.count
+        try validate(module: m, pixelByteCount: nil)             // pixel bytes are compressed
 
         let sop = sopInstanceUID ?? generatedUID()
         var meta = Dataset()
@@ -128,13 +144,13 @@ public enum DICOMWriter {
         meta.ui(0x0002, 0x0012, generatedUID())
 
         var ds = Dataset()
-        if let m = module.modality { ds.cs(0x0008, 0x0060, m) }
+        if let mod = m.modality { ds.cs(0x0008, 0x0060, mod) }
         ds.ui(0x0008, 0x0016, secondaryCaptureSOPClass)
         ds.ui(0x0008, 0x0018, sop)
         ds.ui(0x0020, 0x000D, studyUID ?? generatedUID())
         ds.ui(0x0020, 0x000E, seriesUID ?? generatedUID())
-        appendPixelModule(into: &ds, module: module)
-        ds.encapsulatedPixelData(jpegStream)
+        appendPixelModule(into: &ds, module: m)
+        ds.encapsulatedPixelData(jpegFrames)
 
         return assemble(meta: meta, dataset: ds)
     }
@@ -155,7 +171,8 @@ public enum DICOMWriter {
             throw WriteError.invalidPixelModule("samplesPerPixel must be 1 or 3")
         }
         if let count = pixelByteCount {
-            let expected = m.rows * m.columns * m.samplesPerPixel * ((m.bitsAllocated + 7) / 8)
+            // Native buffer must hold exactly `numberOfFrames` full frames.
+            let expected = m.rows * m.columns * m.samplesPerPixel * ((m.bitsAllocated + 7) / 8) * m.numberOfFrames
             guard count == expected else {
                 throw WriteError.pixelDataSizeMismatch(expected: expected, actual: count)
             }
@@ -166,6 +183,7 @@ public enum DICOMWriter {
         ds.us(0x0028, 0x0002, UInt16(m.samplesPerPixel))
         ds.cs(0x0028, 0x0004, m.photometricInterpretation)
         if m.samplesPerPixel == 3 { ds.us(0x0028, 0x0006, UInt16(m.planarConfiguration)) }
+        if m.numberOfFrames > 1 { ds.integerString(0x0028, 0x0008, m.numberOfFrames) }
         ds.us(0x0028, 0x0010, UInt16(m.rows))
         ds.us(0x0028, 0x0011, UInt16(m.columns))
         ds.us(0x0028, 0x0100, UInt16(m.bitsAllocated))
@@ -253,20 +271,33 @@ private struct Dataset {
         if s.hasSuffix(".0") { s.removeLast(2) }
         short(g, e, "DS", Array(s.utf8))
     }
+    mutating func integerString(_ g: UInt16, _ e: UInt16, _ v: Int) { short(g, e, "IS", Array(String(v).utf8)) }
 
-    /// Native PixelData (OW) — 16-bit or byte samples carried verbatim.
+    /// Native PixelData (OW) — 16-bit or byte samples carried verbatim. For
+    /// multi-frame, pass all frames concatenated in frame order.
     mutating func pixelData(_ data: [UInt8]) { long(0x7FE0, 0x0010, "OW", data) }
 
-    /// Encapsulated PixelData (OB, undefined length): empty Basic Offset Table
-    /// item + one fragment item carrying the compressed stream, closed by the
-    /// Sequence Delimitation Item. (DICOM PS3.5 §A.4.)
-    mutating func encapsulatedPixelData(_ stream: [UInt8]) {
+    /// Encapsulated PixelData (OB, undefined length): a Basic Offset Table item
+    /// then one fragment per frame, closed by the Sequence Delimitation Item
+    /// (DICOM PS3.5 §A.4). Single-frame is one fragment with an empty BOT;
+    /// multi-frame writes a populated BOT (offset of each frame's fragment item
+    /// relative to the first fragment item) + one fragment per frame.
+    mutating func encapsulatedPixelData(_ frames: [[UInt8]]) {
         tag(0x7FE0, 0x0010); bytes += Array("OB".utf8); u16(0); u32(0xFFFFFFFF)   // undefined length
-        tag(0xFFFE, 0xE000); u32(0)                                              // Basic Offset Table (empty)
-        // One fragment; pad the stream to even length per the standard.
-        var frag = stream
-        if frag.count % 2 != 0 { frag.append(0x00) }
-        tag(0xFFFE, 0xE000); u32(UInt32(frag.count)); bytes += frag
-        tag(0xFFFE, 0xE0DD); u32(0)                                              // Sequence Delimitation
+        // Pad each frame's fragment to even length per the standard.
+        let padded = frames.map { f -> [UInt8] in var v = f; if v.count % 2 != 0 { v.append(0x00) }; return v }
+        if padded.count <= 1 {
+            tag(0xFFFE, 0xE000); u32(0)                                          // empty Basic Offset Table
+        } else {
+            // Basic Offset Table: 4 bytes per frame, offset of each fragment's
+            // item header relative to the start of the first fragment item.
+            tag(0xFFFE, 0xE000); u32(UInt32(padded.count * 4))
+            var offset: UInt32 = 0
+            for f in padded { u32(offset); offset += UInt32(8 + f.count) }       // 8 = item tag+length
+        }
+        for f in padded {
+            tag(0xFFFE, 0xE000); u32(UInt32(f.count)); bytes += f                // one fragment per frame
+        }
+        tag(0xFFFE, 0xE0DD); u32(0)                                             // Sequence Delimitation
     }
 }

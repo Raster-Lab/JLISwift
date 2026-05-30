@@ -179,4 +179,96 @@ struct DICOMWriterTests {
         let decoded = try JLIDecoder().decode(from: dicom.pixelData)
         #expect(decoded.data == bytes)
     }
+
+    // MARK: - Multi-frame (WS-M2)
+
+    /// Distinct content per frame so a frame-mapping bug is visible.
+    private func framePixels(_ w: Int, _ h: Int, frame: Int) -> [UInt8] {
+        var d = [UInt8]()
+        for i in 0..<(w * h) { let v = UInt16((i * 7 + frame * 211) & 0x0FFF); d.append(UInt8(v & 0xFF)); d.append(UInt8(v >> 8)) }
+        return d
+    }
+
+    @Test("Encapsulated multi-frame: each frame round-trips bit-exactly via the BOT")
+    func encapsulatedMultiFrame() throws {
+        let w = 8, h = 8, frames = 5
+        var sources = [[UInt8]]()
+        var jpegs = [[UInt8]]()
+        for f in 0..<frames {
+            let src = framePixels(w, h, frame: f)
+            sources.append(src)
+            let img = try JLIImage(width: w, height: h, pixelFormat: .uint16, colorModel: .grayscale, data: src)
+            var cfg = JLIEncoderConfiguration(lossless: true); cfg.losslessPrecision = 12
+            jpegs.append(try JLIEncoder().encode(img, configuration: cfg))
+        }
+        let module = DICOMWriter.PixelModule(rows: h, columns: w, bitsAllocated: 16,
+                                             bitsStored: 12, highBit: 11)
+        let file = try DICOMWriter.writeEncapsulatedFrames(
+            jpegFrames: jpegs, module: module, transferSyntax: DICOMWriter.jpegLosslessSV1)
+
+        let dicom = try DICOMReader.read(file)
+        #expect(dicom.isEncapsulated)
+        #expect(dicom.numberOfFrames == frames)
+        #expect(dicom.encapsulatedFrameStreams.count == frames)
+        // Frame 0 is exposed as pixelData; every frame decodes to its own pixels.
+        for f in 0..<frames {
+            let stream = try #require(dicom.frame(f))
+            let dec = try JLIDecoder().decode(from: stream)
+            #expect(dec.data == sources[f], "frame \(f) not bit-exact")
+        }
+        #expect(dicom.frame(frames) == nil, "out-of-range frame must be nil")
+    }
+
+    @Test("Native multi-frame: frame 0 exposed, all frames recoverable")
+    func nativeMultiFrame() throws {
+        let w = 6, h = 4, frames = 4
+        var all = [UInt8]()
+        var sources = [[UInt8]]()
+        for f in 0..<frames { let s = framePixels(w, h, frame: f); sources.append(s); all += s }
+        let module = DICOMWriter.PixelModule(rows: h, columns: w, bitsAllocated: 16,
+                                             bitsStored: 12, highBit: 11, numberOfFrames: frames)
+        let file = try DICOMWriter.write(pixelData: all, module: module)
+
+        let dicom = try DICOMReader.read(file)
+        #expect(dicom.numberOfFrames == frames)
+        #expect(dicom.isEncapsulated == false)
+        // pixelData is bounded to frame 0 (not the whole multi-frame blob).
+        #expect(dicom.pixelData == sources[0], "native pixelData must be frame 0 only")
+        for f in 0..<frames {
+            #expect(dicom.frame(f) == sources[f], "native frame \(f) wrong")
+        }
+        #expect(dicom.frame(frames) == nil)
+    }
+
+    @Test("A lying NumberOfFrames is clamped to the native data actually present")
+    func lyingFrameCountClamped() throws {
+        // Write a valid 2-frame native file, then re-read it after overwriting the
+        // NumberOfFrames value in place to claim 9 frames — the reader must clamp
+        // the exposed frame count to the 2 frames the buffer actually holds.
+        let w = 4, h = 4, frames = 2
+        var all = [UInt8]()
+        for f in 0..<frames { all += framePixels(w, h, frame: f) }
+        let module = DICOMWriter.PixelModule(rows: h, columns: w, bitsAllocated: 16,
+                                             bitsStored: 12, highBit: 11, numberOfFrames: frames)
+        var file = try DICOMWriter.write(pixelData: all, module: module)
+
+        // Find the IS "2" value of NumberOfFrames (0028,0008) and bump it to "9".
+        // Tag bytes little-endian: 28 00 08 00, then VR "IS", then 2-byte length.
+        var i = 132
+        while i + 8 < file.count {
+            if file[i] == 0x28 && file[i+1] == 0x00 && file[i+2] == 0x08 && file[i+3] == 0x00
+                && file[i+4] == 0x49 && file[i+5] == 0x53 {     // "IS"
+                let len = Int(file[i+6]) | (Int(file[i+7]) << 8)
+                if len >= 1 { file[i + 8] = 0x39 }              // ASCII '9'
+                break
+            }
+            i += 1
+        }
+
+        let dicom = try DICOMReader.read(file)
+        #expect(dicom.numberOfFrames == frames, "frame count must clamp to the 2 frames present, not 9")
+        #expect(dicom.frame(0) == framePixels(w, h, frame: 0))
+        #expect(dicom.frame(1) == framePixels(w, h, frame: 1))
+        #expect(dicom.frame(2) == nil)
+    }
 }

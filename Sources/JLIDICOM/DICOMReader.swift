@@ -56,6 +56,19 @@ public struct DICOMImage: Sendable {
     /// True when ``pixelData`` is a compressed (encapsulated) JPEG stream rather
     /// than native samples. The caller decodes it with the matching codec.
     public var isEncapsulated: Bool = false
+    /// Number of image frames (DICOM tag (0028,0008)); `1` for a single image.
+    /// For multi-frame data ``pixelData`` exposes frame 0; use ``frame(_:)`` to
+    /// reach the others.
+    public var numberOfFrames: Int = 1
+    /// Per-frame compressed streams for an *encapsulated* multi-frame image
+    /// (empty for native data). Each element is one frame's complete JPEG stream,
+    /// which the caller decodes with the matching codec.
+    public var encapsulatedFrameStreams: [[UInt8]] = []
+    /// The full native multi-frame pixel buffer (all frames, empty for
+    /// encapsulated or single-frame). ``frame(_:)`` slices it.
+    public var nativeFrameData: [UInt8] = []
+    /// Bytes per native frame (`rows*cols*spp*ceil(bits/8)`); `0` for encapsulated.
+    public var frameByteCount: Int = 0
 
     /// Full range of decoded intensities after the Modality LUT — the real-world
     /// min/max (e.g. Hounsfield for CT). Handy as the bounds for an interactive
@@ -169,6 +182,24 @@ public struct DICOMImage: Sendable {
     public func toGray12() -> [UInt16] {
         let (c, w) = windowDefaults()
         return render12bit(windowCenter: c, windowWidth: w)
+    }
+
+    /// The pixel payload for frame `index` (0-based). For native data this is the
+    /// raw samples of that frame; for encapsulated data it is that frame's
+    /// compressed JPEG stream (decode it with the matching codec). Returns `nil`
+    /// for an out-of-range index. Frame 0 of a single-frame image equals
+    /// ``pixelData``.
+    public func frame(_ index: Int) -> [UInt8]? {
+        guard index >= 0, index < numberOfFrames else { return nil }
+        if isEncapsulated {
+            return index < encapsulatedFrameStreams.count ? encapsulatedFrameStreams[index] : nil
+        }
+        if numberOfFrames == 1 || nativeFrameData.isEmpty {
+            return index == 0 ? pixelData : nil
+        }
+        let lo = index * frameByteCount, hi = lo + frameByteCount
+        guard hi <= nativeFrameData.count else { return nil }
+        return Array(nativeFrameData[lo..<hi])
     }
 
     /// Native intensities as Double, honoring `bitsAllocated`, `bitsStored`/
@@ -328,6 +359,7 @@ public enum DICOMReader {
 
     static let tagHighBit               = tag(0x0028, 0x0102)
     static let tagPlanarConfiguration   = tag(0x0028, 0x0006)
+    static let tagNumberOfFrames        = tag(0x0028, 0x0008)
     static let tagPixelData             = tag(0x7FE0, 0x0010)
     static let tagTransferSyntax        = tag(0x0002, 0x0010)
     static let tagItem                  = tag(0xFFFE, 0xE000)
@@ -382,7 +414,7 @@ public enum DICOMReader {
 
         var rows = 0, cols = 0, bitsAllocated = 0, bitsStored = 0
         var highBit = -1, planarConfiguration = 0
-        var pixelRep = 0, samplesPerPixel = 1
+        var pixelRep = 0, samplesPerPixel = 1, numberOfFrames = 1
         var photometric = "MONOCHROME2"
         var modality = ""
         var windowCenter: Double? = nil
@@ -390,6 +422,7 @@ public enum DICOMReader {
         var rescaleSlope: Double? = nil
         var rescaleIntercept: Double? = nil
         var pixelData: [UInt8] = []
+        var encapsulatedFrames: [[UInt8]] = []   // per-frame compressed streams (encapsulated only)
 
         var p = datasetStart
         while p < data.count {
@@ -421,6 +454,7 @@ public enum DICOMReader {
             case tagHighBit:             highBit = Int(readUInt16(data, range: parsed.valueRange))
             case tagPixelRepresentation: pixelRep = Int(readUInt16(data, range: parsed.valueRange))
             case tagSamplesPerPixel:     samplesPerPixel = Int(readUInt16(data, range: parsed.valueRange))
+            case tagNumberOfFrames:      numberOfFrames = max(1, Int(readString(data, range: parsed.valueRange).trimmingCharacters(in: .whitespaces)) ?? 1)
             case tagPlanarConfiguration: planarConfiguration = Int(readUInt16(data, range: parsed.valueRange))
             case tagPhotometric:         photometric = readString(data, range: parsed.valueRange)
             case tagModality:            modality = readString(data, range: parsed.valueRange)
@@ -430,11 +464,13 @@ public enum DICOMReader {
             case tagRescaleSlope:        rescaleSlope = readDecimalString(data, range: parsed.valueRange)
             case tagPixelData:
                 if parsed.undefinedLength {
-                    // Encapsulated PixelData: an (empty) Basic Offset Table item
-                    // followed by one-or-more fragment items, closed by the
-                    // Sequence Delimitation Item. Concatenate the fragments into
-                    // the compressed stream (we stop at the delimiter / EOF below).
-                    pixelData = try readEncapsulatedFragments(data, after: parsed.next)
+                    // Encapsulated PixelData: a Basic Offset Table item, then
+                    // fragment items, closed by the Sequence Delimitation Item.
+                    // Map fragments → per-frame compressed streams; `pixelData`
+                    // exposes frame 0 (the common single-image case unchanged).
+                    let enc = try readEncapsulated(data, after: parsed.next)
+                    encapsulatedFrames = Self.encapsulatedFrames(enc, numberOfFrames: numberOfFrames)
+                    pixelData = encapsulatedFrames.first ?? []
                 } else {
                     pixelData = Array(data[parsed.valueRange])
                 }
@@ -456,14 +492,25 @@ public enum DICOMReader {
             throw DICOMError.imageTooLarge(pixels: totalSamples, limit: DICOMReader.maxDecodablePixels)
         }
         guard !pixelData.isEmpty else { throw DICOMError.missingPixelData }
-        // Truncated-PixelData guard applies only to *native* samples — an
-        // encapsulated stream is compressed, so its byte count bears no fixed
-        // relation to the declared geometry.
+        // Native frame storage. Validate that at least the requested frames fit,
+        // then expose frame 0 as `pixelData` (render helpers are single-frame) and
+        // keep the whole buffer in `nativeFrameData` for callers that want others.
+        let frameBytes = totalSamples * ((bitsAllocated + 7) / 8)
+        var nativeAllFrames: [UInt8] = []
         if !encapsulated {
-            let expectedBytes = totalSamples * ((bitsAllocated + 7) / 8)
-            guard pixelData.count >= expectedBytes else {
-                throw DICOMError.truncatedPixelData(expected: expectedBytes, actual: pixelData.count)
+            // The truncated-PixelData guard requires at least one full frame.
+            guard pixelData.count >= frameBytes else {
+                throw DICOMError.truncatedPixelData(expected: frameBytes, actual: pixelData.count)
             }
+            nativeAllFrames = pixelData
+            // Bound the render buffer to frame 0; clamp the frame count to what the
+            // data actually carries so a lying NumberOfFrames cannot over-promise.
+            pixelData = Array(pixelData.prefix(frameBytes))
+            if numberOfFrames > 1 {
+                numberOfFrames = min(numberOfFrames, max(1, nativeAllFrames.count / frameBytes))
+            }
+        } else if numberOfFrames > 1 {
+            numberOfFrames = min(numberOfFrames, max(1, encapsulatedFrames.count))
         }
 
         let effectiveStored = bitsStored == 0 ? bitsAllocated : bitsStored
@@ -484,6 +531,10 @@ public enum DICOMReader {
             transferSyntax: transferSyntax
         )
         image.isEncapsulated = encapsulated
+        image.numberOfFrames = numberOfFrames
+        image.encapsulatedFrameStreams = encapsulated ? encapsulatedFrames : []
+        image.nativeFrameData = encapsulated ? [] : nativeAllFrames
+        image.frameByteCount = encapsulated ? 0 : frameBytes
         return image
     }
 
@@ -593,17 +644,27 @@ public enum DICOMReader {
         return data.count
     }
 
-    /// Reads an encapsulated PixelData value (DICOM PS3.5 §A.4) starting just
-    /// after the PixelData header: a Basic Offset Table item (FFFE,E000) we skip,
-    /// then one-or-more fragment items concatenated into the compressed stream,
-    /// terminated by the Sequence Delimitation Item (FFFE,E0DD). Single-frame is
-    /// the common case; multiple fragments of one frame are concatenated. Bounds-
-    /// checked so malformed input throws rather than over-reads.
-    private static func readEncapsulatedFragments(_ data: [UInt8], after start: Int) throws -> [UInt8] {
+    /// Parsed encapsulated PixelData (DICOM PS3.5 §A.4): the Basic Offset Table
+    /// (first item, byte offsets of each frame's first fragment relative to the
+    /// start of the first fragment item; may be empty) and the list of fragment
+    /// payloads that follow.
+    struct Encapsulated {
+        var basicOffsetTable: [UInt32]      // frame offsets, or [] when the BOT is empty
+        var fragments: [[UInt8]]            // compressed fragment payloads, in order
+        var fragmentItemOffsets: [Int]      // byte offset of each fragment's *item header*
+    }
+
+    /// Reads the encapsulated PixelData structure starting just after the
+    /// PixelData header. Bounds-checked so malformed input throws rather than
+    /// over-reads. Does not assemble frames — see ``encapsulatedFrames``.
+    private static func readEncapsulated(_ data: [UInt8], after start: Int) throws -> Encapsulated {
         var q = start
-        var stream = [UInt8]()
+        var bot = [UInt32]()
+        var fragments = [[UInt8]]()
+        var itemOffsets = [Int]()
         var sawBasicOffsetTable = false
         while q + 8 <= data.count {
+            let itemHeader = q
             let group   = UInt16(data[q]) | (UInt16(data[q + 1]) << 8)
             let element = UInt16(data[q + 2]) | (UInt16(data[q + 3]) << 8)
             let length = readUInt32(data, q + 4)
@@ -615,14 +676,49 @@ public enum DICOMReader {
             let end = q + Int(length)
             guard end <= data.count else { throw DICOMError.truncated }
             if !sawBasicOffsetTable {
-                sawBasicOffsetTable = true                  // first item is the (often empty) BOT — skip
+                sawBasicOffsetTable = true                  // first item is the Basic Offset Table
+                var i = q
+                while i + 4 <= end { bot.append(readUInt32(data, i)); i += 4 }
             } else {
-                stream += data[q..<end]                     // a fragment — append to the frame stream
+                fragments.append(Array(data[q..<end]))
+                itemOffsets.append(itemHeader)
             }
             q = end
         }
-        guard !stream.isEmpty else { throw DICOMError.missingPixelData }
-        return stream
+        guard !fragments.isEmpty else { throw DICOMError.missingPixelData }
+        return Encapsulated(basicOffsetTable: bot, fragments: fragments, fragmentItemOffsets: itemOffsets)
+    }
+
+    /// Assembles the per-frame compressed streams from an encapsulated PixelData.
+    /// Uses the Basic Offset Table to map fragments → frames when present;
+    /// otherwise falls back to the common conventions: `numberOfFrames` fragments
+    /// (one per frame) when the counts match, else all fragments concatenated as a
+    /// single frame. Each returned element is one frame's complete JPEG stream.
+    static func encapsulatedFrames(_ enc: Encapsulated, numberOfFrames: Int) -> [[UInt8]] {
+        let n = max(1, numberOfFrames)
+        // Single frame, possibly split across fragments → concatenate.
+        if n == 1 { return [enc.fragments.flatMap { $0 }] }
+        // One fragment per frame — the overwhelmingly common multi-frame layout.
+        if enc.fragments.count == n { return enc.fragments }
+        // Use the Basic Offset Table to group fragments into frames by the byte
+        // offset of each frame's first fragment (relative to the first fragment
+        // item). The fragment item offsets are absolute, so rebase them.
+        if enc.basicOffsetTable.count == n, let base = enc.fragmentItemOffsets.first {
+            var frames = [[UInt8]]()
+            let starts = enc.basicOffsetTable.map { Int($0) + base }
+            for f in 0..<n {
+                let lo = starts[f]
+                let hi = f + 1 < n ? starts[f + 1] : Int.max
+                var stream = [UInt8]()
+                for (idx, off) in enc.fragmentItemOffsets.enumerated() where off >= lo && off < hi {
+                    stream += enc.fragments[idx]
+                }
+                frames.append(stream)
+            }
+            return frames
+        }
+        // Unknown mapping — expose each fragment as a frame (best effort).
+        return enc.fragments
     }
 
     // MARK: - Value readers
