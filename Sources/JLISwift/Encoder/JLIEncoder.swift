@@ -125,6 +125,18 @@ public struct JLIEncoder: Sendable {
                                       precision: llPrecision, isGrayscale: isGrayscale)
         }
 
+        // Signed integer samples (e.g. signed CT Hounsfield, DICOM
+        // PixelRepresentation == 1) are only well-defined on the lossless path,
+        // which preserves the exact sample bytes. The DCT path level-shifts as if
+        // unsigned and would silently corrupt negative values (or emit an
+        // undecodable stream), so reject signed input here rather than guess.
+        // Encode signed data losslessly, or offset it to unsigned before lossy
+        // encoding.
+        if image.isSigned {
+            throw JLIError.unsupportedJPEGFeature(
+                "signed pixel data on the lossy DCT path (encode losslessly, or offset to unsigned first)")
+        }
+
         // XYB perceptual color (SOF0): RGB → XYB samples → perceptual quant, 4:4:4,
         // with an embedded ICC so standard ICC-aware decoders display correct
         // color. 8-bit color only (the XYB sample scaling is calibrated for 8-bit).

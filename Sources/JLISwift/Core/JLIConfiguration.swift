@@ -184,6 +184,40 @@ public struct JLIEncoderConfiguration: Sendable {
         jpegliAdaptiveQuant: false
     )
 
+    /// A configuration guaranteed to be mathematically lossless for diagnostic
+    /// use: SOF3 predictive coding, point transform 0 (no near-lossless error),
+    /// no chroma subsampling, and every lossy/perceptual path explicitly off.
+    /// Use this — not ``default`` — when encoding images that may be used for
+    /// diagnosis; ``default`` is a *lossy* perceptual configuration.
+    public static let diagnosticLossless: JLIEncoderConfiguration = {
+        var cfg = JLIEncoderConfiguration.default
+        cfg.lossless = true
+        cfg.losslessPredictor = 1
+        cfg.losslessPointTransform = 0
+        cfg.chromaSubsampling = .yuv444
+        cfg.colorSpace = .yCbCr
+        cfg.progressive = false
+        cfg.adaptiveQuantization = false
+        cfg.adaptiveQuantField = false
+        cfg.perceptualQuantTables = false
+        cfg.jpegliAdaptiveQuant = false
+        cfg.optimiseHuffman = true
+        return cfg
+    }()
+
+    /// True only when this configuration reconstructs the source pixels exactly
+    /// (lossless SOF3 with point transform 0). Provenance signal: callers and UIs
+    /// MUST NOT present the output of a configuration where this is `false` as
+    /// diagnostic-lossless — that includes the default perceptual path and any
+    /// near-lossless (point transform > 0) configuration.
+    public var isNumericallyLossless: Bool {
+        lossless && losslessPointTransform == 0
+    }
+
+    /// True when encoding discards information (any non-lossless, or near-lossless
+    /// with point transform > 0). The inverse of ``isNumericallyLossless``.
+    public var isLossy: Bool { !isNumericallyLossless }
+
     /// Creates an encoder configuration.
     ///
     /// - Parameters:

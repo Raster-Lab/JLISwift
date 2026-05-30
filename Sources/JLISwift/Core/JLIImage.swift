@@ -75,6 +75,18 @@ public struct JLIImage: Sendable {
     /// The color model describing the channel layout.
     public let colorModel: JLIColorModel
 
+    /// Whether the integer samples are signed two's-complement (e.g. DICOM
+    /// `PixelRepresentation == 1`, as in signed CT Hounsfield data).
+    ///
+    /// JPEG itself stores unsigned samples, so this is provenance the container
+    /// carries on the caller's behalf: the **lossless** path preserves the exact
+    /// sample bytes regardless of sign (so signed data round-trips bit-exactly and
+    /// this flag is propagated to the decoded image), while the **lossy DCT** path
+    /// is undefined for signed samples and rejects them rather than silently
+    /// corrupting values — encode signed data losslessly, or offset it to unsigned
+    /// first. Only meaningful for integer formats; ignored for `.float32`.
+    public let isSigned: Bool
+
     /// The raw pixel data as a contiguous byte buffer.
     ///
     /// Data is stored in row-major order with components interleaved per pixel.
@@ -116,6 +128,7 @@ public struct JLIImage: Sendable {
         pixelFormat: JLIPixelFormat,
         colorModel: JLIColorModel,
         data: [UInt8],
+        isSigned: Bool = false,
         iccProfile: [UInt8]? = nil,
         exif: [UInt8]? = nil
     ) throws {
@@ -130,6 +143,7 @@ public struct JLIImage: Sendable {
         self.height = height
         self.pixelFormat = pixelFormat
         self.colorModel = colorModel
+        self.isSigned = isSigned
         self.data = data
         self.iccProfile = iccProfile
         self.exif = exif
