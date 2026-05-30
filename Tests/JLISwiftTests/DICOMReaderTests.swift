@@ -25,6 +25,23 @@ private struct DICOMBuilder {
         append16(g); append16(e); elements += Array("OW".utf8); append16(0)
         append32(UInt32(value.count)); elements += value
     }
+    /// 8-bit pixel data (OB), bytes verbatim.
+    mutating func ob(_ g: UInt16, _ e: UInt16, _ value: [UInt8]) {
+        append16(g); append16(e); elements += Array("OB".utf8); append16(0)
+        append32(UInt32(value.count)); elements += value
+    }
+    /// An undefined-length (FFFFFFFF) sequence carrying one undefined-length item
+    /// that itself contains `inner` elements, closed by Item- and Sequence-
+    /// Delimitation Items. Exercises the SQ-skip path that must not derail the
+    /// pixel-module parse.
+    mutating func undefinedLengthSQ(_ g: UInt16, _ e: UInt16, inner: [UInt8]) {
+        append16(g); append16(e); elements += Array("SQ".utf8); append16(0)
+        append32(0xFFFFFFFF)                       // undefined sequence length
+        append16(0xFFFE); append16(0xE000); append32(0xFFFFFFFF)   // Item, undefined length
+        elements += inner
+        append16(0xFFFE); append16(0xE00D); append32(0)            // Item Delimitation
+        append16(0xFFFE); append16(0xE0DD); append32(0)            // Sequence Delimitation
+    }
     private mutating func short(_ g: UInt16, _ e: UInt16, _ vr: String, _ value: [UInt8]) {
         append16(g); append16(e); elements += Array(vr.utf8); append16(UInt16(value.count))
         elements += value
@@ -158,5 +175,133 @@ struct DICOMReaderTests {
         #expect(c == 200 && w == 100)
         // toRGB8() must apply that stored window — identical to render8bit(200,100).
         #expect(img.toRGB8() == img.render8bit(windowCenter: 200, windowWidth: 100))
+    }
+
+    // MARK: - Safety guards (decompression bomb / truncated PixelData)
+
+    /// Builds a 16-bit MONOCHROME2 DICOM with the given geometry and raw samples.
+    private func makeImage(rows: Int, cols: Int, samples: [UInt16]) -> [UInt8] {
+        var b = DICOMBuilder()
+        b.us(0x0028, 0x0010, UInt16(rows))     // Rows
+        b.us(0x0028, 0x0011, UInt16(cols))     // Columns
+        b.us(0x0028, 0x0100, 16)               // BitsAllocated
+        b.us(0x0028, 0x0101, 16)               // BitsStored
+        b.us(0x0028, 0x0103, 0)                // PixelRepresentation (unsigned)
+        b.ow(0x7FE0, 0x0010, samples)          // PixelData
+        return b.bytes()
+    }
+
+    @Test("Oversized geometry is rejected (decompression-bomb guard)")
+    func imageTooLargeIsRejected() {
+        // 65535×65535 ≈ 4.29e9 samples, far above the 268 MP cap. A tiny header
+        // must throw, not attempt a multi-gigabyte allocation (OOM trap).
+        let bytes = makeImage(rows: 65535, cols: 65535, samples: [0])
+        #expect(throws: DICOMError.self) { _ = try DICOMReader.read(bytes) }
+    }
+
+    @Test("Short PixelData is rejected, not silently under-filled")
+    func truncatedPixelDataIsRejected() {
+        // Declares 16×16×2 = 512 bytes of PixelData but supplies only one sample.
+        let bytes = makeImage(rows: 16, cols: 16, samples: [1])
+        #expect(throws: DICOMError.self) { _ = try DICOMReader.read(bytes) }
+    }
+
+    @Test("A correctly-sized image still reads after the guards")
+    func wellFormedImageStillReadsAfterGuards() throws {
+        // 2×2 16-bit, exactly 4 samples — must decode unaffected.
+        let bytes = makeImage(rows: 2, cols: 2, samples: [10, 20, 30, 40])
+        let img = try DICOMReader.read(bytes)
+        #expect(img.width == 2)
+        #expect(img.height == 2)
+    }
+
+    // MARK: - Correctness hardening (SQ skip, signed bitsStored, planar config)
+
+    @Test("An undefined-length sequence before the pixel module does not derail parsing")
+    func undefinedLengthSequenceIsSkipped() throws {
+        // A Referenced Image Sequence (0008,1140) with undefined length sits
+        // BEFORE the pixel-module attributes. Before the fix, the parser descended
+        // into its items and read garbage for Rows/Columns; now it steps over it.
+        var inner = DICOMBuilder()
+        inner.us(0x0028, 0x0010, 999)             // a decoy "Rows" inside the sequence
+        inner.us(0x0028, 0x0011, 999)             // a decoy "Columns" inside the sequence
+
+        var b = DICOMBuilder()
+        b.undefinedLengthSQ(0x0008, 0x1140, inner: inner.elements)   // Referenced Image Sequence
+        b.us(0x0028, 0x0002, 1)
+        b.str(0x0028, 0x0004, "CS", "MONOCHROME2")
+        b.us(0x0028, 0x0010, 2)                   // real Rows
+        b.us(0x0028, 0x0011, 2)                   // real Columns
+        b.us(0x0028, 0x0100, 16)
+        b.us(0x0028, 0x0101, 16)
+        b.us(0x0028, 0x0103, 0)
+        b.ow(0x7FE0, 0x0010, [0, 100, 200, 300])
+
+        let img = try DICOMReader.read(b.bytes())
+        #expect(img.width == 2 && img.height == 2)   // not 999 — sequence was skipped
+    }
+
+    @Test("Signed 12-bit-in-16 data is sign-extended from the stored sign bit")
+    func signed12BitInerSignExtension() throws {
+        // CT-like: 16-bit container, only 12 bits stored, signed. A stored value
+        // of 0x0FFF (12-bit −1 in two's complement) must decode to −1, not 4095.
+        // intercept 0 / slope 1, so the intensity IS the signed stored value.
+        var b = DICOMBuilder()
+        b.us(0x0028, 0x0002, 1)
+        b.str(0x0028, 0x0004, "CS", "MONOCHROME2")
+        b.us(0x0028, 0x0010, 1)                   // Rows
+        b.us(0x0028, 0x0011, 2)                   // Columns
+        b.us(0x0028, 0x0100, 16)                  // BitsAllocated
+        b.us(0x0028, 0x0101, 12)                  // BitsStored
+        b.us(0x0028, 0x0102, 11)                  // HighBit
+        b.us(0x0028, 0x0103, 1)                   // PixelRepresentation = signed
+        b.ow(0x7FE0, 0x0010, [0x0FFF, 0x0001])    // 12-bit −1, then +1
+
+        let img = try DICOMReader.read(b.bytes())
+        let (lo, hi) = img.intensityRange()
+        #expect(lo == -1, "stored 0x0FFF should sign-extend to −1, got \(lo)")
+        #expect(hi == 1)
+    }
+
+    @Test("Unsigned 12-bit-in-16 data masks non-significant high bits")
+    func unsigned12BitMasking() throws {
+        // Unsigned, 12 bits stored. A container value of 0xF001 has dirty high
+        // bits; only the low 12 (0x001 = 1) are significant.
+        var b = DICOMBuilder()
+        b.us(0x0028, 0x0002, 1)
+        b.str(0x0028, 0x0004, "CS", "MONOCHROME2")
+        b.us(0x0028, 0x0010, 1)
+        b.us(0x0028, 0x0011, 2)
+        b.us(0x0028, 0x0100, 16)
+        b.us(0x0028, 0x0101, 12)
+        b.us(0x0028, 0x0102, 11)
+        b.us(0x0028, 0x0103, 0)                   // unsigned
+        b.ow(0x7FE0, 0x0010, [0xF001, 0x0FFF])    // → 1 and 4095 after masking
+
+        let img = try DICOMReader.read(b.bytes())
+        let (lo, hi) = img.intensityRange()
+        #expect(lo == 1, "0xF001 should mask to 1, got \(lo)")
+        #expect(hi == 4095)
+    }
+
+    @Test("Plane-interleaved RGB (PlanarConfiguration 1) is reassembled correctly")
+    func planarConfigurationReassembly() throws {
+        // 2×1 RGB, plane-interleaved: R-plane [10,11], G-plane [20,21],
+        // B-plane [30,31]. Pixel 0 must come out (10,20,30), pixel 1 (11,21,31).
+        var b = DICOMBuilder()
+        b.us(0x0028, 0x0002, 3)                   // SamplesPerPixel = 3
+        b.str(0x0028, 0x0004, "CS", "RGB")
+        b.us(0x0028, 0x0006, 1)                   // PlanarConfiguration = 1 (planar)
+        b.us(0x0028, 0x0010, 1)                   // Rows
+        b.us(0x0028, 0x0011, 2)                   // Columns
+        b.us(0x0028, 0x0100, 8)
+        b.us(0x0028, 0x0101, 8)
+        b.us(0x0028, 0x0103, 0)
+        b.ob(0x7FE0, 0x0010, [10, 11, 20, 21, 30, 31])   // R…R G…G B…B
+
+        let img = try DICOMReader.read(b.bytes())
+        let rgb = img.toRGB8()
+        #expect(Array(rgb[0..<3]) == [10, 20, 30])
+        #expect(Array(rgb[3..<6]) == [11, 21, 31])
     }
 }
