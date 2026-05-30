@@ -3,7 +3,9 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-29 — **0.2.0 RELEASED** (tagged `v0.2.0`, GitHub Release live): jpegli perceptual-quant default (medical quality win — CT q90 ba 1.20 vs 1.82 at equal bytes), **~15–16% faster encode** + **~26–43% faster decode** (byte-identical), the **JLILab** macOS lab (now with an app icon), and measurement tooling. Focus is now the **0.3.0 plan** (below): ship JLILab as a signed/notarized app (+ DMG) with the adaptive-quant field opt-in; the jpegli quality-parity goal (MR gap, needs a field oracle) moved to 0.4.0._
+_Last updated: 2026-05-30 — **Project pivot: medical imaging is now the primary use case.** A multi-agent **medical-grade readiness audit** ([MEDICAL_GRADE_ASSESSMENT.md](MEDICAL_GRADE_ASSESSMENT.md)) found a genuinely strong codec but real engineering gaps + zero regulatory artifacts. The `feat/medical-foundations` branch closed the engineering gaps (193 tests green, verified on the real corpus): decoder fail-safe guards (decompression bomb, lossless shift), DICOM reader hardening (undefined-length SQ skip, bitsStored/HighBit masking + signed sign-extension, planar config), signed-pixel provenance end-to-end, ISO/IEC 10918-2 IDCT conformance, and a **DICOM writer + JPEG-encapsulation** path joining the codec to the container (real compressed clinical DICOMs now decode). **0.4.0's theme is medical foundations** (below). The old jpegli-parity / perf / XYB work is **re-prioritized to P2** — still tracked, no longer the headline._
+
+_Earlier: **0.3.0 RELEASED** (tagged `v0.3.0`): jpegli adaptive-quant field opt-in + JLILab distribution scaffolding. **0.2.0**: perceptual-quant default (CT q90 ba 1.20 vs 1.82 at equal bytes), ~15–16% faster encode / ~26–43% faster decode (byte-identical), the JLILab macOS lab._
 
 ## 0.3.0 — Plan (active, 2026-05-29)
 
@@ -39,9 +41,50 @@ _Last updated: 2026-05-29 — **0.2.0 RELEASED** (tagged `v0.2.0`, GitHub Releas
 ### Sequencing
 WS-A's opt-in field has landed; the remaining 0.3.0 work is **WS-B** (ship the signed app). **Tag `v0.3.0` once the notarized DMG is produced.** Closing the jpegli/MR gap (needs a field oracle) + WS-C/D/E move to **0.4.0**.
 
-## 0.4.0 — Proposed (quality + perf)
-- **Close the jpegli quality gap (MR):** build a **field oracle** (instrument `cjpegli` to dump its `quant_field`), diff against ours, and fix the luma field's response shape on smooth content (WS-A residual, above).
-- **WS-C** targeted perf (parallel inverse color/decode, parallel entropy emit opt-in, fused dequant+IDCT); **WS-D** float32 decode output + DocC + expanded fuzz/conformance; **WS-E** re-evaluate XYB with the mature perceptual machinery.
+## 0.4.0 — Plan (active, 2026-05-30)
+
+**Theme: medical foundations.** Make JLISwift a codec a medical-imaging product can *defensibly* build on: land the safety/correctness fixes, close the highest-value remaining codec gaps for real clinical data, build the **verification-evidence** pack, and draft the **regulatory scaffolding**. This is the work that converts "a strong codec" into "a strong codec with the evidence trail a SaMD needs." Codec quality (jpegli MR gap) and perf drop to **P2** this cycle.
+
+**North star:** by 0.4.0 we can hand a regulatory/clinical partner (a) a frozen, content-addressed regression corpus with pass/fail acceptance criteria, (b) a draft DICOM Conformance Statement that matches the code, (c) a risk-file skeleton (ISO 14971) enumerating codec hazards + the controls already in code, and (d) a green CI gate that proves bit-exact lossless + IDCT conformance + fuzz-safety on every commit. **We still cannot call it "medical grade"** — that needs the full IEC 62304 / ISO 13485 / CDSCO process (0.5.0+) — but a partner can see exactly how far along it is.
+
+**Foundation (DONE — `feat/medical-foundations` branch, 193 tests green):**
+- [x] **Decoder fail-safe guards** — decompression-bomb cap (`maxDecodablePixels`) on baseline/lossless + DICOM reader; lossless point-transform validated (no negative-shift trap).
+- [x] **DICOM reader hardening** — undefined-length SQ skip; `bitsStored`/HighBit masking + signed sign-extension; PlanarConfiguration; truncated-PixelData throws (no silent under-fill). Verified on real CT/DX/MG/MR/XA.
+- [x] **Signedness end-to-end** — `JLIImage.isSigned`; lossless preserves it bit-exactly; lossy path rejects signed input (no silent corruption).
+- [x] **ISO/IEC 10918-2 IDCT conformance** — Annex A statistical test, 3 ranges, passes with ~400× margin.
+- [x] **DICOM writer + JPEG-encapsulation** — produce native + encapsulated DICOM; reader extracts encapsulated JPEG; real compressed clinical US DICOMs decode through the codec.
+
+### WS-M1 — Verification evidence pack (P0 — the highest-value medical work)
+- [ ] **Frozen regression corpus** with explicit acceptance criteria: a small, content-addressed (hashed) set spanning modality × bit-depth × signedness × photometric × transfer-syntax (incl. encapsulated). Lossless = **bit-exact** gate; lossy = bounded butteraugli/PSNR; reject = expected-throw. Stored as committed fixtures or hashes (no PHI in the repo).
+- [ ] **CI cross-validation gate** — promote the libjpeg-turbo/`djpeg` cross-checks from opt-in tooling to a **CI-enforced** step (they already run as embedded fixtures in `ScaledDecode`/`Lossless` tests; extend to encapsulated + 12/16-bit + signed). Green CI must *prove* lossless bit-exactness, not just "doesn't throw."
+- [ ] **DICOM-parser fuzz** — extend the existing JPEG fuzz harness to the DICOM reader (malformed headers, lying lengths, nested/undefined-length SQ, encapsulated fragment corruption, decompression-bomb seeds). Throws, never traps.
+- [ ] **Signed sample-stat report** — a `JLIBench` mode that, per corpus file, records signedness/bitsStored/photometric/transfer-syntax + lossless-round-trip result → CSV, as the empirical evidence artifact.
+
+### WS-M2 — Codec gaps that matter for real clinical data (P1)
+- [ ] **YBR_FULL / YBR_FULL_422 → RGB** color conversion on read (the encapsulated US files decode but land in YBR; render path should produce correct RGB). Cross-validate vs a reference.
+- [ ] **Multi-frame** (NumberOfFrames) — at minimum read frame 0 correctly for both native and encapsulated; ideally expose all frames. (US/XA cine.)
+- [ ] **MONOCHROME1 end-to-end test** — the inversion is applied on render; add an explicit round-trip assertion (audit noted it was untested).
+- [ ] **Encapsulated multi-fragment + Basic Offset Table** — currently single-frame, first-frame; honor the BOT for frame boundaries.
+- [ ] *(stretch)* **Signed lossy** done right — instead of rejecting, offset-to-unsigned + record the offset so signed CT can use the DCT path losslessly-reversibly. Only if a use case needs it.
+
+### WS-M3 — Regulatory scaffolding (P1 — draft, not certification)
+- [ ] **Intended-use / indications statement** + **software safety classification** rationale (codec feeding a diagnostic viewer ≈ IEC 62304 Class B/C) — a short controlled doc.
+- [ ] **DICOM Conformance Statement (draft, PS3.2 shape)** — transfer syntaxes actually supported (read/write), SOP classes, pixel-module attributes honored, explicit list of what is *not* supported. Must match the code (CI could even check the claimed TS list against `encapsulatedTransferSyntaxes`).
+- [ ] **ISO 14971 risk-file skeleton** — hazard table for codec-specific harms (silent pixel corruption, lossy-as-lossless, photometric inversion, signed/unsigned confusion, dropped frames, decompression-bomb DoS) mapped to the controls **already in code** (provenance flags, bomb cap, fail-safe guards, bit-exact tests) + the residual gaps.
+- [ ] **Traceability seed** — a lightweight requirements→test matrix for the safety-critical claims (bit-exact lossless, fail-safe decode, IDCT conformance), so the existing tests become *traced* evidence.
+
+### WS-M4 — Quality & perf (P2 — re-prioritized, still tracked)
+- [ ] **jpegli MR gap** (was the 0.4.0 headline): build a **field oracle** (instrument `cjpegli` to dump `quant_field`), diff vs ours, fix the luma field's response shape on smooth content. *Upside, not a blocker — the perceptual default already banked the headline medical quality win.*
+- [ ] **WS-C perf** — parallel inverse color/decode, parallel entropy emit (opt-in), fused dequant+IDCT.
+- [ ] **WS-D** — float32 decode output; DocC catalog; **WS-E** — re-evaluate XYB with the mature perceptual machinery.
+
+### Sequencing & gate
+**WS-M1 first** (evidence is the highest-leverage medical work and gates everything else), then **WS-M2** (real-data codec gaps) and **WS-M3** (regulatory drafts) in parallel, with **WS-M4** as fill-in. **Tag `v0.4.0`** once WS-M1 is CI-green and WS-M2's YBR + multi-frame land. Discipline unchanged: bit-exact gates, fuzz throws, CI-green, every claim corpus-measured.
+
+**Hard line:** nothing in 0.4.0 lets us market "medical grade," "medical device," "for diagnostic use," or "clinically validated." Those need the full QMS + risk file + CDSCO/FDA pathway (**0.5.0+**, a multi-quarter process program). See [MEDICAL_GRADE_ASSESSMENT.md](MEDICAL_GRADE_ASSESSMENT.md) §10 for safe vs unsafe claim language.
+
+## 0.5.0+ — Regulatory pathway (future, process-led)
+Out of scope for code milestones, tracked here so the direction is explicit: full **IEC 62304** lifecycle docs + traceability, **ISO 14971** risk management file (not just the skeleton), **ISO 13485**-aligned QMS / Design History File, a **published DICOM Conformance Statement**, and the **India CDSCO** (Medical Device Rules 2017) classification + licensing pathway (with US FDA SaMD / EU MDR if those markets are targeted). This is a process + evidence program measured in quarters, not a coding task — but the 0.4.0 scaffolding (WS-M3) is its on-ramp.
 
 ## 0.2.0 — Optimization release (shipped v0.2.0, 2026-05-29)
 
