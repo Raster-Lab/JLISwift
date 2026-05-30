@@ -54,6 +54,86 @@ func runBatch(dir: String, out: String?) {
     }
 }
 
+// MARK: - WS-M1 signed sample-stat report (medical evidence over a real tree)
+
+/// Walks every `.dcm` under `dir` and records, per file, the medically-relevant
+/// pixel-module facts (signedness, bitsStored, photometric, transfer syntax,
+/// encapsulation) plus a **lossless round-trip result** on the raw stored pixels
+/// — the empirical evidence that the codec reconstructs real clinical samples
+/// bit-exactly. Files the reader rejects (unsupported syntax, missing pixels,
+/// bomb, truncated) are recorded with their reason rather than skipped silently,
+/// so the report is a complete census. `out` is a CSV path, or nil for stdout.
+func runSignedStats(dir: String, out: String?) {
+    let fm = FileManager.default
+    var files: [String] = []
+    if let en = fm.enumerator(atPath: dir) {
+        for case let f as String in en where f.lowercased().hasSuffix(".dcm") {
+            files.append("\(dir)/\(f)")
+        }
+    }
+    files.sort()
+
+    var lines = ["path,status,width,height,bitsAllocated,bitsStored,signed,photometric,"
+        + "samplesPerPixel,transferSyntax,encapsulated,losslessRoundTrip"]
+    var read = 0, rejected = 0, rtTested = 0, rtExact = 0
+    for path in files {
+        let rel = path.hasPrefix(dir) ? String(path.dropFirst(dir.count).drop(while: { $0 == "/" })) : path
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+            lines.append("\(rel),read-error,,,,,,,,,,"); continue
+        }
+        let dicom: DICOMImage
+        do {
+            dicom = try DICOMReader.read([UInt8](data))
+        } catch {
+            rejected += 1
+            let reason = "\(error)".replacingOccurrences(of: ",", with: ";")
+            lines.append("\(rel),rejected:\(reason),,,,,,,,,,")
+            continue
+        }
+        read += 1
+
+        // Lossless round-trip on the native stored pixels (uncompressed, single
+        // frame, 8/16-bit container). Encapsulated or odd-size buffers are
+        // recorded as not-applicable rather than forced.
+        var rt = "n/a"
+        let bps = dicom.bitsAllocated <= 8 ? 1 : 2
+        let expect = dicom.width * dicom.height * dicom.samplesPerPixel * bps
+        if !dicom.isEncapsulated && dicom.pixelData.count >= expect && (dicom.samplesPerPixel == 1 || dicom.samplesPerPixel == 3) {
+            let src = Array(dicom.pixelData.prefix(expect))
+            let fmt: JLIPixelFormat = bps == 1 ? .uint8 : .uint16
+            let model: JLIColorModel = dicom.samplesPerPixel == 3 ? .rgb : .grayscale
+            var cfg = JLIEncoderConfiguration(lossless: true)
+            cfg.losslessPrecision = dicom.bitsStored <= 8 ? 8 : (dicom.bitsStored <= 12 ? 12 : 16)
+            cfg.chromaSubsampling = .yuv444
+            rtTested += 1
+            do {
+                let img = try JLIImage(width: dicom.width, height: dicom.height,
+                                       pixelFormat: fmt, colorModel: model, data: src,
+                                       isSigned: dicom.pixelRepresentation == 1)
+                let dec = try JLIDecoder().decode(from: JLIEncoder().encode(img, configuration: cfg))
+                if dec.data == src { rt = "exact"; rtExact += 1 } else { rt = "MISMATCH" }
+            } catch {
+                rt = "error:\("\(error)".replacingOccurrences(of: ",", with: ";"))"
+            }
+        }
+
+        lines.append("\(rel),ok,\(dicom.width),\(dicom.height),\(dicom.bitsAllocated),"
+            + "\(dicom.bitsStored),\(dicom.pixelRepresentation == 1),\(dicom.photometric),"
+            + "\(dicom.samplesPerPixel),\(dicom.transferSyntax),\(dicom.isEncapsulated),\(rt)")
+    }
+
+    let csv = lines.joined(separator: "\n") + "\n"
+    let summary = "signed-stats: \(files.count) files — \(read) read, \(rejected) rejected; "
+        + "lossless round-trip \(rtExact)/\(rtTested) bit-exact\n"
+    if let out = out {
+        try? csv.write(toFile: out, atomically: true, encoding: .utf8)
+        FileHandle.standardError.write((summary + "→ \(out)\n").data(using: .utf8)!)
+    } else {
+        print(csv, terminator: "")
+        FileHandle.standardError.write(summary.data(using: .utf8)!)
+    }
+}
+
 // MARK: - WS4 RD-matrix (quality-per-byte: which JLISwift config should be default?)
 
 /// Encodes a config matrix × quality sweep on the DICOM corpus + a synthetic
@@ -238,6 +318,12 @@ if let i = CommandLine.arguments.firstIndex(of: "--batch"), i + 1 < CommandLine.
     let out = (i + 2 < CommandLine.arguments.count && !CommandLine.arguments[i + 2].hasPrefix("--"))
         ? CommandLine.arguments[i + 2] : nil
     runBatch(dir: dir, out: out); exit(0)
+}
+if let i = CommandLine.arguments.firstIndex(of: "--signed-stats"), i + 1 < CommandLine.arguments.count {
+    let dir = CommandLine.arguments[i + 1]
+    let out = (i + 2 < CommandLine.arguments.count && !CommandLine.arguments[i + 2].hasPrefix("--"))
+        ? CommandLine.arguments[i + 2] : nil
+    runSignedStats(dir: dir, out: out); exit(0)
 }
 if let i = CommandLine.arguments.firstIndex(of: "--profile-encode") {
     let size = (i + 1 < CommandLine.arguments.count ? Int(CommandLine.arguments[i + 1]) : nil) ?? 1024
