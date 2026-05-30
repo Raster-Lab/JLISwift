@@ -62,12 +62,14 @@ WS-A's opt-in field has landed; the remaining 0.3.0 work is **WS-B** (ship the s
 
 *Result: full suite 208 tests / 24 suites green; the medical evidence trail is CI-gated and self-documenting.*
 
-### WS-M2 — Codec gaps that matter for real clinical data (P1)
-- [ ] **YBR_FULL / YBR_FULL_422 → RGB** color conversion on read (the encapsulated US files decode but land in YBR; render path should produce correct RGB). Cross-validate vs a reference.
-- [ ] **Multi-frame** (NumberOfFrames) — at minimum read frame 0 correctly for both native and encapsulated; ideally expose all frames. (US/XA cine.)
-- [ ] **MONOCHROME1 end-to-end test** — the inversion is applied on render; add an explicit round-trip assertion (audit noted it was untested).
-- [ ] **Encapsulated multi-fragment + Basic Offset Table** — currently single-frame, first-frame; honor the BOT for frame boundaries.
-- [ ] *(stretch)* **Signed lossy** done right — instead of rejecting, offset-to-unsigned + record the offset so signed CT can use the DCT path losslessly-reversibly. Only if a use case needs it.
+### WS-M2 — Codec gaps that matter for real clinical data (P1) ✅ mostly DONE
+- [x] **YBR_FULL / YBR_FULL_422 → RGB** color conversion on read — `render8bit` was treating any 3-sample 8-bit image as RGB and copying YCbCr through verbatim (wrong color). Now YBR variants are converted with the full-range BT.601 inverse after de-interleave; true RGB still passes through. (`DICOMColorTests`; encapsulated US decodes to correct RGB.)
+- [x] **Multi-frame** (NumberOfFrames) — parsed; reader exposes `numberOfFrames` + `frame(_:)`, bounds native `pixelData` to frame 0, clamps a lying count. **Verified on real 47- and 64-frame US cine**: each frame splits + decodes independently to 1016×758 RGB.
+- [x] **MONOCHROME1 end-to-end test** — explicit assertion that MONO1 renders as the photometric inverse of MONO2 at the endpoints + per-pel (`DICOMColorTests`).
+- [x] **Encapsulated multi-fragment + Basic Offset Table** — reader maps fragments→frames via the BOT (one-fragment-per-frame fallback, full concat for single frame); writer emits a populated BOT with one fragment per frame (`writeEncapsulatedFrames`). (`DICOMWriterTests`.)
+- [ ] *(stretch, deferred)* **Signed lossy** done right — instead of rejecting, offset-to-unsigned + record the offset so signed CT can use the DCT path losslessly-reversibly. Only if a use case needs it.
+
+*Result: full suite 215 tests / 25 suites green; single-frame real files still bit-exact (no regression). The one remaining WS-M2 item is the optional signed-lossy stretch.*
 
 ### WS-M3 — Regulatory scaffolding (P1 — draft, not certification)
 - [ ] **Intended-use / indications statement** + **software safety classification** rationale (codec feeding a diagnostic viewer ≈ IEC 62304 Class B/C) — a short controlled doc.
@@ -81,7 +83,7 @@ WS-A's opt-in field has landed; the remaining 0.3.0 work is **WS-B** (ship the s
 - [ ] **WS-D** — float32 decode output; DocC catalog; **WS-E** — re-evaluate XYB with the mature perceptual machinery.
 
 ### Sequencing & gate
-**WS-M1 first** (evidence is the highest-leverage medical work and gates everything else), then **WS-M2** (real-data codec gaps) and **WS-M3** (regulatory drafts) in parallel, with **WS-M4** as fill-in. **Tag `v0.4.0`** once WS-M1 is CI-green and WS-M2's YBR + multi-frame land. Discipline unchanged: bit-exact gates, fuzz throws, CI-green, every claim corpus-measured.
+**WS-M1 ✅ + WS-M2 ✅ landed.** Next is **WS-M3** (regulatory drafts — DICOM Conformance Statement, ISO 14971 risk-file skeleton, intended-use/classification, traceability seed), with **WS-M4** as fill-in. **Tag `v0.4.0`** is now unblocked on the code side (WS-M1 CI-green + WS-M2 YBR + multi-frame landed) — it can ship once WS-M3's draft docs are in or be tagged now with WS-M3 following in a doc-only point release. Discipline unchanged: bit-exact gates, fuzz throws, CI-green, every claim corpus-measured.
 
 **Hard line:** nothing in 0.4.0 lets us market "medical grade," "medical device," "for diagnostic use," or "clinically validated." Those need the full QMS + risk file + CDSCO/FDA pathway (**0.5.0+**, a multi-quarter process program). See [MEDICAL_GRADE_ASSESSMENT.md](MEDICAL_GRADE_ASSESSMENT.md) §10 for safe vs unsafe claim language.
 
