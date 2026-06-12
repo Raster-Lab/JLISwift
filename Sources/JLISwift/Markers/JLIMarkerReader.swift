@@ -447,39 +447,31 @@ struct MarkerReader {
     /// `BitReader` is the single point that performs unstuffing, and the decoder consumes
     /// restart markers explicitly at known MCU boundaries via `skipRestartMarker`.
     private mutating func readEntropyData() throws -> [UInt8] {
-        var entropyData = [UInt8]()
-
-        while offset < data.count {
-            let byte = data[offset]
-
-            if byte == 0xFF {
-                // Need at least one more byte to disambiguate stuffing vs marker.
-                guard offset + 1 < data.count else { break }
-                let next = data[offset + 1]
-                if next == 0x00 {
-                    // Stuffed data byte — keep both bytes; BitReader will unstuff.
-                    entropyData.append(0xFF)
-                    entropyData.append(0x00)
-                    offset += 2
-                } else if next >= 0xD0 && next <= 0xD7 {
-                    // RST0–RST7 — restart marker. Include in the entropy buffer;
-                    // the decoder will call `BitReader.skipRestartMarker` at the
-                    // matching MCU boundary to consume it and reset DC predictors.
-                    entropyData.append(0xFF)
-                    entropyData.append(next)
-                    offset += 2
+        // The segment is a verbatim slice (stuffed pairs and RST markers stay
+        // in; `BitReader` unstuffs), so only the END needs finding: scan to the
+        // first 0xFF whose successor is neither 0x00 (stuffing) nor 0xD0–0xD7
+        // (RST0–7) — or a trailing lone 0xFF — leaving `offset` on the 0xFF for
+        // nextMarker(). One slice copy replaces the previous per-byte append
+        // (which paid an Array uniqueness check + growth per byte and showed up
+        // at ~7-9% of a whole lossless decode).
+        let n = data.count
+        let start = offset
+        var pos = offset
+        data.withUnsafeBufferPointer { buf in
+            let p = buf.baseAddress!
+            while pos < n {
+                if p[pos] != 0xFF { pos += 1; continue }
+                guard pos + 1 < n else { break }              // trailing lone 0xFF
+                let next = p[pos + 1]
+                if next == 0x00 || (next >= 0xD0 && next <= 0xD7) {
+                    pos += 2                                   // stuffing / restart
                 } else {
-                    // Other real marker (EOI, DHT, etc.) — stop and leave offset
-                    // on the 0xFF so nextMarker() can pick it up.
-                    break
+                    break                                      // real marker — stop
                 }
-            } else {
-                entropyData.append(byte)
-                offset += 1
             }
         }
-
-        return entropyData
+        offset = pos
+        return Array(data[start..<pos])
     }
 
     // MARK: - Byte Reading Primitives
