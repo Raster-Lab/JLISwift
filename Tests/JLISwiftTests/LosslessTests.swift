@@ -197,4 +197,40 @@ struct LosslessTests {
             }
         }
     }
+
+    @Test("Parallel lossless residual sweep is byte-identical to serial and round-trips")
+    func parallelLosslessEncodeDeterministic() throws {
+        // 640×512 16-bit grayscale = 327,680 samples — over the
+        // losslessParallelMinSamples gate (65,536), so the residual sweep fans
+        // out across cores. Races surface as non-identical output across runs;
+        // the forced-serial encode proves the fan-out itself is byte-identical.
+        let w = 640, h = 512
+        var data = [UInt8](repeating: 0, count: w * h * 2)
+        var state: UInt32 = 0x5EED
+        for i in 0..<(w * h) {
+            state = state &* 1664525 &+ 1013904223
+            let ramp = ((i % w) + (i / w)) * 65535 / (w + h - 2)
+            let v = UInt16(clamping: ramp + Int(state >> 24) - 128)
+            data[i * 2] = UInt8(v & 0xFF); data[i * 2 + 1] = UInt8(v >> 8)
+        }
+        let img = try JLIImage(width: w, height: h, pixelFormat: .uint16,
+                               colorModel: .grayscale, data: data)
+        var cfg = JLIEncoderConfiguration(lossless: true)
+        cfg.losslessPrecision = 16
+
+        let parallel = try JLIEncoder().encode(img, configuration: cfg)
+        for _ in 0..<2 {
+            #expect(try JLIEncoder().encode(img, configuration: cfg) == parallel,
+                    "parallel lossless encode is not deterministic (possible data race)")
+        }
+
+        let savedGate = JLIEncoder.losslessParallelMinSamples
+        JLIEncoder.losslessParallelMinSamples = .max
+        defer { JLIEncoder.losslessParallelMinSamples = savedGate }
+        let serial = try JLIEncoder().encode(img, configuration: cfg)
+        #expect(serial == parallel, "parallel lossless encode differs from serial")
+
+        let dec = try JLIDecoder().decode(from: parallel)
+        #expect(dec.data == data, "lossless round-trip not bit-exact")
+    }
 }

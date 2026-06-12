@@ -604,52 +604,68 @@ public struct JLIEncoder: Sendable {
         let srcCC = image.colorModel.componentCount     // 1 / 3 / 4 (alpha ignored)
         let bps = precision == 8 ? 1 : 2
 
-        // De-interleave source into per-component planes (Int32 samples). For
+        let count = w * h
+        // De-interleave source into flat per-component planes (plane c at offset
+        // c·count; raw + uninitialized — every element is written below). For
         // near-lossless (pt > 0) the point transform discards the low `pt` bits up
         // front; prediction, differencing and reconstruction then all operate in
         // this shifted domain, and the decoder shifts back by `pt` on output.
-        var planes = [[Int32]](repeating: [Int32](repeating: 0, count: w * h), count: nc)
-        for i in 0..<(w * h) {
+        let planeStore = UnsafeMutableBufferPointer<Int32>.allocate(capacity: count * nc)
+        defer { planeStore.deallocate() }
+        let planeBase = planeStore.baseAddress!
+        image.data.withUnsafeBufferPointer { src in
+            let s = src.baseAddress!
             for c in 0..<nc {
-                let s = (i * srcCC + c) * bps
-                let sample = bps == 1 ? Int32(image.data[s])
-                    : Int32(UInt16(image.data[s]) | (UInt16(image.data[s + 1]) << 8))
-                planes[c][i] = sample >> pt
+                let p = planeBase + c * count
+                if bps == 1 {
+                    for i in 0..<count { p[i] = Int32(s[i * srcCC + c]) >> pt }
+                } else {
+                    for i in 0..<count {
+                        let o = (i * srcCC + c) * 2
+                        p[i] = Int32(UInt16(s[o]) | (UInt16(s[o + 1]) << 8)) >> pt
+                    }
+                }
             }
         }
 
         let half = Int32(1 << (precision - 1 - pt))
-        func predict(_ p: [Int32], _ x: Int, _ y: Int) -> Int32 {
-            let row = y * w
-            if x == 0 { return y == 0 ? half : p[row - w] }                   // Rb / initial
-            if y == 0 { return p[row + x - 1] }                               // Ra
-            let ra = p[row + x - 1], rb = p[row - w + x], rc = p[row - w + x - 1]
-            switch predictor {
-            case 1: return ra
-            case 2: return rb
-            case 3: return rc
-            case 4: return ra + rb - rc
-            case 5: return ra + ((rb - rc) >> 1)
-            case 6: return rb + ((ra - rc) >> 1)
-            default: return (ra + rb) >> 1                                     // 7
-            }
-        }
-        // Difference modulo 2^16, mapped to signed 16-bit (T.81); −32768 ⇒ cat 16.
-        func diffOf(_ p: [Int32], _ x: Int, _ y: Int) -> Int32 {
-            var d = (p[y * w + x] - predict(p, x, y)) & 0xFFFF
-            if d >= 32768 { d -= 65536 }
-            return d
-        }
 
-        // Counting pass → one optimal DC table shared across components.
-        var dcFreq = [Int](repeating: 0, count: 256)
-        for y in 0..<h {
-            for x in 0..<w {
-                for c in 0..<nc {
-                    let d = diffOf(planes[c], x, y)
-                    dcFreq[d == -32768 ? 16 : HuffmanEncoder.category(for: d)] += 1
+        // Residuals are memoized once, in emit order (diffs[(y·w + x)·nc + c]),
+        // instead of running the predictor sweep twice (counting pass + emit
+        // pass). Each residual depends only on the *source plane* rows y/y−1 —
+        // never on other residuals — so the sweep parallelizes across row
+        // chunks with a per-worker histogram; integer addition commutes, so the
+        // merged histogram (and therefore the Huffman table and the bitstream)
+        // is identical to a serial pass.
+        let diffStore = UnsafeMutableBufferPointer<Int32>.allocate(capacity: count * nc)
+        defer { diffStore.deallocate() }
+        let diffBase = diffStore.baseAddress!
+
+        let chunks = min(ProcessInfo.processInfo.activeProcessorCount,
+                         max(1, (count * nc) / JLIEncoder.losslessParallelMinSamples))
+        var dcFreq: [Int]
+        if chunks <= 1 {
+            dcFreq = JLIEncoder.losslessResiduals(
+                rows: 0..<h, width: w, nc: nc, count: count,
+                predictor: predictor, half: half, planes: planeBase, diffs: diffBase)
+        } else {
+            let span = (h + chunks - 1) / chunks
+            var partials = [[Int]](repeating: [], count: chunks)
+            partials.withUnsafeMutableBufferPointer { buf in
+                let ptrs = LosslessPtrs(planes: planeBase, diffs: diffBase,
+                                        partials: buf.baseAddress!)
+                DispatchQueue.concurrentPerform(iterations: chunks) { ci in
+                    let lo = ci * span, hi = min(lo + span, h)
+                    ptrs.partials[ci] = lo < hi
+                        ? JLIEncoder.losslessResiduals(
+                            rows: lo..<hi, width: w, nc: nc, count: count,
+                            predictor: predictor, half: half,
+                            planes: ptrs.planes, diffs: ptrs.diffs)
+                        : [Int](repeating: 0, count: 256)
                 }
             }
+            dcFreq = [Int](repeating: 0, count: 256)
+            for part in partials { for i in 0..<256 { dcFreq[i] += part[i] } }
         }
         let table = HuffmanTableBuilder.build(
             frequencies: dcFreq, fallback: StandardHuffmanTables.dcLuminance)
@@ -670,24 +686,22 @@ public struct JLIEncoder: Sendable {
                     spectralStart: predictor, spectralEnd: 0,
                     successiveApproxHigh: 0, successiveApproxLow: pt)
 
+        // Emit reads the memoized residuals as one flat sweep (they are already
+        // in interleaved emit order) — no predictor recompute.
         var bw = BitWriter(estimatedMaxSize: w * h * nc * 2 + 1024)
-        for y in 0..<h {
-            for x in 0..<w {
-                for c in 0..<nc {
-                    let d = diffOf(planes[c], x, y)
-                    let cat = d == -32768 ? 16 : HuffmanEncoder.category(for: d)
-                    let e = table.encodingTable[cat]
-                    if cat > 0 && cat < 16 {
-                        // Code + magnitude bits in one call — identical bitstream
-                        // (appending n then m bits == appending the n+m-bit
-                        // concatenation), half the writer calls. ≤ 16+15 = 31 bits.
-                        let fused = (UInt32(e.code) << cat)
-                            | HuffmanEncoder.additionalBits(for: d, category: cat)
-                        bw.writeBits(fused, count: Int(e.length) + cat)
-                    } else {
-                        bw.writeBits(UInt32(e.code), count: Int(e.length))
-                    }
-                }
+        for i in 0..<(count * nc) {
+            let d = diffBase[i]
+            let cat = d == -32768 ? 16 : HuffmanEncoder.category(for: d)
+            let e = table.encodingTable[cat]
+            if cat > 0 && cat < 16 {
+                // Code + magnitude bits in one call — identical bitstream
+                // (appending n then m bits == appending the n+m-bit
+                // concatenation), half the writer calls. ≤ 16+15 = 31 bits.
+                let fused = (UInt32(e.code) << cat)
+                    | HuffmanEncoder.additionalBits(for: d, category: cat)
+                bw.writeBits(fused, count: Int(e.length) + cat)
+            } else {
+                bw.writeBits(UInt32(e.code), count: Int(e.length))
             }
         }
         bw.flush()
@@ -1060,6 +1074,72 @@ public struct JLIEncoder: Sendable {
     private struct TrellisPtrs: @unchecked Sendable {
         let dct: UnsafePointer<Float>
         let quant: UnsafeMutablePointer<Int32>
+    }
+
+    /// Minimum interleaved sample count (`w·h·nc`) before the lossless residual
+    /// sweep fans out across cores; below this the dispatch overhead wins.
+    /// A var (not let) only so the serial/parallel byte-equality test can force
+    /// the serial path (`= .max`) and prove the fan-out is byte-identical; no
+    /// production code mutates it.
+    nonisolated(unsafe) static var losslessParallelMinSamples = 1 << 16
+
+    /// `@unchecked Sendable` carrier for the lossless residual sweep: workers
+    /// read disjoint row ranges of `planes` (plus one shared read-only border
+    /// row each) and write disjoint row ranges of `diffs` and their own
+    /// `partials` slot.
+    private struct LosslessPtrs: @unchecked Sendable {
+        let planes: UnsafePointer<Int32>
+        let diffs: UnsafeMutablePointer<Int32>
+        let partials: UnsafeMutablePointer<[Int]>
+    }
+
+    /// Computes the T.81 Annex H residual for every sample of `rows` into
+    /// `diffs` (interleaved emit order: `(y·w + x)·nc + c`) and returns the
+    /// 256-bin category histogram for those rows. Residuals depend only on the
+    /// source `planes` (prediction reads rows y and y−1), never on other
+    /// residuals, so any row partition yields identical values — and category
+    /// counts commute, so summed partial histograms equal a serial count.
+    private static func losslessResiduals(
+        rows: Range<Int>, width w: Int, nc: Int, count: Int,
+        predictor: Int, half: Int32,
+        planes: UnsafePointer<Int32>, diffs: UnsafeMutablePointer<Int32>
+    ) -> [Int] {
+        var freq = [Int](repeating: 0, count: 256)
+        freq.withUnsafeMutableBufferPointer { fb in
+            let f = fb.baseAddress!
+            for y in rows {
+                let row = y * w, prevRow = row - w
+                for x in 0..<w {
+                    for c in 0..<nc {
+                        let p = planes + c * count
+                        let px: Int32
+                        if x == 0 {
+                            px = y == 0 ? half : p[prevRow]                    // Rb / initial
+                        } else if y == 0 {
+                            px = p[row + x - 1]                                // Ra
+                        } else {
+                            let ra = p[row + x - 1], rb = p[prevRow + x], rc = p[prevRow + x - 1]
+                            switch predictor {
+                            case 1: px = ra
+                            case 2: px = rb
+                            case 3: px = rc
+                            case 4: px = ra + rb - rc
+                            case 5: px = ra + ((rb - rc) >> 1)
+                            case 6: px = rb + ((ra - rc) >> 1)
+                            default: px = (ra + rb) >> 1                       // 7
+                            }
+                        }
+                        // Difference modulo 2^16, mapped to signed 16-bit (T.81);
+                        // −32768 ⇒ category 16.
+                        var d = (p[row + x] - px) & 0xFFFF
+                        if d >= 32768 { d -= 65536 }
+                        diffs[(row + x) * nc + c] = d
+                        f[d == -32768 ? 16 : HuffmanEncoder.category(for: d)] += 1
+                    }
+                }
+            }
+        }
+        return freq
     }
 
     /// `@unchecked Sendable` carrier for the per-worker partial AC histograms;
