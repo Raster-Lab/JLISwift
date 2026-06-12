@@ -176,6 +176,12 @@ struct ProgressiveDecoder {
         _ reader: inout BitReader, comp c: Int, table: HuffmanTable,
         ss: Int, se: Int, al: Int
     ) throws {
+        // Steal the component buffer for the pass (leaving a placeholder) so
+        // per-coefficient access is a direct subscript on a uniquely-referenced
+        // local — no outer-array traffic or COW uniqueness checks per touch.
+        var comp = coeffs[c]
+        coeffs[c] = []
+        defer { coeffs[c] = comp }
         var eobrun = 0
         var unit = 0
         var rstIndex = 0
@@ -206,7 +212,7 @@ struct ProgressiveDecoder {
                     } else {
                         k += r
                         if k > se { break }
-                        coeffs[c][bidx * 64 + k] = try receiveExtend(&reader, s) << al
+                        comp[bidx * 64 + k] = try receiveExtend(&reader, s) << al
                         k += 1
                     }
                 }
@@ -221,6 +227,12 @@ struct ProgressiveDecoder {
         _ reader: inout BitReader, comp c: Int, table: HuffmanTable,
         ss: Int, se: Int, al: Int
     ) throws {
+        // Steal the component buffer for the pass (leaving a placeholder) so
+        // per-coefficient access is a direct subscript on a uniquely-referenced
+        // local — no outer-array traffic or COW uniqueness checks per touch.
+        var comp = coeffs[c]
+        coeffs[c] = []
+        defer { coeffs[c] = comp }
         let p1: Int32 = 1 << al
         let m1: Int32 = (-1) << al
         var eobrun = 0
@@ -260,9 +272,9 @@ struct ProgressiveDecoder {
                         // bits to nonzeros encountered along the way.
                         while k <= se {
                             let idx = blockBase + k
-                            if coeffs[c][idx] != 0 {
-                                if try reader.readBit() == 1 && (coeffs[c][idx] & p1) == 0 {
-                                    coeffs[c][idx] += coeffs[c][idx] >= 0 ? p1 : m1
+                            if comp[idx] != 0 {
+                                if try reader.readBit() == 1 && (comp[idx] & p1) == 0 {
+                                    comp[idx] += comp[idx] >= 0 ? p1 : m1
                                 }
                             } else {
                                 if r == 0 { break }
@@ -271,7 +283,7 @@ struct ProgressiveDecoder {
                             k += 1
                         }
                         if s != 0 && k <= se {
-                            coeffs[c][blockBase + k] = newVal  // place newly-nonzero coef
+                            comp[blockBase + k] = newVal  // place newly-nonzero coef
                         }
                         k += 1
                     }
@@ -280,9 +292,9 @@ struct ProgressiveDecoder {
                     // Apply correction bits to all remaining nonzeros in the band.
                     while k <= se {
                         let idx = blockBase + k
-                        if coeffs[c][idx] != 0 {
-                            if try reader.readBit() == 1 && (coeffs[c][idx] & p1) == 0 {
-                                coeffs[c][idx] += coeffs[c][idx] >= 0 ? p1 : m1
+                        if comp[idx] != 0 {
+                            if try reader.readBit() == 1 && (comp[idx] & p1) == 0 {
+                                comp[idx] += comp[idx] >= 0 ? p1 : m1
                             }
                         }
                         k += 1
