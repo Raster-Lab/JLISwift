@@ -239,9 +239,32 @@ enum AccelerateDSP {
 
         data.withUnsafeBufferPointer { buf in
             let base = buf.baseAddress!
-            vDSP_vfltu8(base + 0, stride, r, 1, n)
-            vDSP_vfltu8(base + 1, stride, g, 1, n)
-            vDSP_vfltu8(base + 2, stride, b, 1, n)
+            if componentCount == 3 {
+                // Strided vDSP_vfltu8 gathers were the single biggest encode
+                // stage (~18%): one byte per 3 touched per pass, 3 passes. Split
+                // instead into a vImage byte deinterleave (pure data movement)
+                // + 3 stride-1 widening passes — same conversion per element,
+                // byte-identical output, sequential memory traffic.
+                let planes = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: pixelCount * 3)
+                defer { planes.deallocate() }
+                let pr = planes.baseAddress!, pg = pr + pixelCount, pb = pr + pixelCount * 2
+                var src = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: base), height: 1,
+                                        width: vImagePixelCount(pixelCount), rowBytes: pixelCount * 3)
+                var dR = vImage_Buffer(data: pr, height: 1,
+                                       width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
+                var dG = vImage_Buffer(data: pg, height: 1,
+                                       width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
+                var dB = vImage_Buffer(data: pb, height: 1,
+                                       width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
+                vImageConvert_RGB888toPlanar8(&src, &dR, &dG, &dB, vImage_Flags(kvImageNoFlags))
+                vDSP_vfltu8(pr, 1, r, 1, n)
+                vDSP_vfltu8(pg, 1, g, 1, n)
+                vDSP_vfltu8(pb, 1, b, 1, n)
+            } else {
+                vDSP_vfltu8(base + 0, stride, r, 1, n)
+                vDSP_vfltu8(base + 1, stride, g, 1, n)
+                vDSP_vfltu8(base + 2, stride, b, 1, n)
+            }
         }
 
         var center: Float = 128.0
@@ -312,12 +335,29 @@ enum AccelerateDSP {
                     vDSP_vclip(g, 1, &lo, &hi, g, 1, n)
                     vDSP_vclip(b, 1, &lo, &hi, b, 1, n)
                     // vDSP_vfixru8 rounds to nearest (ties to even), matching the
-                    // scalar `Int(value.rounded())` semantics.
+                    // scalar `Int(value.rounded())` semantics. The strided form of
+                    // these three stores was the single biggest decode stage
+                    // (~31% wall, half of it in vfixru8 alone): each pass touched
+                    // one byte in 3 across the whole image. Convert stride-1 into
+                    // contiguous byte planes instead (identical rounding — only
+                    // the addressing changes) and interleave with one vImage pass
+                    // (pure byte movement) → byte-identical output.
+                    let planes = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: pixelCount * 3)
+                    defer { planes.deallocate() }
+                    let pr = planes.baseAddress!, pg = pr + pixelCount, pb = pr + pixelCount * 2
+                    vDSP_vfixru8(r, 1, pr, 1, n)
+                    vDSP_vfixru8(g, 1, pg, 1, n)
+                    vDSP_vfixru8(b, 1, pb, 1, n)
                     return [UInt8](unsafeUninitializedCapacity: pixelCount * 3) { buf, cnt in
-                        let base = buf.baseAddress!
-                        vDSP_vfixru8(r, 1, base + 0, stride, n)
-                        vDSP_vfixru8(g, 1, base + 1, stride, n)
-                        vDSP_vfixru8(b, 1, base + 2, stride, n)
+                        var sR = vImage_Buffer(data: pr, height: 1,
+                                               width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
+                        var sG = vImage_Buffer(data: pg, height: 1,
+                                               width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
+                        var sB = vImage_Buffer(data: pb, height: 1,
+                                               width: vImagePixelCount(pixelCount), rowBytes: pixelCount)
+                        var dst = vImage_Buffer(data: buf.baseAddress!, height: 1,
+                                                width: vImagePixelCount(pixelCount), rowBytes: pixelCount * 3)
+                        vImageConvert_Planar8toRGB888(&sR, &sG, &sB, &dst, vImage_Flags(kvImageNoFlags))
                         cnt = pixelCount * 3
                     }
                 }
