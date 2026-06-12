@@ -257,15 +257,12 @@ enum HuffmanEncoder {
     /// Returns the category (number of bits) needed to represent a value.
     ///
     /// Category 0 = value 0, category 1 = -1..1, category 2 = -3..-2, 2..3, etc.
+    /// One CLZ instruction: `bits(|v|) = 32 − clz(|v|)` (and `clz(0) = 32` makes
+    /// the zero case fall out naturally). Identical to counting shifts — this
+    /// runs twice per sample in lossless encode, so it must be branch-free.
+    @inline(__always)
     static func category(for value: Int32) -> Int {
-        if value == 0 { return 0 }
-        var absVal = abs(Int(value))
-        var cat = 0
-        while absVal > 0 {
-            cat += 1
-            absVal >>= 1
-        }
-        return cat
+        Int(32 - value.magnitude.leadingZeroBitCount)
     }
 
     /// Returns the additional bits to encode after the Huffman category code.
@@ -308,12 +305,22 @@ enum HuffmanEncoder {
     }
 
     /// Encodes a DC coefficient difference using the given Huffman table.
+    ///
+    /// The Huffman code and its appended magnitude bits are emitted in a single
+    /// `writeBits` call: appending `n` bits then `m` bits MSB-first produces the
+    /// same bit sequence as appending the `n+m`-bit concatenation, and stuffing/
+    /// padding are pure functions of the bit sequence — so the stream is
+    /// byte-identical while halving the mutating-writer calls. Max combined
+    /// width is 16 (code) + 15 (DCT magnitude) = 31 bits, within `writeBits`'
+    /// 32-bit value.
     static func encodeDC(_ diff: Int32, table: HuffmanTable, writer: inout BitWriter) {
         let cat = category(for: diff)
         let entry = table.encodingTable[cat]
-        writer.writeBits(UInt32(entry.code), count: Int(entry.length))
         if cat > 0 {
-            writer.writeBits(additionalBits(for: diff, category: cat), count: cat)
+            let fused = (UInt32(entry.code) << cat) | additionalBits(for: diff, category: cat)
+            writer.writeBits(fused, count: Int(entry.length) + cat)
+        } else {
+            writer.writeBits(UInt32(entry.code), count: Int(entry.length))
         }
     }
 
@@ -335,8 +342,10 @@ enum HuffmanEncoder {
                 let cat = category(for: value)
                 let symbol = (zeroRun << 4) | cat
                 let entry = table.encodingTable[symbol]
-                writer.writeBits(UInt32(entry.code), count: Int(entry.length))
-                writer.writeBits(additionalBits(for: value, category: cat), count: cat)
+                // Code + magnitude bits in one call (see encodeDC) — identical
+                // bitstream, half the writer calls. AC cat ≤ 14 → ≤ 30 bits.
+                let fused = (UInt32(entry.code) << cat) | additionalBits(for: value, category: cat)
+                writer.writeBits(fused, count: Int(entry.length) + cat)
                 zeroRun = 0
             }
         }

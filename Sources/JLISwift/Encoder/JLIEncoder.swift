@@ -677,9 +677,15 @@ public struct JLIEncoder: Sendable {
                     let d = diffOf(planes[c], x, y)
                     let cat = d == -32768 ? 16 : HuffmanEncoder.category(for: d)
                     let e = table.encodingTable[cat]
-                    bw.writeBits(UInt32(e.code), count: Int(e.length))
                     if cat > 0 && cat < 16 {
-                        bw.writeBits(HuffmanEncoder.additionalBits(for: d, category: cat), count: cat)
+                        // Code + magnitude bits in one call — identical bitstream
+                        // (appending n then m bits == appending the n+m-bit
+                        // concatenation), half the writer calls. ≤ 16+15 = 31 bits.
+                        let fused = (UInt32(e.code) << cat)
+                            | HuffmanEncoder.additionalBits(for: d, category: cat)
+                        bw.writeBits(fused, count: Int(e.length) + cat)
+                    } else {
+                        bw.writeBits(UInt32(e.code), count: Int(e.length))
                     }
                 }
             }
