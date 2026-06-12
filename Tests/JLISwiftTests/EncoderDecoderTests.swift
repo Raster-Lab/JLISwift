@@ -618,6 +618,39 @@ struct EncoderDecoderTests {
         #expect(dec.data.count == w * h * 3)
     }
 
+    @Test("Parallel Step-7 reconstruction is bit-identical to serial (large image)")
+    func parallelDecodeDeterministic() throws {
+        // 1024×1023 4:2:0 → 16384 luma blocks (over the reconstruct gate of
+        // 2048), with a non-multiple-of-8 height so edge blocks exercise the
+        // partial-row scatter. Decode races surface as non-identical pixels
+        // across runs; the forced-serial decode proves the block-range fan-out
+        // itself is bit-identical.
+        let w = 1024, h = 1023
+        var rgb = [UInt8](repeating: 0, count: w * h * 3)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 3
+                rgb[i] = UInt8((30 + x / 5 + (y & 7)) & 0xFF)
+                rgb[i + 1] = UInt8((60 + y / 4 + (x & 3)) & 0xFF)
+                rgb[i + 2] = UInt8((90 + (x + y) / 9) & 0xFF)
+            }
+        }
+        let img = try JLIImage(width: w, height: h, pixelFormat: .uint8, colorModel: .rgb, data: rgb)
+        let jpeg = try JLIEncoder().encode(img, configuration: .default)
+
+        let parallel = try JLIDecoder().decode(from: jpeg)
+        for _ in 0..<2 {
+            #expect(try JLIDecoder().decode(from: jpeg).data == parallel.data,
+                    "parallel decode is not deterministic (possible data race)")
+        }
+
+        let savedGate = JLIDecoder.reconstructMinBlocksPerChunk
+        JLIDecoder.reconstructMinBlocksPerChunk = .max
+        defer { JLIDecoder.reconstructMinBlocksPerChunk = savedGate }
+        let serial = try JLIDecoder().decode(from: jpeg)
+        #expect(serial.data == parallel.data, "parallel decode differs from serial")
+    }
+
     // MARK: - Distance parameter
 
     @Test("Larger distance produces smaller output (monotonic rate)")

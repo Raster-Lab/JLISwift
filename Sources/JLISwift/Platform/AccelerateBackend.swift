@@ -206,6 +206,60 @@ enum AccelerateDSP {
         vDSP_mmul(scratch, 1, dctMatrix, 1, &output, 1, eightN, 8, 8)
     }
 
+    /// Inverse DCT on `n` blocks straight from entropy-order coefficients: the
+    /// pack pass gathers `Float(zigzag[64i + invZig[8r+c]]) · quantTable[8r+c]`
+    /// directly into the GEMM layout, fusing the inverse-zigzag scatter and the
+    /// dequantize pass (and their two intermediate buffers) into the data
+    /// movement that had to happen anyway. Per element this is the exact same
+    /// Int32→Float convert and IEEE multiply at the exact same value the
+    /// separate passes performed, so the GEMM input — and the whole decode —
+    /// is bit-identical.
+    ///
+    /// Pointer-based so disjoint block ranges can run on separate cores;
+    /// `output` and `scratch` must each hold `64·n` floats for *this* range.
+    static func inverseDCTBatchDequantized(
+        zigzag: UnsafePointer<Int32>, quantTable qt: UnsafePointer<Float>,
+        output: UnsafeMutablePointer<Float>, scratch: UnsafeMutablePointer<Float>,
+        blockCount n: Int
+    ) {
+        guard n > 0 else { return }
+        let eightN = vDSP_Length(8 * n)
+        let rowStride = 8 * n
+
+        // Fused pack: M[r·8N + 8i + c] = dequant(zigzag coefficient at natural
+        // position 8r+c) — replaces inverse-zigzag scatter + dequant sweep + pack
+        // memcpy with one pass.
+        Quantization.inverseZigzagOrder.withUnsafeBufferPointer { izb in
+            let invZig = izb.baseAddress!
+            for i in 0..<n {
+                let src = zigzag + 64 * i
+                for r in 0..<8 {
+                    let dst = scratch + r * rowStride + 8 * i
+                    let qrow = qt + 8 * r
+                    let zrow = invZig + 8 * r
+                    for c in 0..<8 {
+                        dst[c] = Float(src[zrow[c]]) * qrow[c]
+                    }
+                }
+            }
+        }
+
+        // Pass 1: T = Cᵀ · M (8 × 8N).
+        vDSP_mmul(dctMatrixTransposed, 1, scratch, 1, output, 1, 8, eightN, 8)
+
+        // Rearrange T → V (8N × 8 per-block-contig).
+        for i in 0..<n {
+            for r in 0..<8 {
+                memcpy(scratch + 64 * i + 8 * r,
+                       output + r * rowStride + 8 * i,
+                       8 * MemoryLayout<Float>.size)
+            }
+        }
+
+        // Pass 2: f = V · C (8N × 8). Output per-block-contig.
+        vDSP_mmul(scratch, 1, dctMatrix, 1, output, 1, eightN, 8, 8)
+    }
+
     // MARK: - Image-level color conversion (BT.601)
 
     /// Converts interleaved RGB(A) bytes to planar Y/Cb/Cr Float planes via vDSP.
@@ -303,7 +357,6 @@ enum AccelerateDSP {
     ) -> [UInt8] {
         precondition(y.count == pixelCount && cb.count == pixelCount && cr.count == pixelCount)
         let n = vDSP_Length(pixelCount)
-        let stride = vDSP_Stride(3)
 
         // One uninitialized scratch block (cbS, crS, r, g, b) + raw pointers so
         // the in-place `g` updates don't trip copy-on-write, and no buffer is

@@ -209,25 +209,36 @@ public struct JLIDecoder: Sendable {
             }
         }
 
-        // Step 7: Per component — batched inverse-zigzag + dequantize + IDCT +
-        // level-shift up, then write each block into its plane.
+        // Step 7: Per component — fused dequantize+IDCT straight from the
+        // entropy-order coefficients, level-shift, then write each block into
+        // its (exactly component-sized) plane — in parallel across block ranges
+        // for large images (every 8×8 block writes a disjoint plane tile, so
+        // any block partition is race-free and the result is bit-identical to
+        // a serial pass; gated by ``reconstructMinBlocksPerChunk`` and proven
+        // by `parallelDecodeDeterministic`).
         var componentPlanes = [(data: [Float], width: Int, height: Int)]()
         let maxBlockCount = componentDimensions.map { $0.blocksH * $0.blocksV }.max() ?? 0
         // Reused per-component scratch; each component fully writes its used
         // region before reading it, so skip the zero-fill (a per-decode bzero).
         let scratchN = maxBlockCount * 64
-        var natural = [Int32](unsafeUninitializedCapacity: scratchN) { _, c in c = scratchN }
-        var dctBuf = [Float](unsafeUninitializedCapacity: scratchN) { _, c in c = scratchN }
         var pixelsBuf = [Float](unsafeUninitializedCapacity: scratchN) { _, c in c = scratchN }
         var idctScratch = [Float](unsafeUninitializedCapacity: scratchN) { _, c in c = scratchN }
+        // The separate inverse-zigzag + dequantize buffers are only needed by
+        // the 1/2 & 1/4 box-average preview path; the full-resolution path
+        // fuses both into the IDCT pack pass.
+        let needsNatural = scale == 2 || scale == 4
+        var natural = [Int32](unsafeUninitializedCapacity: needsNatural ? scratchN : 0) {
+            _, c in c = needsNatural ? scratchN : 0
+        }
+        var dctBuf = [Float](unsafeUninitializedCapacity: needsNatural ? scratchN : 0) {
+            _, c in c = needsNatural ? scratchN : 0
+        }
 
         for compIdx in 0..<numComponents {
             let comp = components[compIdx]
             let blocksH = componentDimensions[compIdx].blocksH
             let blocksV = componentDimensions[compIdx].blocksV
             let blockCount = blocksH * blocksV
-            let planeWidth = blocksH * 8
-            let planeHeight = blocksV * 8
             let qtF = quantTables[comp.quantTableIndex].map { Float($0) }
 
             let compWidth = (frame.width * comp.horizontalSampling + hMaxSampling - 1) / hMaxSampling
@@ -261,28 +272,27 @@ public struct JLIDecoder: Sendable {
                 continue
             }
 
-            // Inverse zigzag every block: out[block*64 + zigzagOrder[i]] = in[block*64 + i].
-            let zigzag = Quantization.zigzagOrder
-            componentZigzag[compIdx].withUnsafeBufferPointer { srcBuf in
-                natural.withUnsafeMutableBufferPointer { dstBuf in
-                    let src = srcBuf.baseAddress!
-                    let dst = dstBuf.baseAddress!
-                    for b in 0..<blockCount {
-                        let base = b * 64
-                        for i in 0..<64 { dst[base + zigzag[i]] = src[base + i] }
-                    }
-                }
-            }
-
-            AccelerateDSP.dequantizeBatch(
-                natural, table: qtF, into: &dctBuf, blockCount: blockCount
-            )
-
             // 1/2 & 1/4 box-average path: each 8×8 block reduces to a bs×bs tile
             // (bs = 8/scale) whose samples are the exact means of the scale×scale
             // source-pixel boxes, formed straight from the coefficients via the
             // separable A·F·Aᵀ contraction (A = ``boxAverageMatrix``). No IDCT.
+            // This preview path keeps the separate inverse-zigzag + dequantize
+            // passes (the contraction reads natural-order coefficients).
             if scale == 2 || scale == 4 {
+                let zigzag = Quantization.zigzagOrder
+                componentZigzag[compIdx].withUnsafeBufferPointer { srcBuf in
+                    natural.withUnsafeMutableBufferPointer { dstBuf in
+                        let src = srcBuf.baseAddress!
+                        let dst = dstBuf.baseAddress!
+                        for b in 0..<blockCount {
+                            let base = b * 64
+                            for i in 0..<64 { dst[base + zigzag[i]] = src[base + i] }
+                        }
+                    }
+                }
+                AccelerateDSP.dequantizeBatch(
+                    natural, table: qtF, into: &dctBuf, blockCount: blockCount
+                )
                 let bs = 8 / scale
                 let a = Self.boxAverageMatrix(scale: scale)        // bs×8, row-major
                 let pw = blocksH * bs, ph = blocksV * bs
@@ -335,56 +345,49 @@ public struct JLIDecoder: Sendable {
                 continue
             }
 
-            AccelerateDSP.inverseDCTBatch(
-                dctBuf, into: &pixelsBuf, scratch: &idctScratch, blockCount: blockCount
-            )
-
-            // Level shift +2^(P-1) + clamp [0, 2^P-1] over the whole batched
-            // buffer. 128/255 for 8-bit, 2048/4095 for 12-bit.
-            var center = Float(1 << (frame.precision - 1))
-            var lo: Float = 0.0, hi = Float((1 << frame.precision) - 1)
-            let n = vDSP_Length(blockCount * 64)
-            vDSP_vsadd(pixelsBuf, 1, &center, &pixelsBuf, 1, n)
-            vDSP_vclip(pixelsBuf, 1, &lo, &hi, &pixelsBuf, 1, n)
-
-            var plane = [Float](repeating: 0, count: planeWidth * planeHeight)
-            pixelsBuf.withUnsafeBufferPointer { srcBuf in
-                plane.withUnsafeMutableBufferPointer { dstBuf in
-                    let src = srcBuf.baseAddress!
-                    let dst = dstBuf.baseAddress!
-                    for b in 0..<blockCount {
-                        let blockX = b % blocksH
-                        let blockY = b / blocksH
-                        let startX = blockX * 8
-                        let startY = blockY * 8
-                        let blockBase = b * 64
-                        for y in 0..<8 {
-                            let py = startY + y
-                            if py >= planeHeight { break }
-                            let rowBase = py * planeWidth
-                            let srcRow = blockBase + y * 8
-                            for x in 0..<8 {
-                                let px = startX + x
-                                if px >= planeWidth { break }
-                                dst[rowBase + px] = src[srcRow + x]
+            // Full-resolution path: fused dequant+IDCT per block range, scattered
+            // straight into an exactly component-sized plane (no padded plane,
+            // no trim copy — edge blocks write only their in-bounds rows/columns,
+            // and every in-bounds pixel belongs to some block, so the
+            // uninitialized plane is fully covered). All scratch is block-indexed,
+            // so parallel workers slice disjoint subranges of the SAME buffers.
+            var plane = [Float](unsafeUninitializedCapacity: compWidth * compHeight) {
+                _, c in c = compWidth * compHeight
+            }
+            let chunks = min(ProcessInfo.processInfo.activeProcessorCount,
+                             max(1, blockCount / JLIDecoder.reconstructMinBlocksPerChunk))
+            componentZigzag[compIdx].withUnsafeBufferPointer { zzb in
+                qtF.withUnsafeBufferPointer { qtb in
+                    pixelsBuf.withUnsafeMutableBufferPointer { pxb in
+                        idctScratch.withUnsafeMutableBufferPointer { scb in
+                            plane.withUnsafeMutableBufferPointer { plb in
+                                let ptrs = ReconstructPtrs(
+                                    zz: zzb.baseAddress!, qt: qtb.baseAddress!,
+                                    px: pxb.baseAddress!, scratch: scb.baseAddress!,
+                                    plane: plb.baseAddress!)
+                                if chunks <= 1 {
+                                    JLIDecoder.reconstructBlocks(
+                                        0..<blockCount, ptrs: ptrs, blocksH: blocksH,
+                                        compWidth: compWidth, compHeight: compHeight,
+                                        precision: frame.precision)
+                                } else {
+                                    let span = (blockCount + chunks - 1) / chunks
+                                    DispatchQueue.concurrentPerform(iterations: chunks) { c in
+                                        let lo = c * span, hi = min(lo + span, blockCount)
+                                        if lo < hi {
+                                            JLIDecoder.reconstructBlocks(
+                                                lo..<hi, ptrs: ptrs, blocksH: blocksH,
+                                                compWidth: compWidth, compHeight: compHeight,
+                                                precision: frame.precision)
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
-
-            // Trim to actual component dimensions (computed at the loop top).
-            if planeWidth != compWidth || planeHeight != compHeight {
-                var trimmed = [Float](repeating: 0, count: compWidth * compHeight)
-                for y in 0..<compHeight {
-                    for x in 0..<compWidth {
-                        trimmed[y * compWidth + x] = plane[y * planeWidth + x]
-                    }
-                }
-                componentPlanes.append((trimmed, compWidth, compHeight))
-            } else {
-                componentPlanes.append((plane, planeWidth, planeHeight))
-            }
+            componentPlanes.append((plane, compWidth, compHeight))
         }
 
         // Step 8: Chroma upsample and color convert. Output dimensions are the
@@ -650,6 +653,69 @@ public struct JLIDecoder: Sendable {
                             pixelFormat: configuration.outputPixelFormat ?? .uint16,
                             colorModel: model, data: bytes,
                             iccProfile: iccProfile, exif: exif)
+    }
+
+    /// Minimum block count before Step-7 reconstruction fans out across cores
+    /// (16384 blocks ≈ a 1024×1024 luma plane; below a few thousand the
+    /// dispatch overhead wins). A var (not let) only so the serial/parallel
+    /// equality test can force the serial path; no production code mutates it.
+    nonisolated(unsafe) static var reconstructMinBlocksPerChunk = 2048
+
+    /// `@unchecked Sendable` carrier for parallel Step-7 reconstruction: each
+    /// worker reads the shared `zz`/`qt` and writes only its own block range's
+    /// subranges of `px`/`scratch` plus the disjoint plane tiles of its blocks.
+    private struct ReconstructPtrs: @unchecked Sendable {
+        let zz: UnsafePointer<Int32>
+        let qt: UnsafePointer<Float>
+        let px: UnsafeMutablePointer<Float>
+        let scratch: UnsafeMutablePointer<Float>
+        let plane: UnsafeMutablePointer<Float>
+    }
+
+    /// Reconstructs `blocks` of one component: fused dequant+IDCT (bit-identical
+    /// to the separate passes — same convert and multiply per element), level
+    /// shift + clamp, then a per-row memcpy scatter of each block's in-bounds
+    /// region into the component-sized plane. Callable on any disjoint block
+    /// range; block tiles never overlap, so partitioning is race-free.
+    private static func reconstructBlocks(
+        _ blocks: Range<Int>, ptrs: ReconstructPtrs, blocksH: Int,
+        compWidth: Int, compHeight: Int, precision: Int
+    ) {
+        let m = blocks.count
+        guard m > 0 else { return }
+        let base = blocks.lowerBound
+        let px = ptrs.px + base * 64
+        AccelerateDSP.inverseDCTBatchDequantized(
+            zigzag: ptrs.zz + base * 64, quantTable: ptrs.qt,
+            output: px, scratch: ptrs.scratch + base * 64, blockCount: m)
+
+        // Level shift +2^(P-1) + clamp [0, 2^P-1] — 128/255 for 8-bit,
+        // 2048/4095 for 12-bit; per-element ops, so chunking changes nothing.
+        var center = Float(1 << (precision - 1))
+        var lo: Float = 0.0, hi = Float((1 << precision) - 1)
+        let n = vDSP_Length(m * 64)
+        vDSP_vsadd(px, 1, &center, px, 1, n)
+        vDSP_vclip(px, 1, &lo, &hi, px, 1, n)
+
+        for bi in 0..<m {
+            let b = base + bi
+            let startX = (b % blocksH) * 8
+            let startY = (b / blocksH) * 8
+            // MCU geometry can pad subsampled components past the component's
+            // actual extent (e.g. a 4:2:0 luma grid rounded up to even blocks on
+            // a tiny image) — such blocks decode but land entirely outside the
+            // exact-size plane and must be skipped, never clamped negative.
+            guard startX < compWidth, startY < compHeight else { continue }
+            let blockBase = bi * 64
+            let runW = min(8, compWidth - startX)
+            for y in 0..<8 {
+                let py = startY + y
+                if py >= compHeight { break }
+                memcpy(ptrs.plane + py * compWidth + startX,
+                       px + blockBase + y * 8,
+                       runW * MemoryLayout<Float>.size)
+            }
+        }
     }
 
     /// Grayscale (single-component) lossless scan — the clinical hot loop.
