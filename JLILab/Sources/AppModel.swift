@@ -42,6 +42,10 @@ final class AppModel {
     var windowCenter: Double = 0
     var windowWidth: Double = 1
 
+    /// Selected frame of a multi-frame (cine) source — all frames are decoded
+    /// once at load, so scrubbing just swaps buffers. 0 for single-frame sources.
+    var frameIndex: Int = 0
+
     // Derived, rendered on the main actor from Sendable buffers.
     var originalImage: CGImage?
     var decodedImage: CGImage?
@@ -68,6 +72,7 @@ final class AppModel {
         do {
             let src = try ImageLoader.load(url: url)
             source = src
+            frameIndex = 0
             windowCenter = src.defaultCenter
             windowWidth = max(1, src.defaultWidth)
             if src.gray12 == nil && settings.mode == .gray12 { settings.mode = .rgb8 }
@@ -126,6 +131,20 @@ final class AppModel {
         let windowed = src.windowed(center: windowCenter, width: windowWidth)
         source = windowed
         originalImage = Render.cgImage(rgb8: windowed.rgb8, width: windowed.width, height: windowed.height)
+        run()
+    }
+
+    /// Shows frame `index` of a multi-frame (cine) source: swaps in the frame
+    /// decoded at load and re-runs the round-trip on it. No-op for single-frame
+    /// sources.
+    func selectFrame(_ index: Int) {
+        guard var src = source, !src.frames.isEmpty else { return }
+        let i = max(0, min(src.frames.count - 1, index))
+        guard i != frameIndex else { return }
+        frameIndex = i
+        src.rgb8 = src.frames[i]
+        source = src
+        originalImage = Render.cgImage(rgb8: src.rgb8, width: src.width, height: src.height)
         run()
     }
 

@@ -108,8 +108,9 @@ enum RoundTripEngine {
     // MARK: - Helpers
 
     /// Renders a decoded image to an 8-bit RGB buffer of exactly w·h·3, handling
-    /// 8-bit RGB/grayscale and 16-bit (12-bit-range) grayscale outputs.
-    private static func decodedToRGB8(_ img: JLIImage, width w: Int, height h: Int) -> [UInt8] {
+    /// 8-bit RGB/grayscale and 16-bit (12-bit-range) grayscale outputs. Also used
+    /// by `ImageLoader` to display decoded encapsulated-DICOM frames.
+    static func decodedToRGB8(_ img: JLIImage, width w: Int, height h: Int) -> [UInt8] {
         var out = [UInt8](repeating: 0, count: w * h * 3)
         let pixels = w * h
         switch (img.colorModel, img.pixelFormat) {

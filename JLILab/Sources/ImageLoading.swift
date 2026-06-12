@@ -5,6 +5,7 @@ import Foundation
 import CoreGraphics
 import ImageIO
 import JLIDICOM
+import JLISwift
 
 /// A loaded source image normalized for the round-trip lab.
 ///
@@ -19,31 +20,39 @@ struct SourceImage: Sendable {
     var gray12: [UInt16]?
     var kind: String
 
-    /// Retained for monochrome DICOM sources so the viewer can re-window
-    /// interactively without re-reading the file. `nil` for standard images.
-    var dicom: DICOMImage?
+    /// Retained for monochrome native DICOM sources so the viewer can re-window
+    /// interactively from the renderer's cached intensities — one decode at load,
+    /// none per slider tick. `nil` for standard images, RGB DICOM, and
+    /// encapsulated DICOM (whose samples never pass the native intensity path).
+    var renderer: DICOMWindowRenderer?
     /// Full real-world intensity range (slider bounds) and the file's default
-    /// window/level. Meaningful only when `dicom != nil`.
+    /// window/level. Meaningful only when `renderer != nil`.
     var intensityRange: ClosedRange<Double> = 0...0
     var defaultCenter: Double = 0
     var defaultWidth: Double = 0
+    /// All frames of a multi-frame (cine) source, pre-rendered to 8-bit RGB at
+    /// load. Empty for single-frame sources; `rgb8` holds the selected frame.
+    var frames: [[UInt8]] = []
+    /// CT stores Hounsfield units, so the named bone/lung/soft-tissue presets are
+    /// only clinically meaningful here. Captured at load — the parsed DICOMImage
+    /// (and its full pixel buffer) is not retained.
+    var isCT: Bool = false
 
     var hasHighBitDepth: Bool { gray12 != nil }
-    /// Whether interactive window/level applies (monochrome DICOM only).
-    var isWindowable: Bool { dicom != nil }
-    /// CT stores Hounsfield units, so the named bone/lung/soft-tissue presets are
-    /// only clinically meaningful here.
-    var isCT: Bool { dicom?.modality == "CT" }
+    /// Whether interactive window/level applies (monochrome native DICOM only).
+    var isWindowable: Bool { renderer != nil }
 
     /// Returns a copy re-rendered at the given window/level. The window is baked
     /// into both the 8-bit and 12-bit buffers (matching how the source was first
-    /// loaded), so the codec re-encodes exactly what the viewer shows. No-op for
-    /// non-DICOM sources.
+    /// loaded), so the codec re-encodes exactly what the viewer shows. The
+    /// renderer maps its cached intensities — pixel-identical to the DICOMImage
+    /// render methods, without their per-call full pixel-buffer decode. No-op
+    /// for non-windowable sources.
     func windowed(center: Double, width: Double) -> SourceImage {
-        guard let d = dicom else { return self }
+        guard let r = renderer else { return self }
         var copy = self
-        copy.rgb8 = d.render8bit(windowCenter: center, windowWidth: width)
-        if gray12 != nil { copy.gray12 = d.render12bit(windowCenter: center, windowWidth: width) }
+        copy.rgb8 = r.render8bit(windowCenter: center, windowWidth: width)
+        if gray12 != nil { copy.gray12 = r.render12bit(windowCenter: center, windowWidth: width) }
         return copy
     }
 }
@@ -84,21 +93,69 @@ enum ImageLoader {
 
     private static func loadDICOM(_ bytes: [UInt8], url: URL) throws -> SourceImage {
         let dicom = try DICOMReader.read(bytes)
-        let rgb8 = dicom.toRGB8()
-        let mono = dicom.photometric.hasPrefix("MONOCHROME")
-        let gray12: [UInt16]? = mono ? dicom.toGray12() : nil
-        let kind = "DICOM · \(dicom.bitsStored)-bit \(dicom.photometric) · \(dicom.width)×\(dicom.height)"
-        let (lo, hi) = dicom.intensityRange()
-        let (center, width) = dicom.windowDefaults()
-        return SourceImage(
-            url: url, width: dicom.width, height: dicom.height,
-            rgb8: rgb8, gray12: gray12, kind: kind,
+        if dicom.isEncapsulated { return try loadEncapsulatedDICOM(dicom, url: url) }
+
+        var kind = "DICOM · \(dicom.bitsStored)-bit \(dicom.photometric) · \(dicom.width)×\(dicom.height)"
+        // Native multi-frame: the window/level pipeline (and so the lab) works on
+        // frame 0; say so rather than silently dropping the rest.
+        if dicom.numberOfFrames > 1 { kind += " · frame 1 of \(dicom.numberOfFrames)" }
+
+        guard dicom.photometric.hasPrefix("MONOCHROME") else {
             // Window/level only applies to monochrome sources; leave RGB DICOM
             // un-windowable so the sidebar sliders stay hidden.
-            dicom: mono ? dicom : nil,
+            return SourceImage(url: url, width: dicom.width, height: dicom.height,
+                               rgb8: dicom.toRGB8(), gray12: nil, kind: kind)
+        }
+
+        // One renderer per loaded image: a single intensity decode (bitsStored
+        // masking, sign extension, Modality LUT) backs both initial renders below
+        // and every subsequent window/level slider tick.
+        let renderer = DICOMWindowRenderer(dicom)
+        let (lo, hi) = renderer.intensityRange()
+        // The file's stored window when present, else centered on the full range —
+        // the same fallback as DICOMImage.windowDefaults(), fed from the
+        // renderer's cached intensities instead of another full decode.
+        let center: Double, width: Double
+        if let wc = dicom.windowCenter, let ww = dicom.windowWidth, ww > 0 {
+            (center, width) = (wc, ww)
+        } else {
+            (center, width) = ((lo + hi) / 2, max(1, hi - lo))
+        }
+        return SourceImage(
+            url: url, width: dicom.width, height: dicom.height,
+            rgb8: renderer.render8bit(windowCenter: center, windowWidth: width),
+            gray12: renderer.render12bit(windowCenter: center, windowWidth: width),
+            kind: kind,
+            renderer: renderer,
             intensityRange: lo...max(lo, hi),
-            defaultCenter: center, defaultWidth: width
+            defaultCenter: center, defaultWidth: width,
+            isCT: dicom.modality == "CT"
         )
+    }
+
+    /// Encapsulated DICOM: `pixelData` holds compressed JPEG streams, so the
+    /// native render helpers don't apply — every frame is decoded with the codec
+    /// instead, concurrently (near-linear for multi-frame cine), and the decoded
+    /// samples are displayed directly. Window/level needs the native intensity
+    /// pipeline, so these sources are not windowable.
+    private static func loadEncapsulatedDICOM(_ dicom: DICOMImage, url: URL) throws -> SourceImage {
+        let w = dicom.width, h = dicom.height
+        let frames: [[UInt8]]
+        do {
+            frames = try dicom.decodeFramesConcurrently {
+                RoundTripEngine.decodedToRGB8(try JLIDecoder().decode(from: $0), width: w, height: h)
+            }
+        } catch let e as DICOMError {
+            throw e
+        } catch {
+            throw LoadError.decodeFailed(
+                "Could not decode encapsulated frame of \(url.lastPathComponent): \(AppModel.describe(error))")
+        }
+        guard let first = frames.first else { throw DICOMError.invalidPixelData }
+        var kind = "DICOM · \(dicom.bitsStored)-bit \(dicom.photometric) (encapsulated) · \(w)×\(h)"
+        if frames.count > 1 { kind += " · \(frames.count) frames" }
+        return SourceImage(url: url, width: w, height: h, rgb8: first, gray12: nil,
+                           kind: kind, frames: frames.count > 1 ? frames : [])
     }
 
     private static func loadStandard(_ data: Data, url: URL) throws -> SourceImage {

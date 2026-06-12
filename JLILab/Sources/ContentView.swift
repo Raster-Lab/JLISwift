@@ -105,6 +105,7 @@ private struct ControlsSidebar: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
+                frameSection
                 windowSection
                 pipelineSection
                 if model.settings.lossless { losslessSection } else { lossySection }
@@ -112,6 +113,31 @@ private struct ControlsSidebar: View {
                 MetricsView(model: model)
             }
             .padding(16)
+        }
+    }
+
+    /// Frame scrubber — shown only for multi-frame (cine) sources, whose frames
+    /// were all decoded concurrently at load. Scrubbing swaps the pre-decoded
+    /// frame in and re-runs the round-trip on it; nothing is re-decoded.
+    @ViewBuilder private var frameSection: some View {
+        if let src = model.source, src.frames.count > 1 {
+            GroupBox("Cine Frame") {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("Frame")
+                        Spacer()
+                        Text("\(model.frameIndex + 1) / \(src.frames.count)")
+                            .monospacedDigit().foregroundStyle(.secondary)
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { Double(model.frameIndex) },
+                            set: { model.selectFrame(Int($0.rounded())) }
+                        ),
+                        in: 0...Double(src.frames.count - 1), step: 1
+                    )
+                }.padding(6)
+            }
         }
     }
 

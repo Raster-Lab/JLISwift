@@ -2,6 +2,7 @@
 // Copyright 2024 Raster Lab. All rights reserved.
 
 import Accelerate
+import Foundation
 
 /// The jpegli-compatible JPEG decoder.
 ///
