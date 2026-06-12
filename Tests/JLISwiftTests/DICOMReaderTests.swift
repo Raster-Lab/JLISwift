@@ -304,4 +304,64 @@ struct DICOMReaderTests {
         #expect(Array(rgb[0..<3]) == [10, 20, 30])
         #expect(Array(rgb[3..<6]) == [11, 21, 31])
     }
+
+    // MARK: - DICOMWindowRenderer (cached interactive window/level)
+
+    @Test("DICOMWindowRenderer matches DICOMImage rendering pixel-exactly")
+    func windowRendererMatchesImageRender() throws {
+        // 16-bit signed, bitsStored 12, CT-like rescale (intercept −1024), and a
+        // sample spread that exercises below-window clamp, in-window ramp, and
+        // above-window clamp — the vDSP chain must reproduce the scalar path
+        // byte-for-byte across every branch (incl. MONOCHROME1 inversion).
+        for photometric in ["MONOCHROME2", "MONOCHROME1"] {
+            var b = DICOMBuilder()
+            b.us(0x0028, 0x0002, 1)
+            b.str(0x0028, 0x0004, "CS", photometric)
+            b.us(0x0028, 0x0010, 8)                    // Rows
+            b.us(0x0028, 0x0011, 8)                    // Columns
+            b.us(0x0028, 0x0100, 16)                   // BitsAllocated
+            b.us(0x0028, 0x0101, 12)                   // BitsStored
+            b.us(0x0028, 0x0103, 1)                    // signed
+            b.str(0x0028, 0x1052, "DS", "-1024")       // RescaleIntercept
+            b.str(0x0028, 0x1053, "DS", "1")           // RescaleSlope
+            var samples = [UInt16]()
+            for i in 0..<64 { samples.append(UInt16(i * 64) & 0x0FFF) }
+            b.ow(0x7FE0, 0x0010, samples)
+
+            let img = try DICOMReader.read(b.bytes())
+            let renderer = DICOMWindowRenderer(img)
+
+            let (lo, hi) = img.intensityRange()
+            let (rlo, rhi) = renderer.intensityRange()
+            #expect(lo == rlo && hi == rhi)
+
+            for (c, w) in [(0.0, 100.0), (40.0, 400.0), (-500.0, 2000.0), (1000.0, 1.0)] {
+                #expect(renderer.render8bit(windowCenter: c, windowWidth: w)
+                        == img.render8bit(windowCenter: c, windowWidth: w),
+                        "\(photometric) 8-bit window (\(c), \(w)) differs")
+                #expect(renderer.render12bit(windowCenter: c, windowWidth: w)
+                        == img.render12bit(windowCenter: c, windowWidth: w),
+                        "\(photometric) 12-bit window (\(c), \(w)) differs")
+            }
+        }
+    }
+
+    @Test("DICOMWindowRenderer passes 8-bit RGB through window-independently")
+    func windowRendererRGBPassthrough() throws {
+        var b = DICOMBuilder()
+        b.us(0x0028, 0x0002, 3)                   // SamplesPerPixel = 3
+        b.us(0x0028, 0x0006, 0)                   // PlanarConfiguration = 0
+        b.str(0x0028, 0x0004, "CS", "RGB")
+        b.us(0x0028, 0x0010, 1)
+        b.us(0x0028, 0x0011, 2)
+        b.us(0x0028, 0x0100, 8)
+        b.us(0x0028, 0x0101, 8)
+        b.us(0x0028, 0x0103, 0)
+        b.ob(0x7FE0, 0x0010, [10, 20, 30, 40, 50, 60])
+
+        let img = try DICOMReader.read(b.bytes())
+        let renderer = DICOMWindowRenderer(img)
+        #expect(renderer.render8bit(windowCenter: 1, windowWidth: 2) == img.toRGB8())
+        #expect(renderer.render8bit(windowCenter: 99, windowWidth: 7) == img.toRGB8())
+    }
 }

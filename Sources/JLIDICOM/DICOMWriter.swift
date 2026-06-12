@@ -200,6 +200,9 @@ public enum DICOMWriter {
 
     private static func assemble(meta: Dataset, dataset: Dataset) -> [UInt8] {
         var out = [UInt8](repeating: 0, count: 128)              // preamble
+        // One up-front reservation so the (pixel-payload-sized) dataset append
+        // is a single copy rather than repeated growth reallocations.
+        out.reserveCapacity(128 + 4 + 16 + meta.bytes.count + dataset.bytes.count)
         out += Array("DICM".utf8)
         // File Meta Information Group Length (0002,0000) UL = byte length of the
         // rest of group 0002, which must precede the meta elements.
@@ -256,6 +259,7 @@ private struct Dataset {
     }
     /// Long-form element (OB/OW/etc): VR + 2 reserved + 4-byte length.
     private mutating func long(_ g: UInt16, _ e: UInt16, _ vr: String, _ value: [UInt8]) {
+        bytes.reserveCapacity(bytes.count + 12 + value.count)
         tag(g, e); bytes += Array(vr.utf8); u16(0); u32(UInt32(value.count)); bytes += value
     }
 
@@ -283,20 +287,27 @@ private struct Dataset {
     /// multi-frame writes a populated BOT (offset of each frame's fragment item
     /// relative to the first fragment item) + one fragment per frame.
     mutating func encapsulatedPixelData(_ frames: [[UInt8]]) {
+        // Even-padded fragment lengths (per the standard) are computed inline —
+        // no re-materialized padded copies of every frame — and the whole
+        // structure is reserved up front so each compressed byte is appended once.
+        @inline(__always) func paddedCount(_ f: [UInt8]) -> Int { f.count + (f.count & 1) }
+        let totalPayload = frames.reduce(0) { $0 + paddedCount($1) }
+        bytes.reserveCapacity(bytes.count + 12 + 8 + frames.count * 12 + totalPayload + 8)
+
         tag(0x7FE0, 0x0010); bytes += Array("OB".utf8); u16(0); u32(0xFFFFFFFF)   // undefined length
-        // Pad each frame's fragment to even length per the standard.
-        let padded = frames.map { f -> [UInt8] in var v = f; if v.count % 2 != 0 { v.append(0x00) }; return v }
-        if padded.count <= 1 {
+        if frames.count <= 1 {
             tag(0xFFFE, 0xE000); u32(0)                                          // empty Basic Offset Table
         } else {
             // Basic Offset Table: 4 bytes per frame, offset of each fragment's
             // item header relative to the start of the first fragment item.
-            tag(0xFFFE, 0xE000); u32(UInt32(padded.count * 4))
+            tag(0xFFFE, 0xE000); u32(UInt32(frames.count * 4))
             var offset: UInt32 = 0
-            for f in padded { u32(offset); offset += UInt32(8 + f.count) }       // 8 = item tag+length
+            for f in frames { u32(offset); offset += UInt32(8 + paddedCount(f)) } // 8 = item tag+length
         }
-        for f in padded {
-            tag(0xFFFE, 0xE000); u32(UInt32(f.count)); bytes += f                // one fragment per frame
+        for f in frames {
+            tag(0xFFFE, 0xE000); u32(UInt32(paddedCount(f)))                      // one fragment per frame
+            bytes += f
+            if f.count % 2 != 0 { bytes.append(0x00) }                            // even-length pad
         }
         tag(0xFFFE, 0xE0DD); u32(0)                                             // Sequence Delimitation
     }

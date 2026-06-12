@@ -250,6 +250,51 @@ public struct DICOMImage: Sendable {
         return out
     }
 
+    /// Internal accessor so ``DICOMWindowRenderer`` can snapshot the same
+    /// intensity computation it would otherwise re-run per window change.
+    func decodeIntensitiesForRenderer() -> [Double] { decodeIntensities() }
+
+    /// Decodes every frame concurrently across cores and returns the results in
+    /// frame order — the series/cine throughput lever for multi-frame files.
+    /// Frames are independent compressed streams (encapsulated) or disjoint
+    /// native slices, so per-frame decoding carries **zero** identity risk: the
+    /// result equals `(0..<numberOfFrames).map { decode(frame($0)!) }` exactly,
+    /// just wall-clock faster (near-linear for JPEG-encapsulated cine).
+    ///
+    /// `decode` receives each frame's payload (compressed stream for
+    /// encapsulated images, raw samples for native) — pass e.g.
+    /// `{ try JLIDecoder().decode(from: $0) }`. The first error thrown by any
+    /// frame is rethrown; a missing frame payload throws `invalidPixelData`.
+    public func decodeFramesConcurrently<T: Sendable>(
+        _ decode: @Sendable ([UInt8]) throws -> T
+    ) throws -> [T] {
+        let n = numberOfFrames
+        guard n > 1 else {
+            guard let payload = frame(0) else { throw DICOMError.invalidPixelData }
+            return [try decode(payload)]
+        }
+        var results = [T?](repeating: nil, count: n)
+        var errors = [Error?](repeating: nil, count: n)
+        results.withUnsafeMutableBufferPointer { rb in
+            errors.withUnsafeMutableBufferPointer { eb in
+                let slots = FrameSlots<T>(results: rb.baseAddress!, errors: eb.baseAddress!)
+                DispatchQueue.concurrentPerform(iterations: n) { i in
+                    guard let payload = frame(i) else {
+                        slots.errors[i] = DICOMError.invalidPixelData
+                        return
+                    }
+                    do { slots.results[i] = try decode(payload) }
+                    catch { slots.errors[i] = error }
+                }
+            }
+        }
+        if let firstError = errors.compactMap({ $0 }).first { throw firstError }
+        return try results.map {
+            guard let r = $0 else { throw DICOMError.invalidPixelData }
+            return r
+        }
+    }
+
     /// True for the YCbCr-family photometric interpretations whose samples are
     /// luma/chroma, not RGB, and so need a color transform before display:
     /// `YBR_FULL` and `YBR_FULL_422` (full-range). (`YBR_ICT`/`YBR_RCT` are
@@ -273,6 +318,13 @@ public struct DICOMImage: Sendable {
         }
         return (clamp(r), clamp(g), clamp(b))
     }
+}
+
+/// `@unchecked Sendable` carrier for ``DICOMImage/decodeFramesConcurrently(_:)``:
+/// each worker writes only its own index in the two preallocated slot arrays.
+private struct FrameSlots<T>: @unchecked Sendable {
+    let results: UnsafeMutablePointer<T?>
+    let errors: UnsafeMutablePointer<Error?>
 }
 
 public enum DICOMError: Error, CustomStringConvertible {
@@ -366,9 +418,11 @@ public enum DICOMReader {
     static let tagItemDelim             = tag(0xFFFE, 0xE00D)
     static let tagSequenceDelim         = tag(0xFFFE, 0xE0DD)
 
-    /// Convenience: read and parse a DICOM file at `url`.
+    /// Convenience: read and parse a DICOM file at `url`. The file is memory-
+    /// mapped when safe, so a multi-GB study pages in as it is parsed instead of
+    /// being double-buffered (read buffer + byte array) up front.
     public static func read(contentsOf url: URL) throws -> DICOMImage {
-        try read([UInt8](Data(contentsOf: url)))
+        try read([UInt8](Data(contentsOf: url, options: [.mappedIfSafe])))
     }
 
     public static func read(_ data: [UInt8]) throws -> DICOMImage {
@@ -469,7 +523,8 @@ public enum DICOMReader {
                     // Map fragments → per-frame compressed streams; `pixelData`
                     // exposes frame 0 (the common single-image case unchanged).
                     let enc = try readEncapsulated(data, after: parsed.next)
-                    encapsulatedFrames = Self.encapsulatedFrames(enc, numberOfFrames: numberOfFrames)
+                    encapsulatedFrames = Self.encapsulatedFrames(
+                        enc, numberOfFrames: numberOfFrames, data: data)
                     pixelData = encapsulatedFrames.first ?? []
                 } else {
                     pixelData = Array(data[parsed.valueRange])
@@ -505,7 +560,12 @@ public enum DICOMReader {
             nativeAllFrames = pixelData
             // Bound the render buffer to frame 0; clamp the frame count to what the
             // data actually carries so a lying NumberOfFrames cannot over-promise.
-            pixelData = Array(pixelData.prefix(frameBytes))
+            // When the payload is exactly one frame (the dominant single-frame
+            // case) the slice-down is skipped, so pixelData and nativeAllFrames
+            // share one buffer instead of holding two copies of the pixels.
+            if pixelData.count > frameBytes {
+                pixelData = Array(pixelData.prefix(frameBytes))
+            }
             if numberOfFrames > 1 {
                 numberOfFrames = min(numberOfFrames, max(1, nativeAllFrames.count / frameBytes))
             }
@@ -650,7 +710,10 @@ public enum DICOMReader {
     /// payloads that follow.
     struct Encapsulated {
         var basicOffsetTable: [UInt32]      // frame offsets, or [] when the BOT is empty
-        var fragments: [[UInt8]]            // compressed fragment payloads, in order
+        /// Byte ranges of the compressed fragment payloads within the source
+        /// buffer, in order — ranges instead of materialized copies, so frame
+        /// assembly copies each compressed byte exactly once.
+        var fragmentRanges: [Range<Int>]
         var fragmentItemOffsets: [Int]      // byte offset of each fragment's *item header*
     }
 
@@ -660,7 +723,7 @@ public enum DICOMReader {
     private static func readEncapsulated(_ data: [UInt8], after start: Int) throws -> Encapsulated {
         var q = start
         var bot = [UInt32]()
-        var fragments = [[UInt8]]()
+        var fragmentRanges = [Range<Int>]()
         var itemOffsets = [Int]()
         var sawBasicOffsetTable = false
         while q + 8 <= data.count {
@@ -680,13 +743,14 @@ public enum DICOMReader {
                 var i = q
                 while i + 4 <= end { bot.append(readUInt32(data, i)); i += 4 }
             } else {
-                fragments.append(Array(data[q..<end]))
+                fragmentRanges.append(q..<end)
                 itemOffsets.append(itemHeader)
             }
             q = end
         }
-        guard !fragments.isEmpty else { throw DICOMError.missingPixelData }
-        return Encapsulated(basicOffsetTable: bot, fragments: fragments, fragmentItemOffsets: itemOffsets)
+        guard !fragmentRanges.isEmpty else { throw DICOMError.missingPixelData }
+        return Encapsulated(basicOffsetTable: bot, fragmentRanges: fragmentRanges,
+                            fragmentItemOffsets: itemOffsets)
     }
 
     /// Assembles the per-frame compressed streams from an encapsulated PixelData.
@@ -694,12 +758,21 @@ public enum DICOMReader {
     /// otherwise falls back to the common conventions: `numberOfFrames` fragments
     /// (one per frame) when the counts match, else all fragments concatenated as a
     /// single frame. Each returned element is one frame's complete JPEG stream.
-    static func encapsulatedFrames(_ enc: Encapsulated, numberOfFrames: Int) -> [[UInt8]] {
+    static func encapsulatedFrames(
+        _ enc: Encapsulated, numberOfFrames: Int, data: [UInt8]
+    ) -> [[UInt8]] {
         let n = max(1, numberOfFrames)
-        // Single frame, possibly split across fragments → concatenate.
-        if n == 1 { return [enc.fragments.flatMap { $0 }] }
+        // Single frame, possibly split across fragments → concatenate into one
+        // exactly-sized buffer (each compressed byte is copied once, from the
+        // source ranges).
+        if n == 1 {
+            var stream = [UInt8]()
+            stream.reserveCapacity(enc.fragmentRanges.reduce(0) { $0 + $1.count })
+            for r in enc.fragmentRanges { stream.append(contentsOf: data[r]) }
+            return [stream]
+        }
         // One fragment per frame — the overwhelmingly common multi-frame layout.
-        if enc.fragments.count == n { return enc.fragments }
+        if enc.fragmentRanges.count == n { return enc.fragmentRanges.map { Array(data[$0]) } }
         // Use the Basic Offset Table to group fragments into frames by the byte
         // offset of each frame's first fragment (relative to the first fragment
         // item). The fragment item offsets are absolute, so rebase them.
@@ -709,16 +782,21 @@ public enum DICOMReader {
             for f in 0..<n {
                 let lo = starts[f]
                 let hi = f + 1 < n ? starts[f + 1] : Int.max
-                var stream = [UInt8]()
+                var size = 0
                 for (idx, off) in enc.fragmentItemOffsets.enumerated() where off >= lo && off < hi {
-                    stream += enc.fragments[idx]
+                    size += enc.fragmentRanges[idx].count
+                }
+                var stream = [UInt8]()
+                stream.reserveCapacity(size)
+                for (idx, off) in enc.fragmentItemOffsets.enumerated() where off >= lo && off < hi {
+                    stream.append(contentsOf: data[enc.fragmentRanges[idx]])
                 }
                 frames.append(stream)
             }
             return frames
         }
         // Unknown mapping — expose each fragment as a frame (best effort).
-        return enc.fragments
+        return enc.fragmentRanges.map { Array(data[$0]) }
     }
 
     // MARK: - Value readers

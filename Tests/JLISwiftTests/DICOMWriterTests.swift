@@ -271,4 +271,51 @@ struct DICOMWriterTests {
         #expect(dicom.frame(1) == framePixels(w, h, frame: 1))
         #expect(dicom.frame(2) == nil)
     }
+
+    @Test("decodeFramesConcurrently equals the serial per-frame decode, in order")
+    func concurrentFrameDecodeMatchesSerial() throws {
+        // Encapsulated cine: every frame is an independent lossless JPEG, so the
+        // concurrent decode must produce exactly the serial result, frame order
+        // preserved. Run 3× as a race detector.
+        let w = 16, h = 16, frames = 12
+        var jpegs = [[UInt8]]()
+        var sources = [[UInt8]]()
+        for f in 0..<frames {
+            let src = framePixels(w, h, frame: f)
+            sources.append(src)
+            let img = try JLIImage(width: w, height: h, pixelFormat: .uint16,
+                                   colorModel: .grayscale, data: src)
+            var cfg = JLIEncoderConfiguration(lossless: true); cfg.losslessPrecision = 12
+            jpegs.append(try JLIEncoder().encode(img, configuration: cfg))
+        }
+        let module = DICOMWriter.PixelModule(rows: h, columns: w, bitsAllocated: 16,
+                                             bitsStored: 12, highBit: 11)
+        let file = try DICOMWriter.writeEncapsulatedFrames(
+            jpegFrames: jpegs, module: module, transferSyntax: DICOMWriter.jpegLosslessSV1)
+        let dicom = try DICOMReader.read(file)
+
+        let serial: [[UInt8]] = try (0..<frames).map {
+            try JLIDecoder().decode(from: try #require(dicom.frame($0))).data
+        }
+        for _ in 0..<3 {
+            let parallel = try dicom.decodeFramesConcurrently { try JLIDecoder().decode(from: $0).data }
+            #expect(parallel == serial, "concurrent decode differs from serial")
+        }
+        #expect(serial == sources, "decoded frames must be bit-exact")
+
+        // Native multi-frame: payloads are raw slices; identity passthrough must
+        // come back in frame order.
+        var all = [UInt8]()
+        for f in 0..<4 { all += framePixels(w, h, frame: f) }
+        let nativeModule = DICOMWriter.PixelModule(rows: h, columns: w, bitsAllocated: 16,
+                                                   bitsStored: 12, highBit: 11, numberOfFrames: 4)
+        let nativeDicom = try DICOMReader.read(try DICOMWriter.write(pixelData: all, module: nativeModule))
+        let nativeFrames = try nativeDicom.decodeFramesConcurrently { $0 }
+        #expect(nativeFrames == (0..<4).map { framePixels(w, h, frame: $0) })
+
+        // Error propagation: a throwing decode surfaces, not crashes.
+        #expect(throws: DICOMError.self) {
+            _ = try dicom.decodeFramesConcurrently { _ -> [UInt8] in throw DICOMError.invalidPixelData }
+        }
+    }
 }
