@@ -585,69 +585,162 @@ public struct JLIDecoder: Sendable {
         }
 
         var reader = BitReader(data: scan.entropyData)
-        var planes = [[Int32]](repeating: [Int32](repeating: 0, count: w * h), count: nc)
         let half = Int32(1 << (precision - 1 - pt))   // predictor for the very first sample
-        let mask: Int32 = 0xFFFF                       // T.81: differences are modulo 2^16
+        let count = w * h
 
-        for y in 0..<h {
-            let row = y * w
-            let prevRow = row - w
-            for x in 0..<w {
-                // Components are interleaved per sample (1×1 sampling).
-                for c in 0..<nc {
-                    let p = planes[c]
-                    let px: Int32
-                    if x == 0 {
-                        px = y == 0 ? half : p[prevRow]                // Rb (or initial)
-                    } else if y == 0 {
-                        px = p[row + x - 1]                            // Ra
-                    } else {
-                        let ra = p[row + x - 1], rb = p[prevRow + x], rc = p[prevRow + x - 1]
-                        switch predictor {
-                        case 1: px = ra
-                        case 2: px = rb
-                        case 3: px = rc
-                        case 4: px = ra + rb - rc
-                        case 5: px = ra + ((rb - rc) >> 1)
-                        case 6: px = rb + ((ra - rc) >> 1)
-                        default: px = (ra + rb) >> 1                   // 7
-                        }
-                    }
-                    let cat = Int(try HuffmanDecoder.decodeSymbol(from: &reader, table: tables[c]))
-                    let diff: Int32
-                    if cat == 0 { diff = 0 }
-                    else if cat == 16 { diff = -32768 }               // T.81 special case
-                    else { diff = try HuffmanDecoder.decodeValue(from: &reader, category: cat) }
-                    // Prediction & differencing happen entirely in the point-transformed
-                    // (Pt-right-shifted) domain; the inverse shift is applied at output.
-                    planes[c][row + x] = (px + diff) & mask
-                }
-            }
+        // One flat raw buffer holds all component planes (plane c at offset
+        // c·w·h): the previous nested-array form paid a retain/release plus an
+        // outer-array _modify and inner-buffer uniqueness check on EVERY sample
+        // — the dominant non-entropy cost of the clinical lossless path (and
+        // `let p = planes[c]` aliased the buffer being written, a latent
+        // full-plane-COW trap that only optimizer lifetime-shortening kept
+        // benign). Uninitialized is safe: prediction reads only previously
+        // written positions.
+        let store = UnsafeMutableBufferPointer<Int32>.allocate(capacity: count * nc)
+        defer { store.deallocate() }
+        let base = store.baseAddress!
+
+        // The scan workers are dedicated static functions (the same pattern as
+        // the encoder's `trellisBlocks`): a compact hot loop is its own
+        // optimization unit, so the entropy-decode chain stays within inlining
+        // range, and `reader` is passed `inout` end-to-end — never captured by
+        // a closure (a captured inout-mutated struct gets boxed with dynamic
+        // exclusivity checks on every access).
+        if nc == 1 {
+            try Self.losslessScanGray(base, width: w, height: h, predictor: predictor,
+                                      half: half, table: tables[0], reader: &reader)
+        } else {
+            try Self.losslessScanRGB(base, width: w, height: h, count: count,
+                                     predictor: predictor, half: half,
+                                     tables: tables, reader: &reader)
         }
 
         // Interleave planes → output. 1 component = grayscale; 3 = RGB (direct).
+        // Pointer loops over an uninitialized output buffer (every byte is
+        // written); the inverse point-transform shift and clamping semantics
+        // are unchanged.
         let model = configuration.outputColorModel ?? (nc == 1 ? .grayscale : .rgb)
-        let count = w * h
         if precision <= 8 {
-            var bytes = [UInt8](repeating: 0, count: count * nc)
-            for i in 0..<count { for c in 0..<nc { bytes[i * nc + c] = UInt8(clamping: Int(planes[c][i]) << pt) } }
+            var bytes = [UInt8](unsafeUninitializedCapacity: count * nc) { _, n in n = count * nc }
+            bytes.withUnsafeMutableBufferPointer { bp in
+                for c in 0..<nc {
+                    let src = base + c * count
+                    let dst = bp.baseAddress! + c
+                    for i in 0..<count { dst[i * nc] = UInt8(clamping: Int(src[i]) << pt) }
+                }
+            }
             return try JLIImage(width: w, height: h,
                                 pixelFormat: configuration.outputPixelFormat ?? .uint8,
                                 colorModel: model, data: bytes,
                                 iccProfile: iccProfile, exif: exif)
         }
-        var bytes = [UInt8](repeating: 0, count: count * nc * 2)
-        for i in 0..<count {
+        var bytes = [UInt8](unsafeUninitializedCapacity: count * nc * 2) { _, n in n = count * nc * 2 }
+        bytes.withUnsafeMutableBufferPointer { bp in
             for c in 0..<nc {
-                let v = UInt16(clamping: Int(planes[c][i]) << pt)
-                bytes[(i * nc + c) * 2] = UInt8(v & 0xFF)
-                bytes[(i * nc + c) * 2 + 1] = UInt8(v >> 8)
+                let src = base + c * count
+                let dst = bp.baseAddress! + c * 2
+                for i in 0..<count {
+                    let v = UInt16(clamping: Int(src[i]) << pt)
+                    dst[i * nc * 2] = UInt8(v & 0xFF)
+                    dst[i * nc * 2 + 1] = UInt8(v >> 8)
+                }
             }
         }
         return try JLIImage(width: w, height: h,
                             pixelFormat: configuration.outputPixelFormat ?? .uint16,
                             colorModel: model, data: bytes,
                             iccProfile: iccProfile, exif: exif)
+    }
+
+    /// Grayscale (single-component) lossless scan — the clinical hot loop.
+    /// Straight-line per-sample body: predict (edge cases first, then the
+    /// fixed-per-scan selector switch, which the branch predictor learns),
+    /// Huffman category + magnitude bits, accumulate modulo 2^16 (T.81) in the
+    /// point-transformed domain, write through the raw plane pointer.
+    private static func losslessScanGray(
+        _ p: UnsafeMutablePointer<Int32>, width w: Int, height h: Int,
+        predictor: Int, half: Int32, table: HuffmanTable, reader: inout BitReader
+    ) throws {
+        for y in 0..<h {
+            let row = y * w, prevRow = row - w
+            for x in 0..<w {
+                let px: Int32
+                if x == 0 {
+                    px = y == 0 ? half : p[prevRow]                    // Rb (or initial)
+                } else if y == 0 {
+                    px = p[row + x - 1]                                // Ra
+                } else {
+                    let ra = p[row + x - 1], rb = p[prevRow + x], rc = p[prevRow + x - 1]
+                    switch predictor {
+                    case 1: px = ra
+                    case 2: px = rb
+                    case 3: px = rc
+                    case 4: px = ra + rb - rc
+                    case 5: px = ra + ((rb - rc) >> 1)
+                    case 6: px = rb + ((ra - rc) >> 1)
+                    default: px = (ra + rb) >> 1                       // 7
+                    }
+                }
+                let cat = Int(try HuffmanDecoder.decodeSymbol(from: &reader, table: table))
+                let diff: Int32
+                if cat == 0 { diff = 0 }
+                else if cat == 16 { diff = -32768 }                    // T.81 special case
+                else { diff = try HuffmanDecoder.decodeValue(from: &reader, category: cat) }
+                p[row + x] = (px + diff) & 0xFFFF
+            }
+        }
+    }
+
+    /// One interleaved-component lossless sample: predict, decode, accumulate.
+    /// Static (capture-free) so the three per-pixel calls in the RGB scan carry
+    /// no closure context.
+    @inline(__always)
+    private static func losslessSample(
+        _ p: UnsafeMutablePointer<Int32>, _ t: HuffmanTable,
+        _ x: Int, _ y: Int, _ row: Int, _ prevRow: Int,
+        _ predictor: Int, _ half: Int32, _ reader: inout BitReader
+    ) throws {
+        let px: Int32
+        if x == 0 {
+            px = y == 0 ? half : p[prevRow]
+        } else if y == 0 {
+            px = p[row + x - 1]
+        } else {
+            let ra = p[row + x - 1], rb = p[prevRow + x], rc = p[prevRow + x - 1]
+            switch predictor {
+            case 1: px = ra
+            case 2: px = rb
+            case 3: px = rc
+            case 4: px = ra + rb - rc
+            case 5: px = ra + ((rb - rc) >> 1)
+            case 6: px = rb + ((ra - rc) >> 1)
+            default: px = (ra + rb) >> 1
+            }
+        }
+        let cat = Int(try HuffmanDecoder.decodeSymbol(from: &reader, table: t))
+        let diff: Int32
+        if cat == 0 { diff = 0 }
+        else if cat == 16 { diff = -32768 }
+        else { diff = try HuffmanDecoder.decodeValue(from: &reader, category: cat) }
+        p[row + x] = (px + diff) & 0xFFFF
+    }
+
+    /// Three-component (RGB) lossless scan: components interleaved per sample
+    /// (1×1 sampling), each with its own plane pointer and Huffman table.
+    private static func losslessScanRGB(
+        _ base: UnsafeMutablePointer<Int32>, width w: Int, height h: Int, count: Int,
+        predictor: Int, half: Int32, tables: [HuffmanTable], reader: inout BitReader
+    ) throws {
+        let t0 = tables[0], t1 = tables[1], t2 = tables[2]
+        let p0 = base, p1 = base + count, p2 = base + 2 * count
+        for y in 0..<h {
+            let row = y * w, prevRow = row - w
+            for x in 0..<w {
+                try losslessSample(p0, t0, x, y, row, prevRow, predictor, half, &reader)
+                try losslessSample(p1, t1, x, y, row, prevRow, predictor, half, &reader)
+                try losslessSample(p2, t2, x, y, row, prevRow, predictor, half, &reader)
+            }
+        }
     }
 
     // MARK: - Private Helpers
