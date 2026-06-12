@@ -703,40 +703,172 @@ public struct JLIEncoder: Sendable {
                     spectralStart: predictor, spectralEnd: 0,
                     successiveApproxHigh: 0, successiveApproxLow: pt)
 
-        // Emit reads the memoized residuals as one flat sweep (they are already
-        // in interleaved emit order) — no predictor recompute.
+        // Emit reads the memoized residuals (already in interleaved emit order)
+        // — no predictor recompute. Large images emit in PARALLEL: the sample
+        // sequence splits into ordered pieces (restart segments when restarts
+        // are on, else even ranges — residuals carry no cross-sample state, so
+        // any split is valid); each worker writes its piece's bit sequence into
+        // a private *unstuffed* buffer, and a serial stitch feeds those bit
+        // sequences through the main BitWriter, which applies stuffing and
+        // alignment. The total bit sequence equals the serial walk by
+        // construction, and stuffing/padding are pure functions of that
+        // sequence — so the output bytes are identical (gated by the
+        // forced-serial test and the identity-hash matrix, whose lossless-RGB
+        // entries exercise this path).
         var bw = BitWriter(estimatedMaxSize: w * h * nc * 2 + 1024)
-        // With restarts: pad + RSTn (cycling 0–7) between segments of
-        // segRows·w·nc interleaved samples. segSamples = .max when disabled, so
-        // the no-restart bitstream is untouched.
+        let totalSamples = count * nc
         let segSamples = segRows > 0 ? segRows * w * nc : Int.max
-        var sinceRestart = 0
-        var rstIdx = 0
-        for i in 0..<(count * nc) {
-            if sinceRestart == segSamples {
-                bw.emitRestartMarker(rstIdx & 7)
-                rstIdx += 1
-                sinceRestart = 0
+
+        var pieces = [Range<Int>]()
+        if segRows > 0 {
+            var s = 0
+            while s < totalSamples {
+                pieces.append(s..<min(s + segSamples, totalSamples)); s += segSamples
             }
-            sinceRestart += 1
-            let d = diffBase[i]
-            let cat = d == -32768 ? 16 : HuffmanEncoder.category(for: d)
-            let e = table.encodingTable[cat]
-            if cat > 0 && cat < 16 {
-                // Code + magnitude bits in one call — identical bitstream
-                // (appending n then m bits == appending the n+m-bit
-                // concatenation), half the writer calls. ≤ 16+15 = 31 bits.
-                let fused = (UInt32(e.code) << cat)
-                    | HuffmanEncoder.additionalBits(for: d, category: cat)
-                bw.writeBits(fused, count: Int(e.length) + cat)
-            } else {
-                bw.writeBits(UInt32(e.code), count: Int(e.length))
+        } else {
+            let n = min(ProcessInfo.processInfo.activeProcessorCount,
+                        max(1, totalSamples / JLIEncoder.losslessParallelMinSamples))
+            let span = (totalSamples + n - 1) / n
+            var s = 0
+            while s < totalSamples {
+                pieces.append(s..<min(s + span, totalSamples)); s += span
+            }
+        }
+
+        if pieces.count > 1, totalSamples >= JLIEncoder.losslessParallelMinSamples {
+            var emitted = [(bytes: [UInt8], bitCount: Int)](repeating: ([], 0), count: pieces.count)
+            emitted.withUnsafeMutableBufferPointer { eb in
+                let slots = EmitSlots(chunks: eb.baseAddress!, diffs: diffBase, table: table)
+                DispatchQueue.concurrentPerform(iterations: pieces.count) { k in
+                    slots.chunks[k] = JLIEncoder.emitLosslessChunk(
+                        diffs: slots.diffs, range: pieces[k], table: slots.table)
+                }
+            }
+            for (k, chunk) in emitted.enumerated() {
+                if k > 0 && segRows > 0 { bw.emitRestartMarker((k - 1) & 7) }
+                JLIEncoder.feedBits(chunk.bytes, bitCount: chunk.bitCount, into: &bw)
+            }
+        } else {
+            var sinceRestart = 0
+            var rstIdx = 0
+            for i in 0..<totalSamples {
+                if sinceRestart == segSamples {
+                    bw.emitRestartMarker(rstIdx & 7)
+                    rstIdx += 1
+                    sinceRestart = 0
+                }
+                sinceRestart += 1
+                let d = diffBase[i]
+                let cat = d == -32768 ? 16 : HuffmanEncoder.category(for: d)
+                let e = table.encodingTable[cat]
+                if cat > 0 && cat < 16 {
+                    // Code + magnitude bits in one call — identical bitstream
+                    // (appending n then m bits == appending the n+m-bit
+                    // concatenation), half the writer calls. ≤ 16+15 = 31 bits.
+                    let fused = (UInt32(e.code) << cat)
+                        | HuffmanEncoder.additionalBits(for: d, category: cat)
+                    bw.writeBits(fused, count: Int(e.length) + cat)
+                } else {
+                    bw.writeBits(UInt32(e.code), count: Int(e.length))
+                }
             }
         }
         bw.flush()
         mw.writeEntropyData(bw.data)
         mw.writeEOI()
         return mw.data
+    }
+
+    /// `@unchecked Sendable` carrier for the parallel lossless emit: worker `k`
+    /// reads the shared residuals/table and writes only its own chunk slot.
+    private struct EmitSlots: @unchecked Sendable {
+        let chunks: UnsafeMutablePointer<(bytes: [UInt8], bitCount: Int)>
+        let diffs: UnsafePointer<Int32>
+        let table: HuffmanTable
+    }
+
+    /// Bit accumulator WITHOUT stuffing or markers — workers pack their piece's
+    /// raw bit sequence here; the stitch replays it through the real BitWriter
+    /// (which owns stuffing), so the final stream is byte-identical to a serial
+    /// emit of the same bits.
+    private struct RawBitChunkWriter {
+        var bytes: [UInt8]
+        private(set) var bitCount = 0
+        private var acc: UInt64 = 0
+        private var nbits = 0
+
+        init(capacity: Int) {
+            bytes = []
+            bytes.reserveCapacity(capacity)
+        }
+
+        mutating func writeBits(_ value: UInt32, count: Int) {
+            guard count > 0 else { return }
+            acc = (acc << UInt64(count)) | UInt64(value & ((1 << UInt32(count)) &- 1))
+            nbits += count
+            bitCount += count
+            while nbits >= 8 {
+                nbits -= 8
+                bytes.append(UInt8((acc >> UInt64(nbits)) & 0xFF))
+            }
+        }
+
+        /// Packs any trailing partial bits into the HIGH bits of a final byte
+        /// (matching how ``feedBits`` extracts them).
+        mutating func finish() {
+            if nbits > 0 {
+                bytes.append(UInt8((acc << UInt64(8 - nbits)) & 0xFF))
+                nbits = 0
+            }
+        }
+    }
+
+    /// Emits the Huffman bit sequence for `range` of memoized residuals into an
+    /// unstuffed buffer — the exact same per-sample bits as the serial emit.
+    private static func emitLosslessChunk(
+        diffs: UnsafePointer<Int32>, range: Range<Int>, table: HuffmanTable
+    ) -> (bytes: [UInt8], bitCount: Int) {
+        var rw = RawBitChunkWriter(capacity: range.count * 3 + 16)
+        for i in range {
+            let d = diffs[i]
+            let cat = d == -32768 ? 16 : HuffmanEncoder.category(for: d)
+            let e = table.encodingTable[cat]
+            if cat > 0 && cat < 16 {
+                let fused = (UInt32(e.code) << cat)
+                    | HuffmanEncoder.additionalBits(for: d, category: cat)
+                rw.writeBits(fused, count: Int(e.length) + cat)
+            } else {
+                rw.writeBits(UInt32(e.code), count: Int(e.length))
+            }
+        }
+        rw.finish()
+        return (rw.bytes, rw.bitCount)
+    }
+
+    /// Replays an unstuffed bit sequence through the stuffing BitWriter, 24 bits
+    /// per call (writeBits' value mask handles ≤ 31). Appending the same bits in
+    /// different call granularity produces the same stream by the writer's
+    /// MSB-first accumulation.
+    private static func feedBits(_ bytes: [UInt8], bitCount: Int, into bw: inout BitWriter) {
+        var remaining = bitCount
+        bytes.withUnsafeBufferPointer { p in
+            guard let b = p.baseAddress else { return }
+            var i = 0
+            while remaining >= 24 {
+                let v = (UInt32(b[i]) << 16) | (UInt32(b[i + 1]) << 8) | UInt32(b[i + 2])
+                bw.writeBits(v, count: 24)
+                i += 3
+                remaining -= 24
+            }
+            while remaining >= 8 {
+                bw.writeBits(UInt32(b[i]), count: 8)
+                i += 1
+                remaining -= 8
+            }
+            if remaining > 0 {
+                bw.writeBits(UInt32(b[i]) >> (8 - remaining), count: remaining)
+            }
+        }
     }
 
     /// Encodes 8-bit RGB(A) as an XYB-color JPEG: each pixel → scaled-XYB samples
