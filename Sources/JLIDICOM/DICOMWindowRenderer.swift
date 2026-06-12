@@ -36,12 +36,14 @@ public struct DICOMWindowRenderer: Sendable {
         invert = image.photometric == "MONOCHROME1"
         if image.samplesPerPixel == 3 && image.bitsAllocated == 8 {
             // Window-independent: render once with any window, reuse forever.
+            // Intensities are still cached so render12bit/intensityRange match
+            // DICOMImage's behavior on RGB input exactly (it runs the same
+            // intensity decode there, odd as windowing RGB is).
             rgbPassthrough = image.render8bit(windowCenter: 0, windowWidth: 1)
-            intensities = []
         } else {
             rgbPassthrough = nil
-            intensities = image.decodeIntensitiesForRenderer()
         }
+        intensities = image.decodeIntensitiesForRenderer()
     }
 
     /// Full post-rescale intensity range (the natural slider bounds); matches
@@ -106,7 +108,7 @@ public struct DICOMWindowRenderer: Sendable {
         invert: Bool, peak: Double, into out: inout [Double]
     ) {
         var low = -(center - width / 2)
-        var span = max(1e-9, width)
+        let span = max(1e-9, width)
         var zero = 0.0, one = 1.0, half = 0.5
         var negOne = -1.0
         var peakV = peak
@@ -115,7 +117,12 @@ public struct DICOMWindowRenderer: Sendable {
             out.withUnsafeMutableBufferPointer { op in
                 let i = ip.baseAddress!, o = op.baseAddress!
                 vDSP_vsaddD(i, 1, &low, o, 1, len)          // v = x − low
-                vDSP_vsdivD(o, 1, &span, o, 1, len)         // v /= span (IEEE divide)
+                // Explicit element-wise divide, NOT vDSP_vsdivD: vsdivD is not
+                // documented correctly-rounded (it may use reciprocal multiply),
+                // which would break the pixel-identity contract with the scalar
+                // path. The compiler vectorizes this loop to hardware fdiv,
+                // which IS IEEE correctly rounded — identical to scalar `/`.
+                for j in 0..<n { o[j] = o[j] / span }
                 vDSP_vclipD(o, 1, &zero, &one, o, 1, len)   // clamp [0, 1]
                 if invert {
                     vDSP_vsmulD(o, 1, &negOne, o, 1, len)   // v = −v

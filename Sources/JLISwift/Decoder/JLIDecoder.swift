@@ -668,20 +668,42 @@ public struct JLIDecoder: Sendable {
                 && count >= JLIDecoder.losslessSegmentParallelMinSamples
             if parallelOK {
                 let table = tables[0]
+                // Immutable snapshots for the @Sendable workers (the vars above
+                // are never mutated past this point; the lets make that a
+                // compiler-checked fact).
+                let segRowsFinal = segRows
+                let markers = rstOffsets
                 var errors = [Error?](repeating: nil, count: numSegments)
                 errors.withUnsafeMutableBufferPointer { eb in
                     let slots = LosslessSegmentSlots(errors: eb.baseAddress!, plane: base)
                     DispatchQueue.concurrentPerform(iterations: numSegments) { k in
-                        let startRow = k * segRows
-                        let rows = min(segRows, h - startRow)
+                        let startRow = k * segRowsFinal
+                        let rows = min(segRowsFinal, h - startRow)
                         var segReader = k == 0
                             ? BitReader(data: ed)
-                            : BitReader(data: ed, startingAt: rstOffsets[k - 1] + 2)
+                            : BitReader(data: ed, startingAt: markers[k - 1] + 2)
                         do {
                             try Self.losslessScanGray(
                                 slots.plane + startRow * w, width: w, height: rows,
                                 predictor: predictor, half: half, table: table,
                                 reader: &segReader)
+                            // Behavioral equivalence with the serial path on
+                            // CORRUPT input: serial's skipRestartMarker throws
+                            // unless each segment ends exactly at its marker
+                            // (modulo 0xFF fill). An under-consuming corrupt
+                            // segment would otherwise be silently accepted here
+                            // — wrong pixels returned as success on exactly the
+                            // large clinical images this path targets.
+                            if k < numSegments - 1 {
+                                segReader.alignToByte()
+                                var pos = segReader.byteOffset
+                                while pos < markers[k], ed[pos] == 0xFF { pos += 1 }
+                                guard pos == markers[k] else {
+                                    throw JLIError.decodingFailed(
+                                        "lossless restart segment \(k) ended at byte "
+                                        + "\(segReader.byteOffset), expected RST at \(markers[k])")
+                                }
+                            }
                         } catch {
                             slots.errors[k] = error
                         }
@@ -745,16 +767,27 @@ public struct JLIDecoder: Sendable {
                             iccProfile: iccProfile, exif: exif)
     }
 
-    /// Minimum block count before Step-7 reconstruction fans out across cores
-    /// (16384 blocks ≈ a 1024×1024 luma plane; below a few thousand the
-    /// dispatch overhead wins). A var (not let) only so the serial/parallel
-    /// equality test can force the serial path; no production code mutates it.
-    nonisolated(unsafe) static var reconstructMinBlocksPerChunk = 2048
+    /// Minimum block count before Step-7 reconstruction fans out across cores;
+    /// below a few thousand blocks the dispatch overhead wins. Lock-protected
+    /// because the serial/parallel equality tests mutate it while other tests
+    /// may decode concurrently — both gate values are behaviorally equivalent
+    /// (that's what the tests prove), but the access must not be a data race.
+    /// No production code mutates it.
+    static var reconstructMinBlocksPerChunk: Int {
+        get { gateLock.lock(); defer { gateLock.unlock() }; return _reconstructMinBlocksPerChunk }
+        set { gateLock.lock(); defer { gateLock.unlock() }; _reconstructMinBlocksPerChunk = newValue }
+    }
 
     /// Minimum pixel count before a restart-segmented lossless scan decodes its
-    /// segments concurrently. A var (not let) only so the serial/parallel
-    /// equality test can force the serial path; no production code mutates it.
-    nonisolated(unsafe) static var losslessSegmentParallelMinSamples = 1 << 16
+    /// segments concurrently. Same locking rationale as
+    /// ``reconstructMinBlocksPerChunk``.
+    static var losslessSegmentParallelMinSamples: Int {
+        get { gateLock.lock(); defer { gateLock.unlock() }; return _losslessSegmentParallelMinSamples }
+        set { gateLock.lock(); defer { gateLock.unlock() }; _losslessSegmentParallelMinSamples = newValue }
+    }
+    private static let gateLock = NSLock()
+    nonisolated(unsafe) private static var _reconstructMinBlocksPerChunk = 2048
+    nonisolated(unsafe) private static var _losslessSegmentParallelMinSamples = 1 << 16
 
     /// `@unchecked Sendable` carrier for segment-parallel lossless decode:
     /// worker `k` writes only its segment's disjoint row range of `plane` and

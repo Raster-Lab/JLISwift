@@ -73,7 +73,13 @@ func runIdentityHashes(out: String?) {
         ("lossless-p4-rgb8", cfg { $0.lossless = true; $0.losslessPredictor = 4 }),
         ("lossless-p7-rgb8", cfg { $0.lossless = true; $0.losslessPredictor = 7 }),
     ]
-    for ti in TestImages.make(size: 256) {
+    // 256² plus a deliberately odd 67×61 (partial MCUs in both axes — the
+    // edge-block extract/scatter paths) run the full config matrix.
+    var rgbImages = TestImages.make(size: 256)
+    let odd = TestImages.gradient(name: "gradient-67x61", size: 67)
+    rgbImages.append(TestImage(name: "gradient-67x61", width: 67, height: 61,
+                               rgb: Array(odd.rgb.prefix(67 * 61 * 3))))
+    for ti in rgbImages {
         guard let image = try? JLIImage(width: ti.width, height: ti.height,
                                         pixelFormat: .uint8, colorModel: .rgb, data: ti.rgb)
         else { continue }
@@ -114,20 +120,25 @@ func runIdentityHashes(out: String?) {
         ("gray16/lossless-p6", 16, 40, false,
          cfg { $0.lossless = true; $0.losslessPrecision = 16; $0.losslessPredictor = 6 }),
     ]
-    for (name, bits, amp, signed, c) in cases {
-        let samples = graySamples(size: 256, bits: bits, seed: 0xC11AB5, noiseAmp: amp)
-        var bytes = [UInt8](repeating: 0, count: samples.count * 2)
-        for (i, s) in samples.enumerated() {
-            bytes[i * 2] = UInt8(s & 0xFF); bytes[i * 2 + 1] = UInt8(s >> 8)
-        }
-        guard let image = try? JLIImage(width: 256, height: 256, pixelFormat: .uint16,
-                                        colorModel: .grayscale, data: bytes, isSigned: signed)
-        else { continue }
-        if let jpeg = encode(image, c) {
-            record(name, jpeg)
-            if name == "gray12/sof1-lossy" {
-                record("gray12/sof1-lossy/float32", jpeg,
-                       decodeWith: JLIDecoderConfiguration(outputPixelFormat: .float32))
+    // 256² sits exactly AT the lossless parallel gate (runs serial); 512²
+    // crosses it, so the clinical configs also exercise the parallel residual
+    // sweep and the parallel emit stitch in this report.
+    for size in [256, 512] {
+        for (name, bits, amp, signed, c) in cases {
+            let samples = graySamples(size: size, bits: bits, seed: 0xC11AB5, noiseAmp: amp)
+            var bytes = [UInt8](repeating: 0, count: samples.count * 2)
+            for (i, s) in samples.enumerated() {
+                bytes[i * 2] = UInt8(s & 0xFF); bytes[i * 2 + 1] = UInt8(s >> 8)
+            }
+            guard let image = try? JLIImage(width: size, height: size, pixelFormat: .uint16,
+                                            colorModel: .grayscale, data: bytes, isSigned: signed)
+            else { continue }
+            if let jpeg = encode(image, c) {
+                record("\(name)@\(size)", jpeg)
+                if name == "gray12/sof1-lossy" && size == 256 {
+                    record("gray12/sof1-lossy/float32", jpeg,
+                           decodeWith: JLIDecoderConfiguration(outputPixelFormat: .float32))
+                }
             }
         }
     }

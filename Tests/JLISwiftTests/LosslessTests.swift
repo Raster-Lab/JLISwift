@@ -198,6 +198,28 @@ struct LosslessTests {
         }
     }
 
+    @Test("Sub-8-bit lossless precision with .uint8 input reads 1 byte/sample (no over-read)")
+    func uint8InputWithLowPrecision() throws {
+        // Regression for a heap over-read the adversarial review caught: bytes
+        // per sample was derived from the REQUESTED precision (2 for anything
+        // ≠ 8), so .uint8 input + losslessPrecision 4 read 2·w·h bytes from a
+        // w·h buffer — silently encoding adjacent heap memory. The fix derives
+        // it from the actual pixel format; values that fit the precision must
+        // round-trip exactly.
+        let w = 64, h = 64
+        var data = [UInt8](repeating: 0, count: w * h)
+        for i in 0..<data.count { data[i] = UInt8(i % 16) }      // fits 4 bits
+        let img = try JLIImage(width: w, height: h, pixelFormat: .uint8,
+                               colorModel: .grayscale, data: data)
+        var cfg = JLIEncoderConfiguration(lossless: true)
+        cfg.losslessPrecision = 4
+        let first = try JLIEncoder().encode(img, configuration: cfg)
+        // Deterministic output (heap over-reads showed up as run-to-run drift).
+        #expect(try JLIEncoder().encode(img, configuration: cfg) == first)
+        let dec = try JLIDecoder().decode(from: first)
+        #expect(dec.data == data, "4-bit lossless round-trip not bit-exact")
+    }
+
     @Test("Parallel lossless residual sweep is byte-identical to serial and round-trips")
     func parallelLosslessEncodeDeterministic() throws {
         // 640×512 16-bit grayscale = 327,680 samples — over the

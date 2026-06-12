@@ -614,7 +614,13 @@ public struct JLIEncoder: Sendable {
         let w = image.width, h = image.height
         let nc = isGrayscale ? 1 : 3
         let srcCC = image.colorModel.componentCount     // 1 / 3 / 4 (alpha ignored)
-        let bps = precision == 8 ? 1 : 2
+        // Bytes per stored sample comes from the ACTUAL pixel format, never the
+        // requested precision: deriving it from `precision` made a `.uint8`
+        // image with losslessPrecision 2–7 read 2·w·h·srcCC bytes from a
+        // w·h·srcCC buffer — with raw pointers that was a silent heap over-read
+        // straight into the encoded output (caught by the branch's adversarial
+        // review; the old bounds-checked subscripts trapped instead).
+        let bps = image.pixelFormat == .uint16 ? 2 : 1
 
         let count = w * h
         // De-interleave source into flat per-component planes (plane c at offset
@@ -736,12 +742,13 @@ public struct JLIEncoder: Sendable {
         }
 
         if pieces.count > 1, totalSamples >= JLIEncoder.losslessParallelMinSamples {
+            let piecesFinal = pieces        // immutable snapshot for the @Sendable workers
             var emitted = [(bytes: [UInt8], bitCount: Int)](repeating: ([], 0), count: pieces.count)
             emitted.withUnsafeMutableBufferPointer { eb in
                 let slots = EmitSlots(chunks: eb.baseAddress!, diffs: diffBase, table: table)
-                DispatchQueue.concurrentPerform(iterations: pieces.count) { k in
+                DispatchQueue.concurrentPerform(iterations: piecesFinal.count) { k in
                     slots.chunks[k] = JLIEncoder.emitLosslessChunk(
-                        diffs: slots.diffs, range: pieces[k], table: slots.table)
+                        diffs: slots.diffs, range: piecesFinal[k], table: slots.table)
                 }
             }
             for (k, chunk) in emitted.enumerated() {
@@ -1238,11 +1245,18 @@ public struct JLIEncoder: Sendable {
     }
 
     /// Minimum interleaved sample count (`w·h·nc`) before the lossless residual
-    /// sweep fans out across cores; below this the dispatch overhead wins.
-    /// A var (not let) only so the serial/parallel byte-equality test can force
-    /// the serial path (`= .max`) and prove the fan-out is byte-identical; no
-    /// production code mutates it.
-    nonisolated(unsafe) static var losslessParallelMinSamples = 1 << 16
+    /// sweep and entropy emit fan out across cores; below this the dispatch
+    /// overhead wins. Lock-protected because the serial/parallel byte-equality
+    /// tests mutate it (`= .max` to force the serial path) while other tests
+    /// may be encoding concurrently — both gate values are behaviorally
+    /// equivalent (that's what the tests prove), but the access itself must not
+    /// be a data race. No production code mutates it.
+    static var losslessParallelMinSamples: Int {
+        get { gateLock.lock(); defer { gateLock.unlock() }; return _losslessParallelMinSamples }
+        set { gateLock.lock(); defer { gateLock.unlock() }; _losslessParallelMinSamples = newValue }
+    }
+    private static let gateLock = NSLock()
+    nonisolated(unsafe) private static var _losslessParallelMinSamples = 1 << 16
 
     /// `@unchecked Sendable` carrier for the lossless residual sweep: workers
     /// read disjoint row ranges of `planes` (plus one shared read-only border

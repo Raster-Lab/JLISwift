@@ -3,7 +3,7 @@
 Living progress tracker — items move from **Remaining** to **Completed** as each
 stage lands (CI-green). Each line: **what** · *value* · *risk / how it's validated*.
 
-_Last updated: 2026-05-30 — **Project pivot: medical imaging is now the primary use case.** A multi-agent **medical-grade readiness audit** ([MEDICAL_GRADE_ASSESSMENT.md](MEDICAL_GRADE_ASSESSMENT.md)) found a genuinely strong codec but real engineering gaps + zero regulatory artifacts. The `feat/medical-foundations` branch closed the engineering gaps (193 tests green, verified on the real corpus): decoder fail-safe guards (decompression bomb, lossless shift), DICOM reader hardening (undefined-length SQ skip, bitsStored/HighBit masking + signed sign-extension, planar config), signed-pixel provenance end-to-end, ISO/IEC 10918-2 IDCT conformance, and a **DICOM writer + JPEG-encapsulation** path joining the codec to the container (real compressed clinical DICOMs now decode). **0.4.0's theme is medical foundations** (below). The old jpegli-parity / perf / XYB work is **re-prioritized to P2** — still tracked, no longer the headline._
+_Last updated: 2026-06-12 — **0.5.0-perf optimization pass complete** (see below): lossless 16-bit encode 6.3× / decode 1.6× faster (2.8× with opt-in restart segments), lossy decode ~2×, all byte/bit-identical by a new identity-hash gate; DICOM gets a cached window/level renderer + concurrent frame decode. Earlier: **Project pivot: medical imaging is now the primary use case.** A multi-agent **medical-grade readiness audit** ([MEDICAL_GRADE_ASSESSMENT.md](MEDICAL_GRADE_ASSESSMENT.md)) found a genuinely strong codec but real engineering gaps + zero regulatory artifacts. The `feat/medical-foundations` branch closed the engineering gaps (193 tests green, verified on the real corpus): decoder fail-safe guards (decompression bomb, lossless shift), DICOM reader hardening (undefined-length SQ skip, bitsStored/HighBit masking + signed sign-extension, planar config), signed-pixel provenance end-to-end, ISO/IEC 10918-2 IDCT conformance, and a **DICOM writer + JPEG-encapsulation** path joining the codec to the container (real compressed clinical DICOMs now decode). **0.4.0's theme is medical foundations** (below). The old jpegli-parity / perf / XYB work is **re-prioritized to P2** — still tracked, no longer the headline._
 
 _Earlier: **0.3.0 RELEASED** (tagged `v0.3.0`): jpegli adaptive-quant field opt-in + JLILab distribution scaffolding. **0.2.0**: perceptual-quant default (CT q90 ba 1.20 vs 1.82 at equal bytes), ~15–16% faster encode / ~26–43% faster decode (byte-identical), the JLILab macOS lab._
 
@@ -40,6 +40,21 @@ _Earlier: **0.3.0 RELEASED** (tagged `v0.3.0`): jpegli adaptive-quant field opt-
 
 ### Sequencing
 WS-A's opt-in field has landed; the remaining 0.3.0 work is **WS-B** (ship the signed app). **Tag `v0.3.0` once the notarized DMG is produced.** Closing the jpegli/MR gap (needs a field oracle) + WS-C/D/E move to **0.4.0**.
+
+## 0.5.0-perf — Optimization pass (branch `perf/post-0.4-optimization`, 2026-06-12)
+
+**Theme: profile-guided performance for the clinical path, byte/bit-identical by gate.** A fresh release profile + a 44-agent verified analysis re-ranked every hotspot post-0.4.0; all five phases of the resulting plan are implemented. Discipline: every change is bit/byte-identical (new **identity-hash gate**: `JLIBench --identity-hashes` — SHA-256 of 52 encode/decode outputs across a fixed deterministic matrix, diffed before/after every commit) or explicitly opt-in; parallel stages carry forced-serial byte-equality tests; 230 tests / 27 suites green; real corpus 127/127 native lossless round-trips bit-exact.
+
+**Measured (release, 8-core M-series, 1024² unless noted; same-session baselines):**
+- **Lossless 16-bit encode 34.3 → 5.45 ms (6.3×)** — CLZ category + fused code+magnitude emit (P1a), memoized residuals computed once in parallel (P1d), parallel entropy emit via unstuffed-chunk stitch (P4a, byte-identical — the "needs RST markers" assumption proved avoidable).
+- **Lossless 16-bit decode 19.7 → ~12 ms (1.6×)** — 64-bit SWAR bulk BitReader refill (P1b), one-memcpy `readEntropyData` (P2a), raw-pointer scan workers (P1c).
+- **Opt-in lossless restart intervals (P4b)**: decode + encode + segment-parallel decode — **2048² 16-bit decode 53.3 → 19.2 ms (2.8×) at +0.03% bytes**; row-aligned only (libjpeg-turbo's own constraint); cross-validated both directions (embedded cjpeg fixtures decode bit-exactly; djpeg decodes ours bit-exactly).
+- **Lossy decode ~2× smooth (15.6 → 7.5 ms), 1.6× noise** — planar stride-1 color convert + vImage interleave (P3a, was the measured #1 at ~31%), fused dequant+IDCT pack + parallel Step-7 reconstruction over block ranges (P3b), per-scan table hoist + COW fixes (P3c).
+- **Lossy encode 1.2–1.8×** (noise 47.5 → 26.4 ms) — fused emit, planar deinterleave, interior-fast-path extract/downsample, trellis rate table.
+- **DICOM (P2b–P2d)**: `DICOMWindowRenderer` caches decoded intensities (slider ticks stop re-decoding the full plane; vDSP window chain pixel-identical by test); single-copy reader/writer I/O + mmap; `decodeFramesConcurrently` — near-linear multi-frame/series decode, zero identity risk.
+- Removed dead `JLIMetalPipeline.swift` (zero call sites); progressive AC passes use buffer-steal (no per-touch COW checks).
+
+*Caveats kept honest: the P1c scan-worker rewrite is ~2–3% slower than the optimizer-elided nested-array loop it replaced — kept because it removes a latent full-plane-COW trap (the old code's performance hung on unguaranteed optimizer lifetime-shortening) and is the worker shape the segment-parallel decode plugs into. The deferred WS-C items (fuse dequant+IDCT, parallel reconstruction, parallel emit) are now all DONE; the jpegli-MR-gap spike and DocC remain deferred as before.*
 
 ## 0.4.0 — Plan (active, 2026-05-30)
 

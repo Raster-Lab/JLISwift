@@ -183,4 +183,75 @@ struct LosslessRestartTests {
         let dec = try JLIDecoder().decode(from: try JLIEncoder().encode(img, configuration: cfg))
         #expect(dec.data == rgb, "RGB restart round-trip not bit-exact")
     }
+
+    @Test("Parallel restart EMIT is byte-identical to serial emit")
+    func parallelRestartEmitMatchesSerial() throws {
+        // 320×210 16-bit ≥ the encoder's parallel gate; restart every 5 rows →
+        // 42 emission pieces. Forced-serial encode must produce identical bytes
+        // (covers the RST stitch + marker cycling in the parallel emit path).
+        let w = 320, h = 210
+        var data = [UInt8](repeating: 0, count: w * h * 2)
+        var state: UInt32 = 0xD00D
+        for i in 0..<(w * h) {
+            state = state &* 1664525 &+ 1013904223
+            let v = UInt16((i * 13) % 50000) &+ UInt16(state >> 29)
+            data[i * 2] = UInt8(v & 0xFF); data[i * 2 + 1] = UInt8(v >> 8)
+        }
+        let img = try JLIImage(width: w, height: h, pixelFormat: .uint16,
+                               colorModel: .grayscale, data: data)
+        var cfg = JLIEncoderConfiguration(lossless: true)
+        cfg.losslessPrecision = 16
+        cfg.restartInterval = w * 5
+        let parallel = try JLIEncoder().encode(img, configuration: cfg)
+
+        let saved = JLIEncoder.losslessParallelMinSamples
+        JLIEncoder.losslessParallelMinSamples = .max
+        defer { JLIEncoder.losslessParallelMinSamples = saved }
+        let serial = try JLIEncoder().encode(img, configuration: cfg)
+        #expect(serial == parallel, "parallel restart emit differs from serial")
+        #expect(try JLIDecoder().decode(from: parallel).data == data)
+    }
+
+    @Test("A corrupt restart segment throws in BOTH serial and parallel decode")
+    func corruptSegmentThrowsInBothPaths() throws {
+        // Build a valid restart stream over the parallel gate, then inject junk
+        // bytes just before the first RST marker (inside the entropy data). The
+        // serial path throws from skipRestartMarker; the parallel path must
+        // throw from its segment-end validation — never return wrong pixels as
+        // a successful decode (the adversarial review caught exactly that gap).
+        let w = 300, h = 240
+        var data = [UInt8](repeating: 0, count: w * h * 2)
+        for i in 0..<(w * h) {
+            let v = UInt16((i * 7) % 4096)
+            data[i * 2] = UInt8(v & 0xFF); data[i * 2 + 1] = UInt8(v >> 8)
+        }
+        let img = try JLIImage(width: w, height: h, pixelFormat: .uint16,
+                               colorModel: .grayscale, data: data)
+        var cfg = JLIEncoderConfiguration(lossless: true)
+        cfg.losslessPrecision = 12
+        cfg.restartInterval = w * 8
+        var jpeg = try JLIEncoder().encode(img, configuration: cfg)
+
+        // Find the first RST marker after SOI and splice junk data before it.
+        var rstAt = -1
+        var i = 2
+        while i + 1 < jpeg.count {
+            if jpeg[i] == 0xFF, (0xD0...0xD7).contains(jpeg[i + 1]) { rstAt = i; break }
+            i += 1
+        }
+        #expect(rstAt > 0, "no RST marker found in restart-encoded stream")
+        jpeg.insert(contentsOf: [0x12, 0x34, 0x56, 0x78], at: rstAt)
+
+        // Parallel path (default gate).
+        #expect(throws: JLIError.self, "parallel path accepted a corrupt segment") {
+            _ = try JLIDecoder().decode(from: jpeg)
+        }
+        // Serial path (forced).
+        let saved = JLIDecoder.losslessSegmentParallelMinSamples
+        JLIDecoder.losslessSegmentParallelMinSamples = .max
+        defer { JLIDecoder.losslessSegmentParallelMinSamples = saved }
+        #expect(throws: JLIError.self, "serial path accepted a corrupt segment") {
+            _ = try JLIDecoder().decode(from: jpeg)
+        }
+    }
 }

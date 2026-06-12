@@ -346,6 +346,51 @@ struct DICOMReaderTests {
         }
     }
 
+    @Test("Non-finite rescale/window DS values are sanitized, not trapped on")
+    func nonFiniteRescaleSanitized() throws {
+        // "nan"/"inf" are valid Double(_:) parses, so a hostile DS tag would
+        // push NaN through the Modality LUT into UInt8(v*255+0.5) — an
+        // uncatchable trap. The reader sanitizes at the parse boundary.
+        var b = DICOMBuilder()
+        b.us(0x0028, 0x0002, 1)
+        b.str(0x0028, 0x0004, "CS", "MONOCHROME2")
+        b.us(0x0028, 0x0010, 2)
+        b.us(0x0028, 0x0011, 2)
+        b.us(0x0028, 0x0100, 16)
+        b.us(0x0028, 0x0101, 12)
+        b.us(0x0028, 0x0103, 0)
+        b.str(0x0028, 0x1050, "DS", "nan")        // WindowCenter
+        b.str(0x0028, 0x1051, "DS", "inf")        // WindowWidth
+        b.str(0x0028, 0x1052, "DS", "-inf")       // RescaleIntercept
+        b.str(0x0028, 0x1053, "DS", "nan")        // RescaleSlope
+        b.ow(0x7FE0, 0x0010, [0, 100, 200, 300])
+
+        let img = try DICOMReader.read(b.bytes())
+        #expect(img.rescaleSlope == 1.0 && img.rescaleIntercept == 0.0)
+        #expect(img.windowCenter == nil && img.windowWidth == nil)
+        _ = img.toRGB8()                                          // must not trap
+        _ = DICOMWindowRenderer(img).render8bit(windowCenter: 150, windowWidth: 300)
+    }
+
+    @Test("DICOMWindowRenderer matches DICOMImage render12bit on RGB input too")
+    func windowRendererRGB12bitMatches() throws {
+        var b = DICOMBuilder()
+        b.us(0x0028, 0x0002, 3)
+        b.us(0x0028, 0x0006, 0)
+        b.str(0x0028, 0x0004, "CS", "RGB")
+        b.us(0x0028, 0x0010, 1)
+        b.us(0x0028, 0x0011, 2)
+        b.us(0x0028, 0x0100, 8)
+        b.us(0x0028, 0x0101, 8)
+        b.us(0x0028, 0x0103, 0)
+        b.ob(0x7FE0, 0x0010, [10, 20, 30, 40, 50, 60])
+
+        let img = try DICOMReader.read(b.bytes())
+        let renderer = DICOMWindowRenderer(img)
+        #expect(renderer.render12bit(windowCenter: 30, windowWidth: 60)
+                == img.render12bit(windowCenter: 30, windowWidth: 60))
+    }
+
     @Test("DICOMWindowRenderer passes 8-bit RGB through window-independently")
     func windowRendererRGBPassthrough() throws {
         var b = DICOMBuilder()

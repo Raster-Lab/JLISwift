@@ -584,9 +584,14 @@ public enum DICOMReader {
             planarConfiguration: planarConfiguration,
             photometric: photometric.trimmingCharacters(in: .whitespacesAndNewlines),
             modality: modality.trimmingCharacters(in: .whitespacesAndNewlines),
-            windowCenter: windowCenter, windowWidth: windowWidth,
-            rescaleSlope: rescaleSlope ?? 1.0,
-            rescaleIntercept: rescaleIntercept ?? 0.0,
+            // Non-finite values (a hostile DS like "nan"/"inf" parses to a valid
+            // Double!) would propagate NaN through the Modality LUT into the
+            // window math, where UInt8(v·255+0.5) traps uncatchably — sanitize
+            // to the identity/absent defaults at the parse boundary instead.
+            windowCenter: windowCenter?.isFinite == true ? windowCenter : nil,
+            windowWidth: windowWidth?.isFinite == true ? windowWidth : nil,
+            rescaleSlope: rescaleSlope?.isFinite == true ? rescaleSlope! : 1.0,
+            rescaleIntercept: rescaleIntercept?.isFinite == true ? rescaleIntercept! : 0.0,
             pixelData: pixelData,
             transferSyntax: transferSyntax
         )
