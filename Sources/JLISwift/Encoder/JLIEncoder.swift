@@ -593,6 +593,18 @@ public struct JLIEncoder: Sendable {
         guard (0..<precision).contains(pt) else {
             throw JLIError.unsupportedJPEGFeature("lossless point transform \(pt) (0–\(precision - 1))")
         }
+        // Restart intervals (opt-in, previously silently ignored on SOF3):
+        // row-aligned only, matching libjpeg-turbo's lossless constraint ("must
+        // be an integer multiple of the number of MCUs in an MCU row") — which
+        // also makes every restart segment independently decodable. Prediction
+        // resets to scan-start state at each segment (first row of a segment
+        // predicts like the first row of the scan).
+        let restartInterval = configuration.restartInterval
+        if restartInterval > 0, restartInterval % image.width != 0 {
+            throw JLIError.unsupportedJPEGFeature(
+                "lossless restart interval \(restartInterval) must be a multiple of "
+                + "samples-per-row (\(image.width))")
+        }
         if !isGrayscale {
             guard image.colorModel == .rgb || image.colorModel == .rgba else {
                 throw JLIError.unsupportedColorSpaceConversion(
@@ -640,6 +652,9 @@ public struct JLIEncoder: Sendable {
         let diffStore = UnsafeMutableBufferPointer<Int32>.allocate(capacity: count * nc)
         defer { diffStore.deallocate() }
         let diffBase = diffStore.baseAddress!
+        // Rows per restart segment (0 = no restarts). Row-aligned by the guard
+        // above, so each segment's first row predicts like the scan's first row.
+        let segRows = restartInterval > 0 ? restartInterval / w : 0
 
         let chunks = min(ProcessInfo.processInfo.activeProcessorCount,
                          max(1, (count * nc) / JLIEncoder.losslessParallelMinSamples))
@@ -647,7 +662,8 @@ public struct JLIEncoder: Sendable {
         if chunks <= 1 {
             dcFreq = JLIEncoder.losslessResiduals(
                 rows: 0..<h, width: w, nc: nc, count: count,
-                predictor: predictor, half: half, planes: planeBase, diffs: diffBase)
+                predictor: predictor, half: half, segRows: segRows,
+                planes: planeBase, diffs: diffBase)
         } else {
             let span = (h + chunks - 1) / chunks
             var partials = [[Int]](repeating: [], count: chunks)
@@ -659,7 +675,7 @@ public struct JLIEncoder: Sendable {
                     ptrs.partials[ci] = lo < hi
                         ? JLIEncoder.losslessResiduals(
                             rows: lo..<hi, width: w, nc: nc, count: count,
-                            predictor: predictor, half: half,
+                            predictor: predictor, half: half, segRows: segRows,
                             planes: ptrs.planes, diffs: ptrs.diffs)
                         : [Int](repeating: 0, count: 256)
                 }
@@ -682,6 +698,7 @@ public struct JLIEncoder: Sendable {
         mw.writeSOF(progressive: false, precision: precision, width: w, height: h,
                     components: comps, lossless: true)
         mw.writeDHT(tables: [(0, 0, table.bits, table.values)])
+        if restartInterval > 0 { mw.writeDRI(interval: restartInterval) }
         mw.writeSOS(components: comps.map { (selector: $0.id, dcTableId: 0, acTableId: 0) },
                     spectralStart: predictor, spectralEnd: 0,
                     successiveApproxHigh: 0, successiveApproxLow: pt)
@@ -689,7 +706,19 @@ public struct JLIEncoder: Sendable {
         // Emit reads the memoized residuals as one flat sweep (they are already
         // in interleaved emit order) — no predictor recompute.
         var bw = BitWriter(estimatedMaxSize: w * h * nc * 2 + 1024)
+        // With restarts: pad + RSTn (cycling 0–7) between segments of
+        // segRows·w·nc interleaved samples. segSamples = .max when disabled, so
+        // the no-restart bitstream is untouched.
+        let segSamples = segRows > 0 ? segRows * w * nc : Int.max
+        var sinceRestart = 0
+        var rstIdx = 0
         for i in 0..<(count * nc) {
+            if sinceRestart == segSamples {
+                bw.emitRestartMarker(rstIdx & 7)
+                rstIdx += 1
+                sinceRestart = 0
+            }
+            sinceRestart += 1
             let d = diffBase[i]
             let cat = d == -32768 ? 16 : HuffmanEncoder.category(for: d)
             let e = table.encodingTable[cat]
@@ -1101,7 +1130,7 @@ public struct JLIEncoder: Sendable {
     /// counts commute, so summed partial histograms equal a serial count.
     private static func losslessResiduals(
         rows: Range<Int>, width w: Int, nc: Int, count: Int,
-        predictor: Int, half: Int32,
+        predictor: Int, half: Int32, segRows: Int,
         planes: UnsafePointer<Int32>, diffs: UnsafeMutablePointer<Int32>
     ) -> [Int] {
         var freq = [Int](repeating: 0, count: 256)
@@ -1109,13 +1138,18 @@ public struct JLIEncoder: Sendable {
             let f = fb.baseAddress!
             for y in rows {
                 let row = y * w, prevRow = row - w
+                // The first row of the scan AND of each restart segment predicts
+                // with scan-start semantics (default value, then Ra) per T.81 —
+                // a pure function of (y, segRows), so the row-parallel sweep is
+                // unaffected by restarts.
+                let firstRow = y == 0 || (segRows > 0 && y % segRows == 0)
                 for x in 0..<w {
                     for c in 0..<nc {
                         let p = planes + c * count
                         let px: Int32
                         if x == 0 {
-                            px = y == 0 ? half : p[prevRow]                    // Rb / initial
-                        } else if y == 0 {
+                            px = firstRow ? half : p[prevRow]                  // initial / Rb
+                        } else if firstRow {
                             px = p[row + x - 1]                                // Ra
                         } else {
                             let ra = p[row + x - 1], rb = p[prevRow + x], rc = p[prevRow + x - 1]

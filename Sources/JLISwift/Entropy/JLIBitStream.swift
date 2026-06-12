@@ -127,6 +127,13 @@ struct BitReader {
         self.data = data
     }
 
+    /// Starts reading at `offset` — used by segment-parallel lossless decode,
+    /// where each restart segment's reader begins just past its RST marker.
+    init(data: [UInt8], startingAt offset: Int) {
+        self.data = data
+        self.byteOffset = min(max(0, offset), data.count)
+    }
+
     /// Whether there is more data to read.
     var hasMore: Bool {
         byteOffset < data.count || bitsAvailable > 0

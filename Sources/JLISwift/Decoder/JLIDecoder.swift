@@ -70,6 +70,7 @@ public struct JLIDecoder: Sendable {
         // Lossless (SOF3) is predictive, not DCT — fully separate path.
         if frame.isLossless {
             return try decodeLossless(frame: frame, scans: parsed.scans, configuration: configuration,
+                                      restartInterval: parsed.restartInterval,
                                       iccProfile: parsed.iccProfile, exif: parsed.exif)
         }
 
@@ -546,7 +547,7 @@ public struct JLIDecoder: Sendable {
     /// stored directly — no color transform, like libjpeg-turbo's lossless).
     private func decodeLossless(
         frame: JPEGFrameInfo, scans: [JPEGScanData], configuration: JLIDecoderConfiguration,
-        iccProfile: [UInt8]? = nil, exif: [UInt8]? = nil
+        restartInterval: Int = 0, iccProfile: [UInt8]? = nil, exif: [UInt8]? = nil
     ) throws -> JLIImage {
         let precision = frame.precision
         guard (2...16).contains(precision) else {
@@ -618,13 +619,93 @@ public struct JLIDecoder: Sendable {
         // range, and `reader` is passed `inout` end-to-end — never captured by
         // a closure (a captured inout-mutated struct gets boxed with dynamic
         // exclusivity checks on every access).
-        if nc == 1 {
-            try Self.losslessScanGray(base, width: w, height: h, predictor: predictor,
-                                      half: half, table: tables[0], reader: &reader)
+        // Restart segmentation: row-aligned only (the constraint libjpeg-turbo
+        // also enforces for lossless), so each segment's first row predicts with
+        // scan-start semantics and segments are independently decodable. The
+        // scan workers need no restart awareness: a worker invoked on a
+        // segment's rows treats its first row as the \"first row\" (y == 0),
+        // which IS the post-restart prediction state.
+        var segRows = 0
+        if restartInterval > 0 {
+            guard restartInterval % w == 0 else {
+                throw JLIError.unsupportedJPEGFeature(
+                    "lossless restart interval \(restartInterval) not a multiple of "
+                    + "samples-per-row (\(w))")
+            }
+            segRows = restartInterval / w
+        }
+        let numSegments = segRows > 0 ? (h + segRows - 1) / segRows : 1
+
+        if numSegments <= 1 {
+            if nc == 1 {
+                try Self.losslessScanGray(base, width: w, height: h, predictor: predictor,
+                                          half: half, table: tables[0], reader: &reader)
+            } else {
+                try Self.losslessScanRGB(base, width: w, height: h, count: count,
+                                         predictor: predictor, half: half,
+                                         tables: tables, reader: &reader)
+            }
         } else {
-            try Self.losslessScanRGB(base, width: w, height: h, count: count,
-                                     predictor: predictor, half: half,
-                                     tables: tables, reader: &reader)
+            // Parallel fast path (the clinical grayscale case): locate the RST
+            // markers up front (in entropy data a 0xFF is always followed by
+            // 0x00 stuffing, 0xFF fill, or a real RST byte) and decode every
+            // segment concurrently — each from its own reader and into its own
+            // disjoint row range. Falls back to the serial segment loop when
+            // the marker layout is anything but the expected one.
+            var rstOffsets = [Int]()
+            let ed = scan.entropyData
+            var si = 0
+            scanLoop: while si + 1 < ed.count {
+                if ed[si] != 0xFF { si += 1; continue }
+                switch ed[si + 1] {
+                case 0x00: si += 2                                  // stuffed data byte
+                case 0xFF: si += 1                                  // fill byte
+                case 0xD0...0xD7: rstOffsets.append(si); si += 2    // restart marker
+                default: break scanLoop                             // foreign marker — bail
+                }
+            }
+            let parallelOK = nc == 1 && rstOffsets.count == numSegments - 1
+                && count >= JLIDecoder.losslessSegmentParallelMinSamples
+            if parallelOK {
+                let table = tables[0]
+                var errors = [Error?](repeating: nil, count: numSegments)
+                errors.withUnsafeMutableBufferPointer { eb in
+                    let slots = LosslessSegmentSlots(errors: eb.baseAddress!, plane: base)
+                    DispatchQueue.concurrentPerform(iterations: numSegments) { k in
+                        let startRow = k * segRows
+                        let rows = min(segRows, h - startRow)
+                        var segReader = k == 0
+                            ? BitReader(data: ed)
+                            : BitReader(data: ed, startingAt: rstOffsets[k - 1] + 2)
+                        do {
+                            try Self.losslessScanGray(
+                                slots.plane + startRow * w, width: w, height: rows,
+                                predictor: predictor, half: half, table: table,
+                                reader: &segReader)
+                        } catch {
+                            slots.errors[k] = error
+                        }
+                    }
+                }
+                if let e = errors.compactMap({ $0 }).first { throw e }
+            } else {
+                for k in 0..<numSegments {
+                    if k > 0 { try reader.skipRestartMarker(expectedIndex: (k - 1) & 7) }
+                    let startRow = k * segRows
+                    let rows = min(segRows, h - startRow)
+                    if nc == 1 {
+                        try Self.losslessScanGray(
+                            base + startRow * w, width: w, height: rows,
+                            predictor: predictor, half: half, table: tables[0],
+                            reader: &reader)
+                    } else {
+                        try Self.losslessScanRGB(
+                            base + startRow * w, width: w, height: rows, count: count,
+                            predictor: predictor, half: half, tables: tables,
+                            reader: &reader)
+                    }
+                }
+            }
         }
 
         // Interleave planes → output. 1 component = grayscale; 3 = RGB (direct).
@@ -669,6 +750,19 @@ public struct JLIDecoder: Sendable {
     /// dispatch overhead wins). A var (not let) only so the serial/parallel
     /// equality test can force the serial path; no production code mutates it.
     nonisolated(unsafe) static var reconstructMinBlocksPerChunk = 2048
+
+    /// Minimum pixel count before a restart-segmented lossless scan decodes its
+    /// segments concurrently. A var (not let) only so the serial/parallel
+    /// equality test can force the serial path; no production code mutates it.
+    nonisolated(unsafe) static var losslessSegmentParallelMinSamples = 1 << 16
+
+    /// `@unchecked Sendable` carrier for segment-parallel lossless decode:
+    /// worker `k` writes only its segment's disjoint row range of `plane` and
+    /// its own `errors` slot.
+    private struct LosslessSegmentSlots: @unchecked Sendable {
+        let errors: UnsafeMutablePointer<Error?>
+        let plane: UnsafeMutablePointer<Int32>
+    }
 
     /// `@unchecked Sendable` carrier for parallel Step-7 reconstruction: each
     /// worker reads the shared `zz`/`qt` and writes only its own block range's
