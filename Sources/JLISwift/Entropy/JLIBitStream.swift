@@ -101,13 +101,25 @@ struct BitWriter {
 
 /// Bit-level reader for parsing JPEG entropy-coded data.
 ///
-/// Reads bits MSB-first from a byte buffer, handling JPEG byte stuffing.
+/// Reads bits MSB-first from a byte buffer, handling JPEG byte stuffing. The
+/// accumulator is 64-bit and refills in bulk: when the next 8 source bytes
+/// contain no `0xFF` (checked with one SWAR test), they are spliced in with a
+/// single unaligned load instead of up to 8 branchy byte loads. Lossless decode
+/// reads one Huffman symbol plus up to 15 magnitude bits per *sample*, so
+/// refill cost dominates that path — this is its main lever.
+///
+/// Invariant the bulk path preserves: whole unconsumed bytes ever buffered
+/// across operations come only from bulk loads of `0xFF`-free runs, each
+/// mapping 1:1 to the source bytes immediately before `byteOffset` (the
+/// stuffing-aware byte loads are only triggered to complete a read/symbol that
+/// then consumes them below 8 remaining bits). `alignToByte` relies on this to
+/// rewind `byteOffset` over buffered whole bytes exactly.
 struct BitReader {
     private let data: [UInt8]
     /// Current byte position in the data buffer.
     private(set) var byteOffset: Int = 0
-    /// Current bit buffer.
-    private var bitBuffer: UInt32 = 0
+    /// Bit accumulator (MSB-first in the low `bitsAvailable` bits).
+    private var bitBuffer: UInt64 = 0
     /// Number of valid bits in the bit buffer.
     private var bitsAvailable: Int = 0
 
@@ -125,21 +137,47 @@ struct BitReader {
         return try readBits(1)
     }
 
+    /// True when any byte of `x` equals `0xFF` (SWAR zero-byte test on `~x`).
+    @inline(__always)
+    private static func hasFFByte(_ x: UInt64) -> Bool {
+        let y = ~x
+        return ((y &- 0x0101_0101_0101_0101) & ~y & 0x8080_8080_8080_8080) != 0
+    }
+
+    /// Bulk-splices up to 8 source bytes into the accumulator with one load when
+    /// the next 8 bytes are plain data (no `0xFF` anywhere — conservatively
+    /// covering stuffing *and* markers, so the byte-wise path keeps sole
+    /// ownership of both). Returns `false` when the bulk path doesn't apply.
+    @inline(__always)
+    private mutating func bulkRefill() -> Bool {
+        guard byteOffset + 8 <= data.count else { return false }
+        let word = data.withUnsafeBufferPointer { buf in
+            UInt64(bigEndian: UnsafeRawPointer(buf.baseAddress! + byteOffset)
+                .loadUnaligned(as: UInt64.self))
+        }
+        guard !Self.hasFFByte(word) else { return false }
+        let k = (64 - bitsAvailable) >> 3          // whole bytes that fit (≥ 6 here)
+        bitBuffer = (bitBuffer << (8 * k)) | (word >> (64 - 8 * k))
+        bitsAvailable += 8 * k
+        byteOffset += k
+        return true
+    }
+
     /// Reads `count` bits and returns them as an unsigned integer.
     mutating func readBits(_ count: Int) throws -> UInt32 {
         // Every legitimate JPEG bit-read is ≤ 16 bits (magnitude categories ≤ 15,
         // EOBRUN appendages ≤ 14). A larger width only arises from a malformed or
-        // forged Huffman table (whose decoded "category" can be any byte) and
-        // would overflow the 32-bit `bitBuffer` in `loadByte` — throw instead.
+        // forged Huffman table (whose decoded "category" can be any byte) — throw.
         guard count >= 0, count <= 16 else {
             throw JLIError.decodingFailed("invalid bit-read width \(count)")
         }
         while bitsAvailable < count {
+            if bulkRefill() { break }
             try loadByte()
         }
         bitsAvailable -= count
-        let value = (bitBuffer >> bitsAvailable) & ((1 << count) - 1)
-        return value
+        let value = (bitBuffer >> UInt64(bitsAvailable)) & ((1 << UInt64(count)) - 1)
+        return UInt32(truncatingIfNeeded: value)
     }
 
     /// Table-driven fast path for short (≤8-bit) Huffman codes.
@@ -164,13 +202,14 @@ struct BitReader {
         return table.lookaheadSymbol[peek]
     }
 
-    /// Best-effort buffer fill used only by ``fastDecodeSymbol(_:)``. Loads whole
-    /// bytes (resolving `0xFF 0x00` stuffing exactly as ``loadByte()`` does) until
-    /// at least `target` bits are buffered, but **stops without throwing** when it
-    /// reaches a marker (`0xFF` not followed by `0x00`) or the end of the data —
-    /// it never advances past a marker. `target` is ≤8 and entry `bitsAvailable`
-    /// is ≤7, so at most one byte is loaded and `bitBuffer` stays within 32 bits.
+    /// Best-effort buffer fill used only by ``fastDecodeSymbol(_:)``. Tries the
+    /// bulk splice first, then loads whole bytes (resolving `0xFF 0x00` stuffing
+    /// exactly as ``loadByte()`` does) until at least `target` bits are buffered,
+    /// but **stops without throwing** when it reaches a marker (`0xFF` not
+    /// followed by `0x00`) or the end of the data — it never advances past a
+    /// marker.
     private mutating func fillBuffer(upTo target: Int) {
+        if bitsAvailable < target, bulkRefill() { return }
         while bitsAvailable < target {
             guard byteOffset < data.count else { return }
             let byte = data[byteOffset]
@@ -181,7 +220,7 @@ struct BitReader {
             } else {
                 byteOffset += 1
             }
-            bitBuffer = (bitBuffer << 8) | UInt32(byte)
+            bitBuffer = (bitBuffer << 8) | UInt64(byte)
             bitsAvailable += 8
         }
     }
@@ -208,12 +247,17 @@ struct BitReader {
             }
         }
 
-        bitBuffer = (bitBuffer << 8) | UInt32(byte)
+        bitBuffer = (bitBuffer << 8) | UInt64(byte)
         bitsAvailable += 8
     }
 
-    /// Aligns the reader to the next byte boundary by discarding remaining bits.
+    /// Aligns the reader to the next byte boundary by discarding the partial
+    /// byte's remaining bits. Whole unconsumed buffered bytes (which exist only
+    /// via the bulk path's 1:1, `0xFF`-free loads — see the type doc) are
+    /// returned to the source by rewinding `byteOffset`, so marker scanning
+    /// resumes at the true byte position.
     mutating func alignToByte() {
+        byteOffset -= bitsAvailable >> 3
         bitsAvailable = 0
         bitBuffer = 0
     }
