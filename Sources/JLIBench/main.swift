@@ -310,6 +310,17 @@ func printHelp() {
     Regression flags:
       --save-baseline <path>   Save run results as baseline JSON
       --check-baseline <path>  Load baseline JSON, compare, exit 1 on regression
+
+    Identity / profiling flags (each runs alone and exits):
+      --identity-hashes [out]      SHA-256 of every encode/decode in a fixed
+                                   deterministic matrix — the byte/bit-identity
+                                   gate for performance changes (diff before/after)
+      --profile-lossless [bits] [size]  Tight lossless (SOF3) grayscale loops at
+                                   8/12/16-bit (default 16, 1024) for `sample`
+      --profile-encode [size]      Tight lossy encode loop (default 1024)
+      --profile-decode [size]      Tight lossy decode loop (default 1024)
+      --batch <dir> [csv]          Round-trip every .dcm under dir → CSV
+      --signed-stats <dir> [csv]   Medical pixel-module census + lossless round-trip
     """)
 }
 
@@ -324,6 +335,16 @@ if let i = CommandLine.arguments.firstIndex(of: "--signed-stats"), i + 1 < Comma
     let out = (i + 2 < CommandLine.arguments.count && !CommandLine.arguments[i + 2].hasPrefix("--"))
         ? CommandLine.arguments[i + 2] : nil
     runSignedStats(dir: dir, out: out); exit(0)
+}
+if let i = CommandLine.arguments.firstIndex(of: "--identity-hashes") {
+    let out = (i + 1 < CommandLine.arguments.count && !CommandLine.arguments[i + 1].hasPrefix("--"))
+        ? CommandLine.arguments[i + 1] : nil
+    runIdentityHashes(out: out); exit(0)
+}
+if let i = CommandLine.arguments.firstIndex(of: "--profile-lossless") {
+    let bits = (i + 1 < CommandLine.arguments.count ? Int(CommandLine.arguments[i + 1]) : nil) ?? 16
+    let size = (i + 2 < CommandLine.arguments.count ? Int(CommandLine.arguments[i + 2]) : nil) ?? 1024
+    runProfileLossless(bits: bits, size: size); exit(0)
 }
 if let i = CommandLine.arguments.firstIndex(of: "--profile-encode") {
     let size = (i + 1 < CommandLine.arguments.count ? Int(CommandLine.arguments[i + 1]) : nil) ?? 1024
