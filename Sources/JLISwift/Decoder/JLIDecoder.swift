@@ -156,6 +156,18 @@ public struct JLIDecoder: Sendable {
             var mcuCount = 0
             var restartIndex = 0
 
+            // Tables are fixed per scan — resolve them once per component
+            // instead of re-running a closure search + two Dictionary lookups
+            // (and the resulting HuffmanTable struct copies) on every MCU.
+            let compDCTables: [HuffmanTable] = components.map { comp in
+                let sc = scan.header.components.first { $0.componentSelector == comp.id }
+                return dcTables[sc?.dcTableId ?? 0] ?? StandardHuffmanTables.dcLuminance
+            }
+            let compACTables: [HuffmanTable] = components.map { comp in
+                let sc = scan.header.components.first { $0.componentSelector == comp.id }
+                return acTables[sc?.acTableId ?? 0] ?? StandardHuffmanTables.acLuminance
+            }
+
             for mcuY in 0..<mcuCountV {
                 for mcuX in 0..<mcuCountH {
                     // Every `restartInterval` MCUs, skip the RST0–RST7 marker
@@ -170,11 +182,8 @@ public struct JLIDecoder: Sendable {
 
                     for compIdx in 0..<numComponents {
                         let comp = components[compIdx]
-                        let scanComp = scan.header.components.first { $0.componentSelector == comp.id }
-                        let dcTableId = scanComp?.dcTableId ?? 0
-                        let acTableId = scanComp?.acTableId ?? 0
-                        let dcTable = dcTables[dcTableId] ?? StandardHuffmanTables.dcLuminance
-                        let acTable = acTables[acTableId] ?? StandardHuffmanTables.acLuminance
+                        let dcTable = compDCTables[compIdx]
+                        let acTable = compACTables[compIdx]
                         let blocksPerRow = componentBlocksPerRow[compIdx]
 
                         for by in 0..<comp.verticalSampling {

@@ -1197,13 +1197,19 @@ public struct JLIEncoder: Sendable {
         let eobLen = Int(rdo.acTable.encodingTable[0x00].length)
         let zrlLen = Int(rdo.acTable.encodingTable[0xF0].length)
 
+        // Flat (run ≤ 15) × size → bit-cost table, precomputed once per worker:
+        // the O(m²) DP inner loop otherwise reloads the Huffman entry struct
+        // per evaluation. rate[(r<<4)|s] = code length + s, exactly what the
+        // expression below computed.
+        var rateTable = [Int](repeating: 0, count: 256)
+        for rs in 0..<256 { rateTable[rs] = Int(rdo.acTable.encodingTable[rs].length) + (rs & 15) }
+
         // Bits to emit a nonzero of category `size` after `run` preceding zeros.
         func symbolBits(run: Int, size: Int) -> Int {
             var bits = 0
             var r = run
             while r > 15 { bits += zrlLen; r -= 16 }
-            bits += Int(rdo.acTable.encodingTable[(r << 4) | size].length) + size
-            return bits
+            return bits + rateTable[(r << 4) | size]
         }
 
         // Per-block scratch. Each nonzero candidate has up to two "kept" variants
@@ -1320,9 +1326,31 @@ public struct JLIEncoder: Sendable {
             out.withUnsafeMutableBufferPointer { dstBuf in
                 let src = srcBuf.baseAddress!
                 let dst = dstBuf.baseAddress!
+                // Interior blocks (fully inside the plane — all but the last
+                // row/column of blocks on non-multiple-of-8 planes) skip the
+                // per-pixel edge clamps, so the inner loop is a clean
+                // load-subtract-store the compiler vectorizes. Same values:
+                // min() was the identity for these pixels.
+                let fullBX = planeWidth / 8, fullBY = planeHeight / 8
+                for by in 0..<fullBY {
+                    let startY = by * 8
+                    for bx in 0..<fullBX {
+                        let startX = bx * 8
+                        let blockBase = (by * blocksH + bx) * 64
+                        for r in 0..<8 {
+                            let srcRow = (startY + r) * planeWidth + startX
+                            let dstRow = blockBase + r * 8
+                            for c in 0..<8 {
+                                dst[dstRow + c] = src[srcRow + c] - levelShift
+                            }
+                        }
+                    }
+                }
+                // Edge blocks: replicate the last row/column past plane bounds.
+                guard fullBX < blocksH || fullBY < blocksV else { return }
                 for by in 0..<blocksV {
                     let startY = by * 8
-                    for bx in 0..<blocksH {
+                    for bx in 0..<blocksH where by >= fullBY || bx >= fullBX {
                         let startX = bx * 8
                         let blockBase = (by * blocksH + bx) * 64
                         for r in 0..<8 {

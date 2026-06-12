@@ -41,6 +41,47 @@ enum ChromaSampling {
         let newHeight = vertically ? (height + 1) / 2 : height
         var result = [Float](repeating: 0, count: newWidth * newHeight)
 
+        // 2×2 fast path (the 4:2:0 default, ~8% of a color encode): interior
+        // boxes are complete, so the per-pixel edge guards and the generic
+        // sum/count bookkeeping vanish — the additions keep the exact serial
+        // association of the generic loop (((a+b)+c)+d, top row first), and
+        // /4, /2 are exact power-of-two scalings, so output is byte-identical.
+        // Odd-edge boxes (1×2 / 2×1 / 1×1) are handled in matching order.
+        if horizontally && vertically {
+            plane.withUnsafeBufferPointer { sp in
+                result.withUnsafeMutableBufferPointer { rp in
+                    let src = sp.baseAddress!, dst = rp.baseAddress!
+                    let fullW = width / 2, fullH = height / 2
+                    for dy in 0..<fullH {
+                        let rA = (dy * 2) * width, rB = rA + width
+                        let dRow = dy * newWidth
+                        for dx in 0..<fullW {
+                            let sx = dx * 2
+                            let sum = ((src[rA + sx] + src[rA + sx + 1])
+                                       + src[rB + sx]) + src[rB + sx + 1]
+                            dst[dRow + dx] = sum / 4
+                        }
+                        if newWidth > fullW {                         // odd width: 1×2 box
+                            let sx = fullW * 2
+                            dst[dRow + fullW] = (src[rA + sx] + src[rB + sx]) / 2
+                        }
+                    }
+                    if newHeight > fullH {                            // odd height: 2×1 boxes
+                        let rA = (fullH * 2) * width
+                        let dRow = fullH * newWidth
+                        for dx in 0..<fullW {
+                            let sx = dx * 2
+                            dst[dRow + dx] = (src[rA + sx] + src[rA + sx + 1]) / 2
+                        }
+                        if newWidth > fullW {                         // odd corner: 1×1
+                            dst[dRow + fullW] = src[rA + fullW * 2]
+                        }
+                    }
+                }
+            }
+            return (result, newWidth, newHeight)
+        }
+
         let hStep = horizontally ? 2 : 1
         let vStep = vertically ? 2 : 1
 

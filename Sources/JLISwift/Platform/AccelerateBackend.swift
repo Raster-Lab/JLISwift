@@ -432,40 +432,55 @@ enum AccelerateDSP {
         precondition(componentCount == 3 || componentCount == 4)
         precondition(data.count >= pixelCount * componentCount * 2)
 
-        var r = [Float](repeating: 0, count: pixelCount)
-        var g = [Float](repeating: 0, count: pixelCount)
-        var b = [Float](repeating: 0, count: pixelCount)
+        // Same structure as the 8-bit path post-0.2.0: one uninitialized scratch
+        // block for R/G/B, uninitialized outputs, and raw pointers throughout so
+        // the in-place vDSP_vsma chains can't trip array copy-on-write (the
+        // `y … &y` form copies the plane per call). Identical math → identical
+        // bytes; only the redundant zero-fills and COW copies go away.
+        func uninit() -> [Float] {
+            [Float](unsafeUninitializedCapacity: pixelCount) { _, c in c = pixelCount }
+        }
+        var y = uninit(), cb = uninit(), cr = uninit()
+        let rgbScratch = UnsafeMutableBufferPointer<Float>.allocate(capacity: pixelCount * 3)
+        defer { rgbScratch.deallocate() }
+        let r = rgbScratch.baseAddress!, g = r + pixelCount, b = r + pixelCount * 2
+
         // Scalar little-endian deinterleave — UInt8 storage isn't UInt16-aligned.
-        for i in 0..<pixelCount {
-            let p = i * componentCount * 2
-            r[i] = Float(UInt16(data[p])     | (UInt16(data[p + 1]) << 8))
-            g[i] = Float(UInt16(data[p + 2]) | (UInt16(data[p + 3]) << 8))
-            b[i] = Float(UInt16(data[p + 4]) | (UInt16(data[p + 5]) << 8))
+        data.withUnsafeBufferPointer { buf in
+            let s = buf.baseAddress!
+            for i in 0..<pixelCount {
+                let p = i * componentCount * 2
+                r[i] = Float(UInt16(s[p])     | (UInt16(s[p + 1]) << 8))
+                g[i] = Float(UInt16(s[p + 2]) | (UInt16(s[p + 3]) << 8))
+                b[i] = Float(UInt16(s[p + 4]) | (UInt16(s[p + 5]) << 8))
+            }
         }
 
-        var y = [Float](repeating: 0, count: pixelCount)
-        var cb = [Float](repeating: 0, count: pixelCount)
-        var cr = [Float](repeating: 0, count: pixelCount)
         let n = vDSP_Length(pixelCount)
-
-        var yR: Float = 0.299, yG: Float = 0.587, yB: Float = 0.114
-        vDSP_vsmul(r, 1, &yR, &y, 1, n)
-        vDSP_vsma(g, 1, &yG, y, 1, &y, 1, n)
-        vDSP_vsma(b, 1, &yB, y, 1, &y, 1, n)
-
-        var cbR: Float = -0.168736, cbG: Float = -0.331264, cbB: Float = 0.5
         var ctr = center
-        vDSP_vsmul(r, 1, &cbR, &cb, 1, n)
-        vDSP_vsma(g, 1, &cbG, cb, 1, &cb, 1, n)
-        vDSP_vsma(b, 1, &cbB, cb, 1, &cb, 1, n)
-        vDSP_vsadd(cb, 1, &ctr, &cb, 1, n)
-
+        var yR: Float = 0.299, yG: Float = 0.587, yB: Float = 0.114
+        y.withUnsafeMutableBufferPointer { yp in
+            let yb = yp.baseAddress!
+            vDSP_vsmul(r, 1, &yR, yb, 1, n)
+            vDSP_vsma(g, 1, &yG, yb, 1, yb, 1, n)
+            vDSP_vsma(b, 1, &yB, yb, 1, yb, 1, n)
+        }
+        var cbR: Float = -0.168736, cbG: Float = -0.331264, cbB: Float = 0.5
+        cb.withUnsafeMutableBufferPointer { cbp in
+            let cbb = cbp.baseAddress!
+            vDSP_vsmul(r, 1, &cbR, cbb, 1, n)
+            vDSP_vsma(g, 1, &cbG, cbb, 1, cbb, 1, n)
+            vDSP_vsma(b, 1, &cbB, cbb, 1, cbb, 1, n)
+            vDSP_vsadd(cbb, 1, &ctr, cbb, 1, n)
+        }
         var crR: Float = 0.5, crG: Float = -0.418688, crB: Float = -0.081312
-        vDSP_vsmul(r, 1, &crR, &cr, 1, n)
-        vDSP_vsma(g, 1, &crG, cr, 1, &cr, 1, n)
-        vDSP_vsma(b, 1, &crB, cr, 1, &cr, 1, n)
-        vDSP_vsadd(cr, 1, &ctr, &cr, 1, n)
-
+        cr.withUnsafeMutableBufferPointer { crp in
+            let crb = crp.baseAddress!
+            vDSP_vsmul(r, 1, &crR, crb, 1, n)
+            vDSP_vsma(g, 1, &crG, crb, 1, crb, 1, n)
+            vDSP_vsma(b, 1, &crB, crb, 1, crb, 1, n)
+            vDSP_vsadd(crb, 1, &ctr, crb, 1, n)
+        }
         return (y, cb, cr)
     }
 
@@ -477,41 +492,56 @@ enum AccelerateDSP {
         precondition(y.count == pixelCount && cb.count == pixelCount && cr.count == pixelCount)
         let n = vDSP_Length(pixelCount)
 
-        var cbS = [Float](repeating: 0, count: pixelCount)
-        var crS = [Float](repeating: 0, count: pixelCount)
-        var negCenter = -center
-        vDSP_vsadd(cb, 1, &negCenter, &cbS, 1, n)
-        vDSP_vsadd(cr, 1, &negCenter, &crS, 1, n)
+        // One scratch block (cbS, crS, r, g, b) + raw pointers — same fix as the
+        // 8-bit path: the previous `g … &g` in-place forms copied the plane per
+        // call and every buffer was zero-filled before being fully overwritten.
+        // Identical op sequence on identical values → byte-identical output.
+        let scratch = UnsafeMutableBufferPointer<Float>.allocate(capacity: pixelCount * 5)
+        defer { scratch.deallocate() }
+        let cbS = scratch.baseAddress!
+        let crS = cbS + pixelCount, r = cbS + pixelCount * 2
+        let g = cbS + pixelCount * 3, b = cbS + pixelCount * 4
 
-        var r = [Float](repeating: 0, count: pixelCount)
-        var g = [Float](repeating: 0, count: pixelCount)
-        var b = [Float](repeating: 0, count: pixelCount)
+        var negCenter = -center
         var rCr: Float = 1.402
         var gCb: Float = -0.344136, gCr: Float = -0.714136
         var bCb: Float = 1.772
-
-        vDSP_vsma(crS, 1, &rCr, y, 1, &r, 1, n)
-        vDSP_vsmul(cbS, 1, &gCb, &g, 1, n)
-        vDSP_vsma(crS, 1, &gCr, g, 1, &g, 1, n)
-        vDSP_vadd(y, 1, g, 1, &g, 1, n)
-        vDSP_vsma(cbS, 1, &bCb, y, 1, &b, 1, n)
-
         var lo: Float = 0.0, hi = maxValue
-        vDSP_vclip(r, 1, &lo, &hi, &r, 1, n)
-        vDSP_vclip(g, 1, &lo, &hi, &g, 1, n)
-        vDSP_vclip(b, 1, &lo, &hi, &b, 1, n)
 
-        var out = [UInt8](repeating: 0, count: pixelCount * 3 * 2)
-        for i in 0..<pixelCount {
-            let p = i * 6
-            let rv = UInt16(r[i].rounded(.toNearestOrEven))
-            let gv = UInt16(g[i].rounded(.toNearestOrEven))
-            let bv = UInt16(b[i].rounded(.toNearestOrEven))
-            out[p]     = UInt8(rv & 0xFF); out[p + 1] = UInt8(rv >> 8)
-            out[p + 2] = UInt8(gv & 0xFF); out[p + 3] = UInt8(gv >> 8)
-            out[p + 4] = UInt8(bv & 0xFF); out[p + 5] = UInt8(bv >> 8)
+        return y.withUnsafeBufferPointer { yp in
+            cb.withUnsafeBufferPointer { cbp in
+                cr.withUnsafeBufferPointer { crp in
+                    let yb = yp.baseAddress!, cbb = cbp.baseAddress!, crb = crp.baseAddress!
+                    vDSP_vsadd(cbb, 1, &negCenter, cbS, 1, n)
+                    vDSP_vsadd(crb, 1, &negCenter, crS, 1, n)
+                    vDSP_vsma(crS, 1, &rCr, yb, 1, r, 1, n)
+                    vDSP_vsmul(cbS, 1, &gCb, g, 1, n)
+                    vDSP_vsma(crS, 1, &gCr, g, 1, g, 1, n)
+                    vDSP_vadd(yb, 1, g, 1, g, 1, n)
+                    vDSP_vsma(cbS, 1, &bCb, yb, 1, b, 1, n)
+                    vDSP_vclip(r, 1, &lo, &hi, r, 1, n)
+                    vDSP_vclip(g, 1, &lo, &hi, g, 1, n)
+                    vDSP_vclip(b, 1, &lo, &hi, b, 1, n)
+
+                    var out = [UInt8](unsafeUninitializedCapacity: pixelCount * 6) {
+                        _, c in c = pixelCount * 6
+                    }
+                    out.withUnsafeMutableBufferPointer { op in
+                        let o = op.baseAddress!
+                        for i in 0..<pixelCount {
+                            let p = i * 6
+                            let rv = UInt16(r[i].rounded(.toNearestOrEven))
+                            let gv = UInt16(g[i].rounded(.toNearestOrEven))
+                            let bv = UInt16(b[i].rounded(.toNearestOrEven))
+                            o[p]     = UInt8(rv & 0xFF); o[p + 1] = UInt8(rv >> 8)
+                            o[p + 2] = UInt8(gv & 0xFF); o[p + 3] = UInt8(gv >> 8)
+                            o[p + 4] = UInt8(bv & 0xFF); o[p + 5] = UInt8(bv >> 8)
+                        }
+                    }
+                    return out
+                }
+            }
         }
-        return out
     }
 
     // MARK: - Batched quantization
